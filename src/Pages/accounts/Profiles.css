@@ -1,0 +1,73 @@
+/* src/pages/Accounts/Referrals.css */
+
+.profiles-container {
+  max-width: 600px;
+  margin-left: 40px;
+  padding: 24px;
+  background-color: #fff;
+  border-radius: 12px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+.profiles-container h2 {
+  font-size: 24px;
+  margin-bottom: 24px;
+  color: #333;
+}
+
+.profile-form {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.profile-form label {
+  display: flex;
+  flex-direction: column;
+  font-weight: 500;
+  color: #444;
+}
+
+.profile-form input[type="email"],
+.profile-form input[type="text"],
+.profile-form input[type="password"] {
+  padding: 10px 12px;
+  font-size: 16px;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  margin-top: 6px;
+  transition: border-color 0.2s ease-in-out;
+}
+
+.profile-form input:focus {
+  outline: none;
+  border-color: #2ecc71;
+}
+
+.info-text {
+  font-size: 13px;
+  color: #666;
+  margin-top: 6px;
+  line-height: 1.4;
+}
+
+.info-text a {
+  color: #2ecc71;
+  text-decoration: underline;
+}
+
+.save-button {
+  background-color: #2ecc71;
+  color: #fff;
+  font-size: 16px;
+  padding: 12px 20px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: background-color 0.2s ease;
+}
+
+.save-button:hover {
+  background-color: #27c065;
+}

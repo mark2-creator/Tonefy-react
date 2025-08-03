@@ -1,0 +1,52 @@
+/* src/pages/Accounts.css */
+
+.accounts-container {
+  display: flex;
+  height: calc(100vh - 64px); /* adjust based on your header height */
+  background-color: #f9f9f9;
+}
+
+.accounts-sidebar {
+  width: 240px;
+  background-color: #fff;
+  border-right: 3px solid #e0e0e0;
+  padding-left: 40px;
+  padding-top: 40px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+ /* justify-content: center;*/
+  height: 100%;
+}
+
+.accounts-sidebar ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.accounts-sidebar li {
+  display: flex;
+  align-items: center;
+  gap: 30px;
+  margin-bottom: 16px;
+  cursor: pointer;
+  color: #333;
+  font-weight: 500;
+  transition: color 0.3s;
+}
+
+.accounts-sidebar li:hover {
+  color: #2ecc71; /* your brand color */
+}
+
+.accounts-sidebar li span {
+  font-size: 18px;
+}
+
+.accounts-main {
+  flex: 1;
+  padding: 24px;
+  background-color: #fff;
+  overflow-y: auto;
+}
