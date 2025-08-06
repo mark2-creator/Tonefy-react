@@ -1,43 +1,36 @@
-// src/pages/Templates.jsx
 import React from "react";
-import DashboardHeader from "../components/DashboardHeader";
-import SideBar from "../components/SideBar";
 
 const Templates = () => {
   return (
-    <div className="templates-wrapper">
-      <SideBar />
-      <div className="templates-full">
-        <DashboardHeader />
+    
+      <div className="w-full px-4 mx-auto">
+        <div className="w-full md:w-3/4 lg:w-1/2">
+          <div className="w-full md:w-[500px] lg:w-[700px] flex justify-between items-start bg-gray-200 rounded-lg shadow p-6 mt-0">
+            {/* Left side: heading */}
+            <div className="self-start">
+              <h2 className="text-2xl font-bold text-[#27ae60]">Templates</h2>
+            </div>
 
-        <div className="templates-main">
-          <div className="templates-content">
-            <div className="template-card">
-              <div className="template-left">
-                <h2 className="template-title">Templates</h2>
-              </div>
-              <div className="template-right">
-                <button className="template-btn">
-                  9:16
-                  <br />
-                  <small>(Portrait)</small>
-                </button>
-                <button className="template-btn">
-                  1:1
-                  <br />
-                  <small>(Square)</small>
-                </button>
-                <button className="template-btn">
-                  16:9
-                  <br />
-                  <small>(Landscape)</small>
-                </button>
-              </div>
+            {/* Right side: buttons */}
+            <div className="flex space-x-4">
+              <button className="bg-[#2ecc71] hover:bg-[#27ae60] text-[#27ae60] font-semibold py-2 px-4 rounded transition text-left">
+                9:16 <br />
+                <small className="text-xs font-normal">(Portrait)</small>
+              </button>
+
+              <button className="bg-[#2ecc71] hover:bg-[#27ae60] text-[#27ae60] font-semibold py-2 px-4 rounded transition text-left">
+                1:1 <br />
+                <small className="text-xs font-normal">(Square)</small>
+              </button>
+
+              <button className="bg-[#2ecc71] hover:bg-[#27ae60] text-[#27ae60] font-semibold py-2 px-4 rounded transition text-left">
+                16:9 <br />
+                <small className="text-xs font-normal">(Landscape)</small>
+              </button>
             </div>
           </div>
         </div>
       </div>
-    </div>
   );
 };
 

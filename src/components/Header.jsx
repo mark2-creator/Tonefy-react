@@ -2,38 +2,36 @@ import React from "react";
 
 export default function Header({ openModal }) {
   return (
-    <header className="w-full bg-white shadow-sm sticky top-0 z-50">
-      <div className="max-w-7xl mx-auto px-4 md:px-8 py-4 flex items-center justify-between">
-        
-        {/* Logo */}
-        <div className="text-2xl font-bold text-black">Tonefy AI</div>
+    <header className="w-full bg-white shadow-sm sticky top-0 z-50 h-16 flex items-center justify-between px-6">
 
-        {/* Navigation */}
-        <nav className="hidden md:flex items-center gap-6 text-gray-700 text-sm font-medium">
-          <a href="#" className="hover:text-[#2ecc71] transition">Features</a>
-          <a href="#" className="hover:text-[#2ecc71] transition">Use cases</a>
-          <a href="#" className="hover:text-[#2ecc71] transition">Explore</a>
-          <a href="#" className="hover:text-[#2ecc71] transition">Pricing</a>
-          <span className="bg-[#2ecc71] text-white text-xs font-semibold px-2 py-1 rounded-full">
-            50% off!
-          </span>
-        </nav>
+      {/* Logo */}
+      <div className="text-2xl font-bold text-black">Tonefy AI</div>
 
-        {/* Auth Buttons */}
-        <div className="flex items-center gap-5">
-          <button
-            onClick={() => openModal("login")}
-            className="text-[#2ecc71] font-medium hover:underline"
-          >
-            Login
-          </button>
-          <button
-            onClick={() => openModal("signup")}
-            className="bg-[#2ecc71] text-white px-4 py-2 rounded-lg font-medium hover:bg-[#27ae60] transition"
-          >
-            Signup
-          </button>
-        </div>
+      {/* Navigation */}
+      <nav className="hidden md:flex items-center gap-6 text-gray-700 text-sm font-medium">
+        <a href="#" className="hover:text-[#2ecc71] transition">Features</a>
+        <a href="#" className="hover:text-[#2ecc71] transition">Use cases</a>
+        <a href="#" className="hover:text-[#2ecc71] transition">Explore</a>
+        <a href="#" className="hover:text-[#2ecc71] transition">Pricing</a>
+        <span className="bg-[#2ecc71] text-white text-xs font-semibold px-2 py-1 rounded-full">
+          50% off!
+        </span>
+      </nav>
+
+      {/* Auth Buttons */}
+      <div className="flex items-center gap-5">
+        <button
+          onClick={() => openModal("login")}
+          className="text-[#2ecc71] font-medium hover:underline"
+        >
+          Login
+        </button>
+        <button
+          onClick={() => openModal("signup")}
+          className="bg-[#2ecc71] text-white px-4 py-2 rounded-lg font-medium hover:bg-[#27ae60] transition"
+        >
+          Signup
+        </button>
       </div>
     </header>
   );

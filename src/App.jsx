@@ -1,31 +1,26 @@
 import React, { useState } from "react";
-import { Routes, Route } from "react-router-dom";
+import { Routes, Route, Navigate } from "react-router-dom";
 
-import Dashboard from "./pages/Dashboard";
-import Files from "./pages/Files";
-import Templates from "./pages/Templates";
-import Clone from "./pages/Clone";
-import Custom from "./pages/Custom";
-import BrandKits from "./pages/BrandKits";
-import Team from "./pages/Team";
-import Automation from "./pages/Automation";
-import AccountsLayout from "./pages/accounts/AccountsLayout";
-import Profiles from "./pages/accounts/Profiles";
-import Usage from "./pages/accounts/Usage";
-import Rewards from "./pages/accounts/Rewards";
-import Referrals from "./pages/accounts/Referrals";
-import Affiliate from "./pages/accounts/Affiliate";
-import Logout from "./pages/Accounts/Logout";
+import Dashboard from "./Pages/Dashboard";
+import Files from "./Pages/Files";
+import Templates from "./Pages/Templates";
+import Clone from "./Pages/Clone";
+import Custom from "./Pages/Custom";
+import BrandKits from "./Pages/BrandKits";
+import Team from "./Pages/Team";
+import Automation from "./Pages/Automation";
 
-import ProtectedRoute from "./components/ProtectedRoute"; // ✅ correct name used
+import Profiles from "./Pages/accounts/Profiles";
+import Usage from "./Pages/accounts/Usage";
+import Rewards from "./Pages/accounts/Rewards";
+import Referrals from "./Pages/accounts/Referrals";
+import Affiliate from "./Pages/accounts/Affiliate";
+import Logout from "./Pages/accounts/Logout";
+
+import ProtectedRoute from "./components/ProtectedRoute";
 import AuthModal from "./components/AuthModal";
-import "@fortawesome/fontawesome-free/css/all.min.css"; // ✅ correct
+import "@fortawesome/fontawesome-free/css/all.min.css";
 import LandingPage from "./components/LandingPage";
-import '@fortawesome/fontawesome-free/css/all.min.css';
-
-import LovedBySection from "./components/LovedBySection";
-
-import "./input.css";
 
 function App() {
   const [modalOpen, setModalOpen] = useState(false);
@@ -46,6 +41,9 @@ function App() {
         {/* Public Route */}
         <Route path="/" element={<LandingPage openModal={openModal} />} />
 
+        {/* Redirect /accounts to /accounts/profiles */}
+        <Route path="/accounts" element={<Navigate to="/accounts/profiles" replace />} />
+
         {/* Protected Routes */}
         <Route
           path="/dashboard"
@@ -55,7 +53,6 @@ function App() {
             </ProtectedRoute>
           }
         />
-
         <Route
           path="/files"
           element={
@@ -121,24 +118,55 @@ function App() {
           }
         />
 
-        {/* Nested Protected Account Routes */}
+        {/* Account Routes */}
         <Route
-          path="/accounts/*"
+          path="/accounts/profiles"
           element={
             <ProtectedRoute>
-              <AccountsLayout />
+              <Profiles />
             </ProtectedRoute>
-
           }
-        >
-          <Route index element={<Profiles />} />
-          <Route path="profiles" element={<Profiles />} />
-          <Route path="usage" element={<Usage />} />
-          <Route path="rewards" element={<Rewards />} />
-          <Route path="referrals" element={<Referrals />} />
-          <Route path="affiliate" element={<Affiliate />} />
-          <Route path="logout" element={<Logout />} />
-        </Route>
+        />
+        <Route
+          path="/accounts/usage"
+          element={
+            <ProtectedRoute>
+              <Usage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/accounts/rewards"
+          element={
+            <ProtectedRoute>
+              <Rewards />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/accounts/referrals"
+          element={
+            <ProtectedRoute>
+              <Referrals />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/accounts/affiliate"
+          element={
+            <ProtectedRoute>
+              <Affiliate />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/accounts/logout"
+          element={
+            <ProtectedRoute>
+              <Logout />
+            </ProtectedRoute>
+          }
+        />
       </Routes>
 
       {/* Global Auth Modal */}

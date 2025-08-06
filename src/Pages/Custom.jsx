@@ -1,36 +1,52 @@
-// src/pages/Custom.jsx
 import React from "react";
 import DashboardHeader from "../components/DashboardHeader";
-import SideBar from "../components/SideBar";
+import SideBar from "../components/Sidebar";
 import { UserPlus } from "lucide-react";
-import "./Custom.css"; // optional
 
 function Custom() {
   return (
-    <>
-      <DashboardHeader />
+    <div className="flex min-h-screen bg-gray-50">
       <SideBar />
-      <main className="custom-page">
-        <div className="breadcrumb">
-  <span className="breadcrumb-parent">Voices</span>
-  <span className="breadcrumb-separator">/</span>
-  <span className="breadcrumb-current">Custom</span>
-</div>
+      <div className="flex-1 flex flex-col">
+        <DashboardHeader />
+        <main className="flex-1 p-8 max-w-5xl mx-auto">
+          {/* Breadcrumb */}
+          <nav className="text-sm text-gray-500 mb-6 select-none" aria-label="Breadcrumb">
+            <ol className="list-reset flex space-x-2">
+              <li>
+                <span className="cursor-pointer hover:text-green-600">Voices</span>
+              </li>
+              <li>
+                <span className="mx-2">/</span>
+              </li>
+              <li className="text-gray-900 font-semibold">Custom</li>
+            </ol>
+          </nav>
 
-        <h1 className="custom-heading">
-          <UserPlus size={24} color="#2ecc71" />
-          <span>Create Custom Voice</span>
-        </h1>
-        <p className="custom-description">
-          Define a unique voice by customizing pitch, speed, and tone. Great for brand personalization.
-        </p>
+          {/* Heading */}
+          <h1 className="flex items-center text-3xl font-bold text-gray-900 mb-4 gap-3">
+            <UserPlus size={28} className="text-[#2ecc71]" />
+            <span>Create Custom Voice</span>
+          </h1>
 
-        <div className="custom-config-section">
-          <button className="custom-config-btn">Start Customization</button>
-          <p className="custom-note">More settings coming soon!</p>
-        </div>
-      </main>
-    </>
+          {/* Description */}
+          <p className="text-gray-700 mb-8 max-w-2xl">
+            Define a unique voice by customizing pitch, speed, and tone. Great for brand personalization.
+          </p>
+
+          {/* Config Section */}
+          <div className="flex flex-col items-start space-y-3">
+            <button
+              type="button"
+              className="bg-[#2ecc71] hover:bg-green-600 text-white font-semibold px-6 py-3 rounded-lg transition"
+            >
+              Start Customization
+            </button>
+            <p className="text-sm text-gray-500 italic">More settings coming soon!</p>
+          </div>
+        </main>
+      </div>
+    </div>
   );
 }
 

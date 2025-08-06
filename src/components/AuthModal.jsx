@@ -8,7 +8,6 @@ import {
   signInWithPopup,
   GoogleAuthProvider,
 } from "firebase/auth";
-
 import { auth } from "../firebase";
 
 const AuthModal = ({ isOpen, onClose, mode = "login" }) => {
@@ -113,43 +112,50 @@ const AuthModal = ({ isOpen, onClose, mode = "login" }) => {
   if (!isOpen) return null;
 
   return (
-    <div className="modal-overlay" onClick={handleClose}>
-      <div className="login-modal" onClick={(e) => e.stopPropagation()}>
-        <button className="modal-close-btn" onClick={handleClose} type="button">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={handleClose}>
+      <div
+        className="bg-white rounded-xl shadow-lg w-full max-w-md p-6 relative"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          className="absolute top-2 right-4 text-2xl text-gray-500 hover:text-red-500"
+          onClick={handleClose}
+        >
           &times;
         </button>
 
-        <form onSubmit={handleSubmit} autoComplete="off">
-          <h2>{isLogin ? "Login to Tonefy" : "Sign Up for Tonefy"}</h2>
+        <form onSubmit={handleSubmit} className="space-y-5">
+          <h2 className="text-2xl font-bold text-center mb-2">
+            {isLogin ? "Login to Tonefy" : "Sign Up for Tonefy"}
+          </h2>
 
-          {message && <p className="success">{message}</p>}
+          {message && <p className="text-sm text-center text-gray-600">{message}</p>}
 
-          <div className="input-group">
+          <div>
             <input
               type="email"
               placeholder="Email"
-              autoComplete="off"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               required
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#2ecc71]"
             />
           </div>
 
-          <div className="input-group password-input-wrapper">
+          <div className="relative">
             <input
               type={showPassword ? "text" : "password"}
               placeholder="Password"
-              autoComplete="new-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg pr-10 focus:outline-none focus:ring-2 focus:ring-[#2ecc71]"
             />
             <button
               type="button"
-              className="show-password-btn"
               onClick={() => setShowPassword((prev) => !prev)}
+              className="absolute inset-y-0 right-3 flex items-center text-gray-500"
               tabIndex={-1}
-              aria-label={showPassword ? "Hide password" : "Show password"}
             >
               {showPassword ? <EyeOff size={20} /> : <Eye size={20} />}
             </button>
@@ -157,53 +163,52 @@ const AuthModal = ({ isOpen, onClose, mode = "login" }) => {
 
           {isLogin && (
             <p
-              className="forgot-password"
+              className="text-sm text-right text-blue-600 hover:underline cursor-pointer"
               onClick={handleForgotPassword}
-              style={{ cursor: "pointer" }}
             >
               Forgot Password?
             </p>
           )}
 
           {!isLogin && (
-            <div className="input-group">
+            <div>
               <input
                 type="password"
                 placeholder="Confirm Password"
-                autoComplete="new-password"
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
                 required
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#2ecc71]"
               />
             </div>
           )}
 
           <button
             type="submit"
-            className={isLogin ? "login-button" : "signup-button"}
+            className="w-full bg-[#2ecc71] hover:bg-green-600 text-white font-semibold py-2 rounded-lg transition"
           >
             {isLogin ? "Login" : "Sign Up"}
           </button>
 
-          <div className="divider">or</div>
+          <div className="text-center text-gray-500 my-2">or</div>
 
           <button
             type="button"
-            className="google-button"
             onClick={handleGoogleSignIn}
+            className="w-full flex items-center justify-center gap-2 border border-gray-300 py-2 rounded-lg hover:bg-gray-100 transition"
           >
             <img
               src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
               alt="Google"
-              className="google-icon"
+              className="w-5 h-5"
             />
-            Continue with Google
+            <span className="font-medium">Continue with Google</span>
           </button>
 
-          <p className="toggle-text">
+          <p className="text-sm text-center mt-4">
             {isLogin ? "Don't have an account?" : "Already have an account?"}{" "}
             <span
-              className="toggle-link"
+              className="text-[#2ecc71] font-medium hover:underline cursor-pointer"
               onClick={() => {
                 setIsLogin(!isLogin);
                 resetForm();

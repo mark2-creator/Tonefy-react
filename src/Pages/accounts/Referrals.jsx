@@ -1,53 +1,72 @@
-import React, { useState } from "react";
-import "./Rewards.css";
-
+import React from "react";
+import DashboardHeader from "../../components/DashboardHeader";
+import AccountsSidebar  from "../../components/AccountsSidebar";
 const Referrals = () => {
-  const referralLink = "https://fliki.ai?referral=ahumuza-mark-6eramj";
-  const [copied, setCopied] = useState(false);
+  const referralLink = "https://tonefy.ai?referral=ahumuza-mark-6eramj";
 
   const handleCopy = () => {
-    navigator.clipboard.writeText(referralLink).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
+    navigator.clipboard.writeText(referralLink);
+    alert("Referral link copied to clipboard!");
   };
 
   return (
-    <div className="referrals-container">
-      <h2>Referral program ❤️</h2>
-      <p>Invite your friends to Fliki and earn up to 120 credits 🤯😍!</p>
+    <>
+    <DashboardHeader/>
+    <AccountsSidebar/>
+     <div className=" ml-40 mt-16 px-6 py-10 bg-gray-500 rounded-md shadow-md min-h-screen">
+      
+      <h1 className="text-3xl font-bold text-gray-900 mb-2">Referrals</h1>
+      <p className="text-lg text-gray-700 mb-6">Referral program ❤️</p>
 
-      <section>
-        <h3>How it works</h3>
-        <ol>
+      <div className="bg-white shadow rounded-lg p-6 mb-8">
+        <p className="text-md text-gray-700 mb-4">
+          Invite your friends to <span className="font-semibold text-[#2ecc71]">Tonefy</span> and earn up to <span className="font-bold">120 credits</span> 🤯😍!
+        </p>
+
+        <h2 className="text-xl font-semibold text-gray-800 mt-6 mb-2">How it works</h2>
+        <ul className="list-disc list-inside text-gray-700 space-y-2">
           <li>
-            <strong>Share your referral link:</strong> Copy your unique referral link below and share it with your friends.
+            <span className="font-medium">Share your referral link:</span> Copy your unique referral link below and share it with your friends.
           </li>
           <li>
-            <strong>Your friend signs up:</strong> For each friend that signs up using your link, you'll receive 2 credits! The more friends you refer, the more credits you can earn.
+            <span className="font-medium">Your friend signs up:</span> For each friend that signs up using your link, you’ll receive <span className="font-semibold">2 credits</span>!
           </li>
-        </ol>
-      </section>
+          <li>
+            The more friends you refer, the more credits you can earn.
+          </li>
+        </ul>
 
-      <section>
-        <h3>Your referral link:</h3>
-        <div className="referral-link-box">
-          <input type="text" value={referralLink} readOnly />
-          <button onClick={handleCopy}>{copied ? "Copied!" : "Copy link"}</button>
+        <div className="mt-6">
+          <label className="block text-gray-800 font-medium mb-2">Your referral link:</label>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              readOnly
+              value={referralLink}
+              className="flex-1 px-4 py-2 border rounded-md bg-gray-50 text-gray-800"
+            />
+            <button
+              onClick={handleCopy}
+              className="px-4 py-2 bg-[#2ecc71] hover:bg-green-600 text-white rounded-md text-sm font-medium"
+            >
+              Copy link
+            </button>
+          </div>
         </div>
-      </section>
+      </div>
 
-      <section className="stats">
-        <div>
-          <h4>Total referrals</h4>
-          <p>0</p>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+        <div className="bg-white rounded-lg shadow p-6 text-center">
+          <p className="text-sm text-gray-500 mb-1">Total referrals</p>
+          <p className="text-3xl font-bold text-gray-800">0</p>
         </div>
-        <div>
-          <h4>Total credits earned</h4>
-          <p>0</p>
+        <div className="bg-white rounded-lg shadow p-6 text-center">
+          <p className="text-sm text-gray-500 mb-1">Total credits earned</p>
+          <p className="text-3xl font-bold text-gray-800">0</p>
         </div>
-      </section>
+      </div>
     </div>
+    </>
   );
 };
 

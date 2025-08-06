@@ -1,34 +1,49 @@
-// src/pages/BrandKits.jsx
 import React from "react";
-import DashboardHeader from "../components/DashboardHeader";
-import SideBar from "../components/SideBar";
+import SideBar from "../components/Sidebar";
 import { Palette } from "lucide-react";
-import "./BrandKits.css"; // Optional styling
 
 function BrandKits() {
   return (
-    <>
-      <DashboardHeader />
+  
+    <div className="flex min-h-screen bg-gray-50">
       <SideBar />
-      <main className="brandkits-page">
-        <div className="breadcrumb-box">
-          <span className="breadcrumb-text">Brand Kits</span>
-        </div>
+      <div className="flex-1 flex flex-col">
+      
+        <main className="flex-1 p-8 max-w-5xl mx-auto">
+          {/* Breadcrumb */}
+          <nav
+           className="text-sm text-gray-500 mb-6 select-none"
+            aria-label="Breadcrumb"
+          >
+            <ol className="list-reset flex space-x-2">
+              <li className="text-gray-900 font-semibold">Brand Kits</li>
+            </ol>
+          </nav>
 
-        <h1 className="brandkits-heading">
-          <Palette size={24} color="#2ecc71" />
-          <span>Uniform and on-brand look for your videos!</span>
-        </h1>
+          {/* Heading */}
+          <h1 className="flex items-center text-3xl font-bold text-gray-900 mb-4 gap-3">
+            <Palette size={28} className="text-[#2ecc71]" />
+            <span>Uniform and on-brand look for your videos!</span>
+          </h1>
 
-        <p className="brandkits-description">
-          Define your brand's fonts, colors, watermark and other brand details which can be applied to your video automatically.
-        </p>
+          {/* Description */}
+          <p className="text-gray-700 mb-8 max-w-2xl">
+            Define your brand&apos;s fonts, colors, watermark and other brand details which can be applied to your video automatically.
+          </p>
 
-        <div className="brandkits-action">
-          <button className="brandkits-add-btn">Add New Brand</button>
-        </div>
-      </main>
-    </>
+          {/* Action Button */}
+          <div>
+            <button
+              type="button"
+              className="bg-[#2ecc71] hover:bg-green-600 text-white font-semibold px-6 py-3 rounded-lg transition"
+            >
+              Add New Brand
+            </button>
+          </div>
+        </main>
+      </div>
+    </div>
+  
   );
 }
 

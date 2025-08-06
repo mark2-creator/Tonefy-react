@@ -1,87 +1,131 @@
 import React from "react";
-import "./Usage.css"; // optional styling
+import DashboardHeader from "../../components/DashboardHeader";
+import AccountsSidebar from "../../components/AccountsSidebar";
 
 const Usage = () => {
   return (
-    <div className="usage-page">
-      <h2>Usage</h2>
+    <>
+      <DashboardHeader />
+      <AccountsSidebar />
+      <div className="px-6 pt-20 ml-40 max-w-[calc(100%-160px)] overflow-x-hidden space-y-8">
+        <h2 className="text-2xl font-bold">Usage</h2>
 
-      <section>
-        <h3>Credits</h3>
-        <p>Usage: 0/5 minutes (0%)</p>
-        <p><small>(credits will reset on Aug 3, 2025)</small></p>
-      </section>
+        {/* Credits Section */}
+        <section className="bg-white shadow rounded-lg p-4 space-y-1">
+          <h3 className="text-lg font-semibold">Credits</h3>
+          <p>
+            Usage: <span className="font-medium">0/5 minutes (0%)</span>
+          </p>
+          <p className="text-sm text-gray-500">
+            (credits will reset on Aug 3, 2025)
+          </p>
+        </section>
 
-      <section>
-        <h3>Usage Graph</h3>
-        <div className="usage-graph">[Graph Placeholder]</div>
-      </section>
+        {/* Usage Graph */}
+        <section className="bg-white shadow rounded-lg p-4">
+          <h3 className="text-lg font-semibold mb-2">Usage Graph</h3>
+          <div className="border border-dashed border-gray-400 text-center py-8 text-gray-500">
+            [Graph Placeholder]
+          </div>
+        </section>
 
-      <section>
-        <h3>How credits work</h3>
-        <p>Plan: <strong>Free monthly</strong> (active since Jul 4, 2024)</p>
-      </section>
+        {/* Credits Info */}
+        <section className="bg-white shadow rounded-lg p-4">
+          <h3 className="text-lg font-semibold">How credits work</h3>
+          <p>
+            Plan: <strong>Free monthly</strong>
+            <span className="text-gray-500"> (active since Jul 4, 2024)</span>
+          </p>
+        </section>
 
-      <section className="promo-box">
-        <p>⚡️ <strong>Summer special sale!</strong></p>
-        <p>Use code <strong>FLIKISUMMER50</strong> for 50% off all annual plans.</p>
-      </section>
+        {/* Promo Box */}
+        <section className="bg-yellow-50 border border-yellow-300 rounded-lg p-4">
+          <p className="font-bold">⚡️ Summer special sale!</p>
+          <p>
+            Use code <span className="font-bold">FLIKISUMMER50</span> for 50% off all annual plans.
+          </p>
+        </section>
 
-      <section className="plans">
-        <h3>Subscribe to Tonefy</h3>
-        <div className="billing-options">
-          <button>Monthly</button>
-          <button>Yearly ⚡️ 50% off</button>
-        </div>
+        {/* Plans Section */}
+        <section className="bg-white shadow rounded-lg p-4">
+          <h3 className="text-lg font-semibold mb-4">Subscribe to Tonefy</h3>
 
-        <div className="plan">
-          <h4>Standard</h4>
-          <p>$28/month</p>
-          <p>For creators venturing into AI video production.</p>
-          <button>Subscribe now</button>
-        </div>
+          <div className="flex gap-3 mb-6">
+            <button className="px-4 py-2 border border-gray-300 rounded hover:bg-gray-100">
+              Monthly
+            </button>
+            <button className="px-4 py-2 border border-gray-300 rounded bg-green-500 text-white hover:bg-green-600">
+              Yearly ⚡️ 50% off
+            </button>
+          </div>
 
-        <div className="plan">
-          <h4>Premium</h4>
-          <p>$88/month</p>
-          <p>For teams and experienced video creators.</p>
-          <button>Subscribe now</button>
-        </div>
-      </section>
+          <div className="grid md:grid-cols-2 gap-4">
+            <div className="border rounded-lg p-4">
+              <h4 className="text-xl font-bold">Standard</h4>
+              <p className="text-lg font-semibold">$28/month</p>
+              <p className="text-gray-600">
+                For creators venturing into AI video production.
+              </p>
+              <button className="mt-4 w-full bg-green-500 text-white py-2 rounded hover:bg-green-600">
+                Subscribe now
+              </button>
+            </div>
 
-      <section className="credits-table">
-        <h3>Credits Comparison</h3>
-        <table>
-          <thead>
-            <tr>
-              <th>Feature</th>
-              <th>Standard</th>
-              <th>Premium</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td>Minutes</td><td>180</td><td>600</td></tr>
-            <tr><td>Export length</td><td>15 min</td><td>40 min</td></tr>
-            <tr><td>Standard voices</td><td>1000</td><td>2000+</td></tr>
-            <tr><td>Ultra-Realistic voices</td><td>150</td><td>1000+</td></tr>
-            <tr><td>Studio-Quality voices</td><td>50</td><td>350+</td></tr>
-            <tr><td>AI Video clips</td><td>﹣</td><td>✔</td></tr>
-            <tr><td>Brand kits</td><td>1</td><td>3</td></tr>
-            <tr><td>Scene limits</td><td>100</td><td>150</td></tr>
-            <tr><td>AI Avatar</td><td>Limited</td><td>✔</td></tr>
-            <tr><td>Voice cloning</td><td>1</td><td>3</td></tr>
-            <tr><td>Custom voices</td><td>1</td><td>3</td></tr>
-            <tr><td>Templates</td><td>✔</td><td>✔</td></tr>
-            <tr><td>Web research</td><td>✔</td><td>✔</td></tr>
-            <tr><td>Custom fonts</td><td>﹣</td><td>✔</td></tr>
-            <tr><td>Faster exports</td><td>﹣</td><td>✔</td></tr>
-            <tr><td>Team collaboration</td><td>﹣</td><td>﹣</td></tr>
-          </tbody>
-        </table>
-      </section>
-    </div>
+            <div className="border rounded-lg p-4">
+              <h4 className="text-xl font-bold">Premium</h4>
+              <p className="text-lg font-semibold">$88/month</p>
+              <p className="text-gray-600">
+                For teams and experienced video creators.
+              </p>
+              <button className="mt-4 w-full bg-green-500 text-white py-2 rounded hover:bg-green-600">
+                Subscribe now
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {/* Credits Table */}
+        <section className="bg-white shadow rounded-lg p-4 overflow-x-auto">
+          <h3 className="text-lg font-semibold mb-4">Credits Comparison</h3>
+          <table className="w-full border-collapse border border-gray-300">
+            <thead className="bg-gray-100">
+              <tr>
+                <th className="border border-gray-300 p-2 text-left">Feature</th>
+                <th className="border border-gray-300 p-2 text-left">Standard</th>
+                <th className="border border-gray-300 p-2 text-left">Premium</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[
+                ["Minutes", "180", "600"],
+                ["Export length", "15 min", "40 min"],
+                ["Standard voices", "1000", "2000+"],
+                ["Ultra-Realistic voices", "150", "1000+"],
+                ["Studio-Quality voices", "50", "350+"],
+                ["AI Video clips", "﹣", "✔"],
+                ["Brand kits", "1", "3"],
+                ["Scene limits", "100", "150"],
+                ["AI Avatar", "Limited", "✔"],
+                ["Voice cloning", "1", "3"],
+                ["Custom voices", "1", "3"],
+                ["Templates", "✔", "✔"],
+                ["Web research", "✔", "✔"],
+                ["Custom fonts", "﹣", "✔"],
+                ["Faster exports", "﹣", "✔"],
+                ["Team collaboration", "﹣", "﹣"],
+              ].map(([feature, standard, premium], idx) => (
+                <tr key={idx}>
+                  <td className="border border-gray-300 p-2">{feature}</td>
+                  <td className="border border-gray-300 p-2">{standard}</td>
+                  <td className="border border-gray-300 p-2">{premium}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      </div>
+    </>
   );
 };
 
 export default Usage;
- 

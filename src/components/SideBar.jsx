@@ -14,81 +14,77 @@ import {
   UserPlus,
 } from "lucide-react";
 
-function SideBar() {
+function Sidebar() {
   const [voicesOpen, setVoicesOpen] = useState(false);
 
   return (
-    <aside className="sidebar">
-      <ul className="sidebar-nav">
-        <li className="sidebar-item">
-         <Link to="/dashboard" className="sidebar-link">
-  <Home className="icon" size={28} color="#2ecc71" />
-  <span>Home</span>
-</Link>
+    <aside className="fixed top-30 left-0 h-[calc(100vh-64px)] w-64 bg-white border-r border-gray-200 shadow-sm p-6 z-50">
+      <ul className="space-y-4 text-gray-800">
+        <li>
+          <Link to="/dashboard" className="flex items-center gap-3 hover:text-green-500">
+            <Home size={24} color="#2ecc71" />
+            <span>Home</span>
+          </Link>
         </li>
 
-        <li className="sidebar-item">
-          <Link to="/files" className="sidebar-link">
-            <FileText className="icon" size={28} color="#3498db" />
+        <li>
+          <Link to="/files" className="flex items-center gap-3 hover:text-green-500">
+            <FileText size={24} color="#3498db" />
             <span>Files</span>
           </Link>
         </li>
 
-        <li className="sidebar-item">
-          <Link to="/templates" className="sidebar-link">
-            <Layers className="icon" size={28} color="#e67e22" />
+        <li>
+          <Link to="/templates" className="flex items-center gap-3 hover:text-green-500">
+            <Layers size={24} color="#e67e22" />
             <span>Templates</span>
           </Link>
         </li>
 
-        {/* Voices with Dropdown */}
-        <li className="sidebar-item">
-          <div className="sidebar-dropdown">
-            <div
-              className="sidebar-item dropdown-toggle voices-toggle"
-              onClick={() => setVoicesOpen(!voicesOpen)}
-            >
-              <Mic className="icon" size={28} color="#1026e9" />
-              <span>Voices</span>
-              {voicesOpen ? (
-                <ChevronUp size={16} />
-              ) : (
-                <ChevronDown size={16} />
-              )}
-            </div>
+        {/* Voices Dropdown */}
+        <li>
+          <button
+            className="flex items-center gap-3 w-full text-left hover:text-green-500"
+            onClick={() => setVoicesOpen(!voicesOpen)}
+          >
+            <Mic size={24} color="#1026e9" />
+            <span>Voices</span>
+            <span className="ml-auto">
+              {voicesOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+            </span>
+          </button>
 
-            {voicesOpen && (
-              <div className="dropdown-items">
-                <Link to="/voices/clone" className="sidebar-subitem">
-                  <Wand2 size={16} color="#2ecc71" />
-                  Clone
-                </Link>
-                <Link to="/voices/custom" className="sidebar-subitem">
-                  <UserPlus size={16} color="#2ecc71" />
-                  Custom
-                </Link>
-              </div>
-            )}
-          </div>
+          {voicesOpen && (
+            <div className="ml-7 mt-2 space-y-2">
+              <Link to="/voices/clone" className="flex items-center gap-2 text-sm hover:text-green-500">
+                <Wand2 size={16} color="#2ecc71" />
+                Clone
+              </Link>
+              <Link to="/voices/custom" className="flex items-center gap-2 text-sm hover:text-green-500">
+                <UserPlus size={16} color="#2ecc71" />
+                Custom
+              </Link>
+            </div>
+          )}
         </li>
 
-        <li className="sidebar-item">
-          <Link to="/brand-kits" className="sidebar-link">
-            <Palette className="icon" size={28} color="#1abc9c" />
+        <li>
+          <Link to="/brand-kits" className="flex items-center gap-3 hover:text-green-500">
+            <Palette size={24} color="#1abc9c" />
             <span>Brand Kits</span>
           </Link>
         </li>
 
-        <li className="sidebar-item">
-          <Link to="/team" className="sidebar-link">
-            <Users className="icon" size={28} color="#e74c3c" />
+        <li>
+          <Link to="/team" className="flex items-center gap-3 hover:text-green-500">
+            <Users size={24} color="#e74c3c" />
             <span>Team</span>
           </Link>
         </li>
 
-        <li className="sidebar-item">
-          <Link to="/automation" className="sidebar-link">
-            <Zap className="icon" size={28} color="#f1c40f" />
+        <li>
+          <Link to="/automation" className="flex items-center gap-3 hover:text-green-500">
+            <Zap size={24} color="#f1c40f" />
             <span>Automation</span>
           </Link>
         </li>
@@ -97,4 +93,4 @@ function SideBar() {
   );
 }
 
-export default SideBar;
+export default Sidebar;

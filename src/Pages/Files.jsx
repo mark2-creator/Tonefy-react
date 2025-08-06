@@ -1,8 +1,6 @@
-// src/pages/Files.jsx
 import React, { useState } from "react";
-import "./Files.css";
-import DashboardHeader from "../components/DashboardHeader";
-import SideBar from "../components/SideBar";
+import SideBar from "../components/Sidebar";
+
 import {
   FileText,
   Search,
@@ -35,62 +33,60 @@ const Files = () => {
   const [query, setQuery] = useState("");
 
   return (
-    <div className="dashboard-wrapper">
-      <SideBar />
-      <div className="dashboard-main">
-        <DashboardHeader />
-        <main className="main-content">
-          <div className="dashboard-welcome">
-            <h1>Files</h1>
-            <p>Manage your files and create new content</p>
-          </div>
+  
+      <div className="flex h-screen bg-gray-50">
+        <SideBar />
+        <div className="flex-1 flex flex-col overflow-hidden">
+          <main className="flex-1 overflow-auto max-w-5xl mx-auto">
+            <div className="mb-6">
+              <h1 className="text-3xl font-bold text-gray-800">Files</h1>
+              <p className="text-gray-600 mt-1">
+                Manage your files and create new content
+              </p>
+            </div>
 
-          <div className="dashboard-container">
-            <div className="dashboard-section">
-              <h2>Files</h2>
+            <section>
+              <h2 className="text-xl font-semibold text-gray-700 mb-4">Files</h2>
 
               {showSearch && (
-                <div style={{ marginBottom: "20px" }}>
+                <div className="mb-5">
                   <input
                     type="text"
                     placeholder="Search your files..."
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
-                    style={{
-                      width: "100%",
-                      padding: "10px",
-                      fontSize: "16px",
-                      borderRadius: "8px",
-                      border: "1px solid #ccc",
-                    }}
+                    className="w-full px-4 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-[#2ecc71] focus:border-[#2ecc71] focus:outline-none"
                   />
                 </div>
               )}
 
-              <div className="dashboard-cards">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-5">
                 {fileCards.map((card, index) => (
                   <div
                     key={index}
-                    className="dashboard-card"
                     onClick={() =>
                       card.title === "Search" ? setShowSearch(!showSearch) : null
                     }
-                    style={{ cursor: card.title === "Search" ? "pointer" : "default" }}
+                    className={`bg-white rounded-xl shadow-md p-5 transition hover:shadow-lg ${
+                      card.title === "Search" ? "cursor-pointer" : ""
+                    }`}
                   >
                     {React.cloneElement(iconMap[card.icon], {
-                      className: "icon icon-blue",
+                      className: "text-[#2ecc71] mb-3",
                       size: 32,
                     })}
-                    <h3>{card.title}</h3>
-                    <p>{card.desc}</p>
+                    <h3 className="text-lg font-semibold text-gray-800">
+                      {card.title}
+                    </h3>
+                    <p className="text-sm text-gray-600">{card.desc}</p>
                   </div>
                 ))}
               </div>
-            </div>
-          </div>
-        </main>
+            </section>
+          </main>
+        </div>
       </div>
-    </div>
+
   );
 };
 

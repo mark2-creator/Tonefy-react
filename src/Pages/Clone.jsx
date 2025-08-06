@@ -1,39 +1,59 @@
-// src/pages/Clone.jsx
 import React from "react";
 import DashboardHeader from "../components/DashboardHeader";
-import SideBar from "../components/SideBar";
+import SideBar from "../components/Sidebar";
 import { Wand2 } from "lucide-react";
-import "./Clone.css"; // Optional custom styles
 
 function Clone() {
   return (
-    <>
-      <DashboardHeader />
+  
+    <div className="flex min-h-screen bg-gray-50">
       <SideBar />
-      <main className="clone-page">
-        <div className="clone-container">
-          <div className="breadcrumb-box">
-  <span className="breadcrumb-text">Voices</span>
-  <span className="breadcrumb-separator">/</span>
-  <span className="breadcrumb-text">Clone</span>
-</div>
+      <div className="flex-1 flex flex-col">
+        <DashboardHeader />
+        <main className="flex-1 p-8 max-w-5xl mx-auto">
+          {/* Breadcrumb */}
+          <nav
+            className="text-sm text-gray-500 mb-6 select-none"
+            aria-label="Breadcrumb"
+          >
+            <ol className="list-reset flex space-x-2">
+              <li>
+                <span className="cursor-pointer hover:text-green-600">Voices</span>
+              </li>
+              <li>
+                <span className="mx-2">/</span>
+              </li>
+              <li className="text-gray-900 font-semibold">Clone</li>
+            </ol>
+          </nav>
 
-          <h1 className="clone-heading">
-            <Wand2 size={24} color="#2ecc71" />
+          {/* Heading */}
+          <h1 className="flex items-center text-3xl font-bold text-gray-900 mb-4 gap-3">
+            <Wand2 size={28} className="text-[#2ecc71]" />
             <span>Create a clone of your voice that sounds just like you</span>
           </h1>
 
-          <p className="clone-description">
-            Record two minutes of your voice, then generate any number of voice-overs in your own voice using just text.
+          {/* Description */}
+          <p className="text-gray-700 mb-8 max-w-2xl">
+            Record two minutes of your voice, then generate any number of
+            voice-overs in your own voice using just text.
           </p>
 
-          <div className="clone-upload-section">
-            <button className="clone-upload-btn">Upload Voice Sample</button>
-            <p className="clone-note">Supported formats: MP3, WAV • Max size: 5MB</p>
+          {/* Upload Section */}
+          <div className="flex flex-col items-start space-y-3">
+            <button
+              type="button"
+              className="bg-[#2ecc71] hover:bg-green-600 text-white font-semibold px-6 py-3 rounded-lg transition"
+            >
+              Upload Voice Sample
+            </button>
+            <p className="text-sm text-gray-500 italic">
+              Supported formats: MP3, WAV &bull; Max size: 5MB
+            </p>
           </div>
-        </div>
-      </main>
-    </>
+        </main>
+      </div>
+    </div>
   );
 }
 

@@ -1,9 +1,6 @@
-// src/pages/Dashboard.jsx
-
 import React from "react";
-import "./Dashboard.css";
 import DashboardHeader from "../components/DashboardHeader";
-import SideBar from "../components/SideBar";
+
 import {
   Sparkles,
   FileText,
@@ -21,21 +18,35 @@ import {
   Presentation,
 } from "lucide-react";
 
+const iconColorMap = {
+  "icon-purple": "text-purple-600",
+  "icon-blue": "text-blue-600",
+  "icon-teal": "text-teal-600",
+  "icon-orange": "text-orange-500",
+  "icon-red": "text-red-500",
+  "icon-green": "text-green-600",
+  "icon-gray": "text-gray-500",
+  "icon-pink": "text-pink-500",
+  "icon-yellow": "text-yellow-500",
+  "icon-lightblue": "text-sky-400",
+  "icon-cyan": "text-cyan-500",
+};
+
 const iconMap = {
-  sparkles: <Sparkles />,
-  fileText: <FileText />,
-  link: <Link2 />,
-  layout: <Layout />,
-  scissors: <Scissors />,
-  mic: <Mic />,
-  filePlus: <FilePlus />,
-  music: <Music />,
-  podcast: <Mic2 />,
-  voice: <Volume2 />,
-  dialogue: <MessageSquare />,
-  thumbnail: <Image />,
-  social: <Users />,
-  presentation: <Presentation />,
+  sparkles: <Sparkles size={36} />,
+  fileText: <FileText size={36} />,
+  link: <Link2 size={36} />,
+  layout: <Layout size={36} />,
+  scissors: <Scissors size={36} />,
+  mic: <Mic size={36} />,
+  filePlus: <FilePlus size={36} />,
+  music: <Music size={36} />,
+  podcast: <Mic2 size={36} />,
+  voice: <Volume2 size={36} />,
+  dialogue: <MessageSquare size={36} />,
+  thumbnail: <Image size={36} />,
+  social: <Users size={36} />,
+  presentation: <Presentation size={36} />,
 };
 
 const dashboardSections = [
@@ -77,35 +88,36 @@ const dashboardSections = [
 
 const Dashboard = () => {
   return (
-    <div className="dashboard-wrapper">
-      <SideBar />
-      <div className="dashboard-main">
-        <DashboardHeader />
-        <main className="main-content">
-          <div className="dashboard-welcome">
-            <h1>Welcome!</h1>
-            <p>Choose a workflow or start with an empty file</p>
-          </div>
+    <>
+      <DashboardHeader />
+      <div className="p-6 md:p-10">
+        <div className="mb-10">
+          <h1 className="text-3xl font-bold text-gray-900">Welcome!</h1>
+          <p className="text-gray-700 mt-2">Choose a workflow or start with an empty file</p>
+        </div>
 
-          {dashboardSections.map((section, index) => (
-            <div key={index} className="dashboard-container">
-              <div className="dashboard-section">
-                <h2>{section.title}</h2>
-                <div className="dashboard-cards">
-                  {section.cards.map((card, idx) => (
-                    <div key={idx} className="dashboard-card">
-                      {React.cloneElement(iconMap[card.icon], { className: `icon ${card.color}` })}
-                      <h3>{card.title}</h3>
-                      <p>{card.desc}</p>
-                    </div>
-                  ))}
+        {dashboardSections.map((section, idx) => (
+          <section key={idx} className="mb-12">
+            <h2 className="text-2xl font-semibold mb-6 text-gray-800">{section.title}</h2>
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+              {section.cards.map((card, cidx) => (
+                <div
+                  key={cidx}
+                  className="bg-white rounded-lg p-6 shadow hover:shadow-lg transition cursor-pointer flex flex-col items-center text-center"
+                >
+                  {React.cloneElement(iconMap[card.icon], {
+                    className: `mb-4 ${iconColorMap[card.color]} mx-auto`,
+                    size: 48,
+                  })}
+                  <h3 className="text-lg font-semibold text-gray-900 mb-2">{card.title}</h3>
+                  <p className="text-gray-600 text-sm">{card.desc}</p>
                 </div>
-              </div>
+              ))}
             </div>
-          ))}
-        </main>
+          </section>
+        ))}
       </div>
-    </div>
+    </>
   );
 };
 
