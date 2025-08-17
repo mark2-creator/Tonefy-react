@@ -49,18 +49,22 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
   };
 
   const handleSubmit = async () => {
+    if (!formData.prompt.trim()) return;
     setLoading(true);
+
     try {
       const res = await fetch("http://localhost:5000/api/idea-to-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: formData.prompt }),
       });
+
       if (!res.ok) throw new Error(`Server error ${res.status}`);
       const json = await res.json();
 
-      setVideoUrl(json.videoUrl);
-      setAudioUrl(json.audioUrl);
+      // Use full backend URL for video
+      setVideoUrl(json.videoUrl ? `http://localhost:5000${json.videoUrl}` : null);
+      setAudioUrl(json.audioUrl ? `http://localhost:5000${json.audioUrl}` : null);
       setFormData(prev => ({ ...prev, script: json.script }));
     } catch (err) {
       console.error("Submit failed:", err);
@@ -94,19 +98,42 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
           ))}
         </div>
 
+        {/* Video player section */}
         {videoUrl ? (
           <div className="flex flex-col items-center gap-4">
-            <video src={videoUrl} controls autoPlay loop className="w-full max-h-[500px] rounded-md" />
-            {audioUrl && <audio src={audioUrl} controls autoPlay className="w-full" />}
+            <video
+              src={videoUrl}
+              controls
+              autoPlay
+              loop
+              className="w-full max-h-[500px] rounded-md"
+            />
+            {audioUrl && (
+              <audio
+                src={audioUrl}
+                controls
+                autoPlay
+                className="w-full"
+              />
+            )}
           </div>
-        ) : renderStep()}
+        ) : (
+          renderStep()
+        )}
 
+        {/* Navigation / Submit buttons */}
         {!videoUrl && (
           <div className="mt-6 flex justify-between">
-            {step > 1 ? <button onClick={() => setStep(step-1)} className="px-4 py-2 border rounded-md">Back</button> : <div />}
+            {step > 1 ? (
+              <button
+                onClick={() => setStep(step - 1)}
+                className="px-4 py-2 border rounded-md"
+              >Back</button>
+            ) : <div />}
+
             {step < 5 ? (
               <button
-                onClick={() => setStep(step+1)}
+                onClick={() => setStep(step + 1)}
                 className={`px-4 py-2 rounded-md text-white ${canProceed() ? "bg-[#2ecc71]" : "bg-gray-400 cursor-not-allowed"}`}
                 disabled={!canProceed()}
               >Next</button>
@@ -115,7 +142,9 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
                 onClick={handleSubmit}
                 className="px-4 py-2 bg-[#2ecc71] text-white rounded-md"
                 disabled={loading}
-              >{loading ? "Submitting..." : "Submit"}</button>
+              >
+                {loading ? "Generating Video..." : "Submit"}
+              </button>
             )}
           </div>
         )}
