@@ -1,0 +1,8 @@
+1
+00:00:00,000 --> 00:00:01,000
+A calm morning by the beach.
+
+2
+00:00:01,000 --> 00:00:06,000
+Waves gently crash, seagulls fly above, and the sun rises slowly.
+

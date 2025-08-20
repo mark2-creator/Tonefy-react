@@ -18,10 +18,7 @@ export default function Step3MediaUpload({ formData, setFormData, onNext, onBack
       {formData.media?.length > 0 && (
         <p className="mt-2 text-sm text-gray-500">{formData.media.length} files selected</p>
       )}
-      <div className="flex justify-between mt-6">
-        <button onClick={onBack} className="px-4 py-2 border rounded">Back</button>
-        <button onClick={onNext} className="px-4 py-2 bg-green-500 text-white rounded">Next</button>
-      </div>
+      
     </div>
   );
 }

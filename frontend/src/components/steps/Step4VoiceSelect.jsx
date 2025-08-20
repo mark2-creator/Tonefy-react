@@ -1,6 +1,6 @@
 import React from "react";
 
-export default function Step4VoiceSelect({ formData, setFormData, onNext, onBack }) {
+export default function Step4VoiceSelect({ formData, setFormData, onNext, onBack  }) {
   const voices = ["Voice A (Male)", "Voice B (Female)", "Voice C (Neutral)"];
 
   return (
@@ -12,16 +12,12 @@ export default function Step4VoiceSelect({ formData, setFormData, onNext, onBack
             <input
               type="radio"
               name="voice"
-              checked={formData.voice === voice}
-              onChange={() => setFormData({ ...formData, voice })}
+              checked={formData.voiceover === voice} // update voiceover
+              onChange={() => setFormData({ ...formData, voiceover: voice })} // update voiceover
             />
             <span>{voice}</span>
           </label>
         ))}
-      </div>
-      <div className="flex justify-between mt-6">
-        <button onClick={onBack} className="px-4 py-2 border rounded">Back</button>
-        <button onClick={onNext} className="px-4 py-2 bg-green-500 text-white rounded">Next</button>
       </div>
     </div>
   );
