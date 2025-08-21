@@ -12,7 +12,11 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
   const [videoUrl, setVideoUrl] = useState(null);
   const [subtitlesUrl, setSubtitlesUrl] = useState(null);
   const [error, setError] = useState(null);
+
   const [videos, setVideos] = useState([]); // Pexels videos state
+  const [selectedVideo, setSelectedVideo] = useState(null); // ⭐ selected video
+  const [audioUrl, setAudioUrl] = useState(null); // ⭐ generated ElevenLabs audio
+
   const [formData, setFormData] = useState({
     prompt: "",
     duration: "30",
@@ -28,6 +32,8 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
     avatar: "",
     voiceover: "",
     brandKit: null,
+    selectedVideo: null, // ⭐ so it's tracked in final submit
+    audioUrl: null,      // ⭐ keep audioUrl in formData too
   });
 
   const steps = [
@@ -46,6 +52,8 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
       setSubtitlesUrl(null);
       setError(null);
       setProgress(0);
+      setSelectedVideo(null);
+      setAudioUrl(null);
     }
   }, [isOpen]);
 
@@ -61,8 +69,8 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
             body: JSON.stringify({ query: searchTerm }),
           });
           const data = await res.json();
-          console.log("Pexels videos:", data.videos);
-          setVideos(data.videos || []);
+          console.log("📹 Pexels videos:", data.videos);
+          setVideos((data.videos || []).slice(0, 2)); // only 2 results now
         } catch (err) {
           console.error("Error fetching videos:", err);
         }
@@ -73,36 +81,133 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
 
   const canProceed = () => {
     if (step === 1) return formData.prompt.trim();
+    if (step === 2) return selectedVideo; // ⭐ require video selection
     if (step === 4) return formData.voiceover && formData.voiceover.trim();
     return true;
+  };
+
+  const handleSelectVideo = (video) => {
+    setSelectedVideo(video);
+    setFormData((prev) => ({ ...prev, selectedVideo: video }));
+    console.log("✅ User selected video:", video);
+  };
+
+  // ⭐ Generate ElevenLabs audio when moving forward from step 2 → 3
+  const handleNext = async () => {
+    if (step === 2) {
+      if (!selectedVideo) {
+        alert("Please select a video first!");
+        return;
+      }
+      try {
+        const res = await fetch("http://localhost:5000/api/generate-audio", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: formData.prompt,
+            voice: formData.voiceover || "default",
+          }),
+        });
+
+        if (!res.ok) {
+          const errorData = await res.json();
+          throw new Error(errorData.error || "Failed to generate audio");
+        }
+
+        const data = await res.json();
+        const audioResponse = await fetch(data.audioUrl);
+        const blob = await audioResponse.blob();
+        const url = URL.createObjectURL(blob);
+        setAudioUrl(url);
+        setFormData((prev) => ({ ...prev, audioUrl: data.audioUrl }));
+
+        console.log("✅ Audio ready:", url);
+      } catch (err) {
+        console.error("Audio generation failed:", err);
+        alert("Audio generation failed: " + err.message);
+      }
+    }
+
+    setStep(step + 1);
   };
 
   const renderStep = () => {
     switch (step) {
       case 1:
         return <Step1Prompt formData={formData} setFormData={setFormData} />;
+
       case 2:
-       return (
-  <>
-    <Step2Template formData={formData} setFormData={setFormData} videos={videos} />
-    <div className="mt-6">
-      <h3 className="text-lg font-semibold mb-2">Pexels Videos</h3>
-      <div className="grid grid-cols-3 gap-4">
-        {videos.map((video) => (
-          <video
-            key={video.id}
-            src={video.video_files[0].link}
-            controls
-            className="rounded-lg shadow-md"
-          />
-        ))}
-      </div>
-    </div>
-  </>
-);
+        return (
+          <>
+            <Step2Template
+              formData={formData}
+              setFormData={setFormData}
+              videos={videos}
+            />
+
+            {/* Pexels Videos Section */}
+            <div className="mt-6">
+              <h3 className="text-lg font-semibold mb-2">Pexels Videos</h3>
+              <div className="grid grid-cols-2 gap-4">
+                {videos.map((video) => {
+                  const mp4File =
+                    video.video_files.find(
+                      (file) => file.file_type === "video/mp4" && file.quality === "sd"
+                    ) || video.video_files[0];
+
+                  return (
+                    <div
+                      key={video.id}
+                      className={`cursor-pointer rounded-lg overflow-hidden shadow-md border-2 ${
+                        selectedVideo?.id === video.id
+                          ? "border-green-500"
+                          : "border-transparent"
+                      }`}
+                      onClick={() => handleSelectVideo(video)}
+                    >
+                      <video
+                        src={mp4File.link}
+                        className="w-full h-40 object-cover"
+                        muted
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+
+              {selectedVideo && (
+                <div className="mt-4 p-3 border rounded bg-gray-50">
+                  <p className="font-medium">
+                    ✅ Selected Video ID: {selectedVideo.id}
+                  </p>
+                  <video
+                    src={
+                      selectedVideo.video_files.find(
+                        (f) => f.file_type === "video/mp4" && f.quality === "sd"
+                      )?.link || selectedVideo.video_files[0].link
+                    }
+                    controls
+                    className="mt-2 w-full rounded-lg"
+                  />
+                </div>
+              )}
+            </div>
+          </>
+        );
 
       case 3:
-        return <Step3Styles formData={formData} setFormData={setFormData} />;
+        return (
+          <div>
+            <Step3Styles formData={formData} setFormData={setFormData} />
+            {audioUrl && (
+              <div className="mt-4 p-3 border rounded bg-gray-50">
+                <p className="font-medium">🎵 Generated Audio Preview</p>
+                <audio controls src={audioUrl} className="mt-2 w-full" />
+              </div>
+            )}
+          </div>
+        );
+
       case 4:
         return <Step4VoiceSelect formData={formData} setFormData={setFormData} />;
       case 5:
@@ -112,6 +217,7 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
     }
   };
 
+  // ⭐ Updated handleSubmit with audioUrl + selectedVideo
   const handleSubmit = async () => {
     if (!formData.prompt.trim()) return;
 
@@ -129,8 +235,10 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           prompt: formData.prompt,
-          duration: formData.duration,
+          selectedVideo: formData.selectedVideo,
+          audioUrl: formData.audioUrl,
           voiceover: formData.voiceover,
+          duration: formData.duration,
         }),
       });
 
@@ -160,6 +268,8 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
     setSubtitlesUrl(null);
     setError(null);
     setProgress(0);
+    setSelectedVideo(null);
+    setAudioUrl(null);
   };
 
   if (!isOpen) return null;
@@ -174,6 +284,7 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
           ✕
         </button>
 
+        {/* Progress steps */}
         <div className="flex items-center gap-2 mb-6 flex-wrap">
           {steps.map((s) => (
             <div
@@ -193,7 +304,13 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
               <video controls autoPlay className="w-full h-full object-contain">
                 <source src={videoUrl} type="video/mp4" />
                 {subtitlesUrl && (
-                  <track src={subtitlesUrl} kind="subtitles" srcLang="en" label="English" default />
+                  <track
+                    src={subtitlesUrl}
+                    kind="subtitles"
+                    srcLang="en"
+                    label="English"
+                    default
+                  />
                 )}
               </video>
             </div>
@@ -227,7 +344,10 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
             {loading ? (
               <div className="flex flex-col items-center py-8">
                 <div className="w-full bg-gray-200 rounded-full h-2.5 mb-4">
-                  <div className="bg-[#2ecc71] h-2.5 rounded-full" style={{ width: `${progress}%` }} />
+                  <div
+                    className="bg-[#2ecc71] h-2.5 rounded-full"
+                    style={{ width: `${progress}%` }}
+                  />
                 </div>
                 <p className="text-gray-600">
                   {progress < 100 ? "Generating your video..." : "Finalizing..."}
@@ -256,7 +376,7 @@ const IdeaToVideoModal = ({ isOpen, onClose }) => {
 
             {step < 5 ? (
               <button
-                onClick={() => setStep(step + 1)}
+                onClick={handleNext}
                 className={`px-4 py-2 rounded-md text-white ${
                   canProceed() ? "bg-[#2ecc71] hover:bg-[#27ae60]" : "bg-gray-400 cursor-not-allowed"
                 }`}
