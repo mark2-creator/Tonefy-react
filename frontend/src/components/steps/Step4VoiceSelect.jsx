@@ -5,15 +5,9 @@ console.log(
   Boolean(import.meta.env.VITE_ELEVENLABS_API_KEY)
 );
 
-export default function Step4VoiceSelect({ formData, setFormData }) {
+export default function Step4VoiceSelect({ formData, setFormData, availableVoices }) {
   const [playing, setPlaying] = useState(false);
   const [loadingVoice, setLoadingVoice] = useState(null);
-
-  const VOICE_OPTIONS = [
-    { id: "19STyYD15bswVz51nqLf", name: "Samara", gender: "Female" },
-    { id: "wJqPPQ618aTW29mptyoc", name: "Ana Rita", gender: "Female" },
-    { id: "wBXNqKUATyqu0RtYt25i", name: "Adam", gender: "Male" }
-  ];
 
   const handlePreview = (objectUrl) => {
     const audio = new Audio(objectUrl);
@@ -58,35 +52,73 @@ export default function Step4VoiceSelect({ formData, setFormData }) {
       <h2 className="text-2xl font-bold text-gray-800">Step 4: Select Voice</h2>
       
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {VOICE_OPTIONS.map((voice) => (
+        {availableVoices.length > 0 ? (
+          availableVoices.map((voice) => (
+            <div
+              key={voice.voice_id}
+              className={`p-4 border rounded-lg cursor-pointer transition-all ${
+                formData.voiceover === voice.voice_id
+                  ? "border-green-500 bg-green-50 ring-2 ring-green-200"
+                  : "border-gray-300 hover:border-blue-400 hover:bg-blue-50"
+              }`}
+              onClick={() =>
+                setFormData((prev) => ({ ...prev, voiceover: voice.voice_id }))
+              }
+            >
+              <h3 className="font-semibold text-lg">{voice.name}</h3>
+              <p className="text-sm text-gray-600">{voice.category || "Custom"}</p>
+              <button
+                type="button"
+                className="mt-3 px-3 py-1 bg-blue-500 text-white text-sm rounded hover:bg-blue-600"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleGeneratePreview(voice.voice_id);
+                }}
+              >
+                {loadingVoice === voice.voice_id
+                  ? "⏳ Generating..."
+                  : playing && formData.voiceover === voice.voice_id
+                  ? "▶ Playing..."
+                  : "▶ Preview"}
+              </button>
+            </div>
+          ))
+        ) : (
           <div
-            key={voice.id}
             className={`p-4 border rounded-lg cursor-pointer transition-all ${
-              formData.voiceover === voice.id
+              formData.voiceover === "qBDvhofpxp92JgXJxDjB"
                 ? "border-green-500 bg-green-50 ring-2 ring-green-200"
                 : "border-gray-300 hover:border-blue-400 hover:bg-blue-50"
             }`}
-            onClick={() => setFormData(prev => ({ ...prev, voiceover: voice.id }))}
+            onClick={() =>
+              setFormData((prev) => ({ ...prev, voiceover: "qBDvhofpxp92JgXJxDjB" }))
+            }
           >
-            <h3 className="font-semibold text-lg">{voice.name}</h3>
-            <p className="text-sm text-gray-600">{voice.gender}</p>
+            <h3 className="font-semibold text-lg">Ana Rita</h3>
+            <p className="text-sm text-gray-600">Custom</p>
             <button
               type="button"
               className="mt-3 px-3 py-1 bg-blue-500 text-white text-sm rounded hover:bg-blue-600"
               onClick={(e) => {
                 e.stopPropagation();
-                handleGeneratePreview(voice.id);
+                handleGeneratePreview("qBDvhofpxp92JgXJxDjB");
               }}
             >
-              {loadingVoice === voice.id ? "⏳ Generating..." : playing ? "▶ Playing..." : "▶ Preview"}
+              {loadingVoice === "qBDvhofpxp92JgXJxDjB"
+                ? "⏳ Generating..."
+                : playing && formData.voiceover === "qBDvhofpxp92JgXJxDjB"
+                ? "▶ Playing..."
+                : "▶ Preview"}
             </button>
           </div>
-        ))}
+        )}
       </div>
 
       <div className="bg-gray-50 p-4 rounded-lg">
         <p className="text-sm text-gray-600">
-          Selected voice: {VOICE_OPTIONS.find(v => v.id === formData.voiceover)?.name || "None"}
+          Selected voice:{" "}
+          {availableVoices.find((v) => v.voice_id === formData.voiceover)?.name ||
+            (formData.voiceover === "qBDvhofpxp92JgXJxDjB" ? "Ana Rita" : "None")}
         </p>
       </div>
     </div>
