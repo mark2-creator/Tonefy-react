@@ -475,9 +475,9 @@ app.post("/api/idea-to-video", async (req, res) => {
 
     let ffmpegCmd;
     if (hasBgMusic) {
-      ffmpegCmd = `ffmpeg -y -stream_loop -1 -i "${videoPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${audioDuration} -filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.15[music];[voice][music]amix=inputs=2:duration=first[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset fast -crf 26 -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
+      ffmpegCmd = `ffmpeg -y -stream_loop -1 -i "${videoPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${audioDuration} -filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.15[music];[voice][music]amix=inputs=2:duration=first[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset fast -crf 26 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
     } else {
-      ffmpegCmd = `ffmpeg -y -stream_loop -1 -i "${videoPath}" -i "${audioPathLocal}" -t ${audioDuration} -vf "${vf}" -c:v libx264 -preset fast -crf 26 -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
+      ffmpegCmd = `ffmpeg -y -stream_loop -1 -i "${videoPath}" -i "${audioPathLocal}" -t ${audioDuration} -vf "${vf}" -c:v libx264 -preset fast -crf 26 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
     }
 
     updateJob(jobId, { progress: 40, message: "Merging video & audio..." });
@@ -719,9 +719,9 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
 
     let ffmpegCmd;
     if (hasBgMusic) {
-      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${totalAudioDuration} -filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.15[music];[voice][music]amix=inputs=2:duration=first[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset fast -crf 26 -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
+      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${totalAudioDuration} -filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.15[music];[voice][music]amix=inputs=2:duration=first[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset fast -crf 26 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
     } else {
-      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -t ${totalAudioDuration} -vf "${vf}" -c:v libx264 -preset fast -crf 26 -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
+      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -t ${totalAudioDuration} -vf "${vf}" -c:v libx264 -preset fast -crf 26 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
     }
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, { timeout: 180000 }, (err, stdout, stderr) => {
