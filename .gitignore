@@ -1,0 +1,8 @@
+node_modules/
+backend/.env
+backend/serviceAccountKey.json
+backend/serviceAccountKey.json.old
+*.log
+backend/public/videos/*.mp4
+backend/public/audios/*.mp3
+backend/videos/*.mp4
