@@ -175,17 +175,38 @@ function buildCaptionFilter(script, audioDuration) {
   });
   return filters.join(',');
 }
-function buildAssFile(script, audioDuration, assPath, captionStyle) {
+function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestamps = null) {
   const words = script.replace(/[\n\r]+/g, ' ').trim().split(/\s+/).filter(Boolean);
   if (words.length === 0) return false;
 
-  // Premium: 2-3 words per chunk for dynamic feel
-  const chunkSize = captionStyle === 'word' ? 1 : 3;
-  const chunks = [];
-  for (let i = 0; i < words.length; i += chunkSize) {
-    chunks.push(words.slice(i, i + chunkSize).join(' '));
+  // Use whisper word timestamps if available, otherwise estimate
+  let chunks, chunkTimings;
+  if (wordTimestamps && wordTimestamps.length > 0) {
+    // Animated styles: one word per line with exact timing
+    const ANIMATED = ['highlight','sticker','shadow3d','tiktok','neon','fire','bold','purple'];
+    if (ANIMATED.includes(captionStyle)) {
+      chunks = wordTimestamps.map(w => w.word);
+      chunkTimings = wordTimestamps.map(w => ({ start: w.start, end: w.end }));
+    } else {
+      // Group into 3-word chunks using whisper timing
+      chunks = [];
+      chunkTimings = [];
+      for (let i = 0; i < wordTimestamps.length; i += 3) {
+        const group = wordTimestamps.slice(i, i + 3);
+        chunks.push(group.map(w => w.word).join(' '));
+        chunkTimings.push({ start: group[0].start, end: group[group.length-1].end });
+      }
+    }
+  } else {
+    // Fallback: estimate timing
+    const chunkSize = captionStyle === 'word' ? 1 : 3;
+    chunks = [];
+    for (let i = 0; i < words.length; i += chunkSize) {
+      chunks.push(words.slice(i, i + chunkSize).join(' '));
+    }
+    const timePerChunk = audioDuration / chunks.length;
+    chunkTimings = chunks.map((_, i) => ({ start: i * timePerChunk, end: Math.min((i+1) * timePerChunk, audioDuration) }));
   }
-  const timePerChunk = audioDuration / chunks.length;
 
   const toAssTime = (s) => {
     const h = Math.floor(s / 3600).toString().padStart(1, '0');
@@ -195,63 +216,95 @@ function buildAssFile(script, audioDuration, assPath, captionStyle) {
     return `${h}:${m}:${sec}.${cs}`;
   };
 
-  // Premium styles
-  const styles = {
-    // Bold white text, thick black outline, drop shadow - CapCut style
+  // Advanced caption styles
+  const STYLES = {
     "classic": {
-      fontname: "Arial",
-      fontsize: 26,
-      primary: "&H00FFFFFF",   // white text
-      outline: "&H00000000",   // black outline
-      back: "&H80000000",      // semi-transparent shadow
-      bold: 1,
-      outline_w: 3,
-      shadow: 1.5,
-      alignment: 2,            // center bottom
-      marginV: 80
+      fontname:"Arial", fontsize:26, bold:1,
+      primary:"&H00FFFFFF", outline:"&H00000000", back:"&H80000000",
+      outline_w:3, shadow:1.5, alignment:2, marginV:80, spacing:0,
+      borderStyle:1, italic:0,
+      transform: t => t.toUpperCase(),
     },
-    // Yellow highlighted text - TikTok style
     "tiktok": {
-      fontname: "Arial",
-      fontsize: 28,
-      primary: "&H00FFFF00",   // yellow
-      outline: "&H00000000",   // black outline
-      back: "&H90000000",
-      bold: 1,
-      outline_w: 3,
-      shadow: 1,
-      alignment: 2,
-      marginV: 80
+      fontname:"Arial", fontsize:30, bold:1,
+      primary:"&H0000FFFF", outline:"&H00000000", back:"&H90000000",
+      outline_w:4, shadow:2, alignment:2, marginV:80, spacing:0,
+      borderStyle:1, italic:0,
+      transform: t => t.toUpperCase(),
     },
-    // White bold text with green highlight outline
     "neon": {
-      fontname: "Arial",
-      fontsize: 26,
-      primary: "&H00FFFFFF",
-      outline: "&H0000FF00",   // green outline
-      back: "&H90000000",
-      bold: 1,
-      outline_w: 3,
-      shadow: 0,
-      alignment: 2,
-      marginV: 80
+      fontname:"Arial", fontsize:26, bold:1,
+      primary:"&H007FFF00", outline:"&H00003300", back:"&H00000000",
+      outline_w:3, shadow:0, alignment:2, marginV:80, spacing:1,
+      borderStyle:1, italic:0,
+      transform: t => t.toUpperCase(),
     },
-    // Large bold white - Reels style
-    "reels": {
-      fontname: "Arial",
-      fontsize: 30,
-      primary: "&H00FFFFFF",
-      outline: "&H00000000",
-      back: "&HAA000000",
-      bold: 1,
-      outline_w: 4,
-      shadow: 2,
-      alignment: 2,
-      marginV: 100
-    }
+    "fire": {
+      fontname:"Arial", fontsize:28, bold:1,
+      primary:"&H000045FF", outline:"&H00000099", back:"&H00000000",
+      outline_w:3, shadow:1, alignment:2, marginV:80, spacing:0,
+      borderStyle:1, italic:0,
+      transform: t => t.toUpperCase(),
+    },
+    "sticker": {
+      fontname:"Arial", fontsize:26, bold:1,
+      primary:"&H00000000", outline:"&H00FFFFFF", back:"&H00FFFFFF",
+      outline_w:8, shadow:0, alignment:2, marginV:80, spacing:0,
+      borderStyle:3, italic:0,
+      transform: t => t.toUpperCase(),
+    },
+    "shadow3d": {
+      fontname:"Arial", fontsize:28, bold:1,
+      primary:"&H00FFFFFF", outline:"&H00000000", back:"&HAA333333",
+      outline_w:2, shadow:4, alignment:2, marginV:80, spacing:0,
+      borderStyle:1, italic:0,
+      transform: t => t.toUpperCase(),
+    },
+    "highlight": {
+      fontname:"Arial", fontsize:26, bold:1,
+      primary:"&H0000FFFF", outline:"&H00000000", back:"&H00000000",
+      outline_w:3, shadow:1, alignment:2, marginV:80, spacing:0,
+      borderStyle:1, italic:0,
+      transform: (t, i) => i % 2 === 0 ? t.toUpperCase() : t.toLowerCase(),
+    },
+    "outline": {
+      fontname:"Arial", fontsize:28, bold:1,
+      primary:"&H00000000", outline:"&H00FFFFFF", back:"&H00000000",
+      outline_w:3, shadow:0, alignment:2, marginV:80, spacing:1,
+      borderStyle:1, italic:0,
+      transform: t => t.toUpperCase(),
+    },
+    "cinematic": {
+      fontname:"Arial", fontsize:22, bold:0,
+      primary:"&H00FFFFFF", outline:"&H00000000", back:"&H80000000",
+      outline_w:1, shadow:2, alignment:2, marginV:120, spacing:3,
+      borderStyle:1, italic:1,
+      transform: t => t.toUpperCase(),
+    },
+    "minimal": {
+      fontname:"Arial", fontsize:20, bold:0,
+      primary:"&H00FFFFFF", outline:"&H00000000", back:"&H00000000",
+      outline_w:1, shadow:0, alignment:2, marginV:80, spacing:0,
+      borderStyle:1, italic:0,
+      transform: t => t,
+    },
+    "bold": {
+      fontname:"Arial", fontsize:32, bold:1,
+      primary:"&H00FFFFFF", outline:"&H00000000", back:"&H00000000",
+      outline_w:5, shadow:3, alignment:2, marginV:80, spacing:0,
+      borderStyle:1, italic:0,
+      transform: t => t.toUpperCase(),
+    },
+    "purple": {
+      fontname:"Arial", fontsize:28, bold:1,
+      primary:"&H00FF00FF", outline:"&H00000000", back:"&H00000000",
+      outline_w:3, shadow:2, alignment:2, marginV:80, spacing:0,
+      borderStyle:1, italic:0,
+      transform: t => t.toUpperCase(),
+    },
   };
 
-  const s = styles[captionStyle] || styles["classic"];
+  const s = STYLES[captionStyle] || STYLES["classic"];
 
   const header = `[Script Info]
 ScriptType: v4.00+
@@ -262,19 +315,94 @@ WrapStyle: 1
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,${s.fontname},${s.fontsize},${s.primary},&H000000FF,${s.outline},${s.back},${s.bold},0,0,0,100,100,0.5,0,1,${s.outline_w},${s.shadow},${s.alignment},20,20,${s.marginV},1
+Style: Default,${s.fontname},${s.fontsize},${s.primary},&H000000FF,${s.outline},${s.back},${s.bold},${s.italic},0,0,100,100,${s.spacing},0,${s.borderStyle},${s.outline_w},${s.shadow},${s.alignment},20,20,${s.marginV},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
-  const events = chunks.map((chunk, i) => {
-    const start = i * timePerChunk;
-    const end = Math.min((i + 1) * timePerChunk, audioDuration);
-    // Clean and uppercase for premium look
-    const safeChunk = chunk.replace(/[}{]/g, '').toUpperCase();
-    return `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${safeChunk}`;
-  });
+  const ANIMATED_STYLES = ['highlight','sticker','shadow3d','tiktok','neon','fire','bold','purple'];
+  const isAnimated = ANIMATED_STYLES.includes(captionStyle) && wordTimestamps?.length > 0;
+
+  // Position variation — alternate center/bottom every 5 words
+  const getMarginV = (i) => {
+    const positions = [80, 80, 80, 80, 80, 80, 80, 80, 80, 80];
+    return positions[i % positions.length];
+  };
+
+  const makeLines = (chunk, i) => {
+    const start = chunkTimings[i].start;
+    const end = chunkTimings[i].end;
+    const dur = end - start;
+    const popEnd = start + Math.min(0.15, dur * 0.35); // 150ms pop
+    const text = (s.transform ? s.transform(chunk, i) : chunk).replace(/[}{]/g, '');
+    const mv = getMarginV(i); // position variation
+     // center screen or default bottom
+
+    if (!isAnimated) {
+      return [`Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,${mv},,${pos}${text}`];
+    }
+
+    switch(captionStyle) {
+      case 'tiktok':
+      case 'highlight':
+        // 160% pop → cyan, settle to yellow
+        return [
+          `Dialogue: 0,${toAssTime(start)},${toAssTime(popEnd)},Default,,0,0,${mv},,${pos}{\\fscx160\\fscy160\\1c&H00FFFF&\\3c&H000000&\\bord3}${text}`,
+          `Dialogue: 0,${toAssTime(popEnd)},${toAssTime(end)},Default,,0,0,${mv},,${pos}{\\fscx100\\fscy100\\1c&H00FFFF&\\3c&H000000&\\bord4}${text}`,
+        ];
+      case 'neon':
+        // 160% pop → bright green glow
+        return [
+          `Dialogue: 0,${toAssTime(start)},${toAssTime(popEnd)},Default,,0,0,${mv},,${pos}{\\fscx160\\fscy160\\1c&H007FFF00&\\3c&H00003300&\\blur4\\bord3}${text}`,
+          `Dialogue: 0,${toAssTime(popEnd)},${toAssTime(end)},Default,,0,0,${mv},,${pos}{\\fscx100\\fscy100\\1c&H007FFF00&\\3c&H00003300&\\blur2\\bord3}${text}`,
+        ];
+      case 'fire':
+        // 160% pop → orange/red
+        return [
+          `Dialogue: 0,${toAssTime(start)},${toAssTime(popEnd)},Default,,0,0,${mv},,${pos}{\\fscx160\\fscy160\\1c&H000045FF&\\3c&H00000099&\\bord4}${text}`,
+          `Dialogue: 0,${toAssTime(popEnd)},${toAssTime(end)},Default,,0,0,${mv},,${pos}{\\fscx100\\fscy100\\1c&H000045FF&\\3c&H00000099&\\bord3}${text}`,
+        ];
+      case 'bold':
+        // 160% white pop with heavy border
+        return [
+          `Dialogue: 0,${toAssTime(start)},${toAssTime(popEnd)},Default,,0,0,${mv},,${pos}{\\fscx160\\fscy160\\1c&H00FFFFFF&\\3c&H00000000&\\bord6\\shad4}${text}`,
+          `Dialogue: 0,${toAssTime(popEnd)},${toAssTime(end)},Default,,0,0,${mv},,${pos}{\\fscx100\\fscy100\\1c&H00FFFFFF&\\3c&H00000000&\\bord5\\shad3}${text}`,
+        ];
+      case 'sticker': {
+        // Colored box: use BorderStyle 3 + OutlineColour for box, white text
+        const boxColors = [
+          {box:'&H0033CCFF&', txt:'&H00FFFFFF&'}, // orange
+          {box:'&H00FF0090&', txt:'&H00FFFFFF&'}, // pink
+          {box:'&H0000CC00&', txt:'&H00FFFFFF&'}, // green
+          {box:'&H00FFCC00&', txt:'&H00000000&'}, // yellow, black text
+          {box:'&H00CC0000&', txt:'&H00FFFFFF&'}, // blue
+          {box:'&H00990099&', txt:'&H00FFFFFF&'}, // purple
+        ];
+        const bc = boxColors[i % boxColors.length];
+        return [
+          `Dialogue: 0,${toAssTime(start)},${toAssTime(popEnd)},Default,,0,0,${mv},,{\\fscx160\\fscy160\\1c${bc.txt}\\3c${bc.box}\\bord14\\shad0\\BorderStyle3}${text}`,
+          `Dialogue: 0,${toAssTime(popEnd)},${toAssTime(end)},Default,,0,0,${mv},,{\\fscx100\\fscy100\\1c${bc.txt}\\3c${bc.box}\\bord12\\shad0\\BorderStyle3}${text}`,
+        ];
+      }
+      case 'shadow3d':
+        // Deep 3D shadow pop
+        return [
+          `Dialogue: 0,${toAssTime(start)},${toAssTime(popEnd)},Default,,0,0,${mv},,${pos}{\\fscx160\\fscy160\\1c&H00FFFFFF&\\shad10\\3c&H00333333&\\bord2}${text}`,
+          `Dialogue: 0,${toAssTime(popEnd)},${toAssTime(end)},Default,,0,0,${mv},,${pos}{\\fscx100\\fscy100\\1c&H00FFFFFF&\\shad6\\3c&H00333333&\\bord2}${text}`,
+        ];
+      case 'purple':
+        // Purple glow pop
+        return [
+          `Dialogue: 0,${toAssTime(start)},${toAssTime(popEnd)},Default,,0,0,${mv},,${pos}{\\fscx160\\fscy160\\1c&H00FF00FF&\\3c&H00330033&\\blur3\\bord3}${text}`,
+          `Dialogue: 0,${toAssTime(popEnd)},${toAssTime(end)},Default,,0,0,${mv},,${pos}{\\fscx100\\fscy100\\1c&H00FF00FF&\\3c&H00330033&\\blur1\\bord3}${text}`,
+        ];
+      default:
+        return [`Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,${mv},,${pos}${text}`];
+    }
+  };
+
+  const events = chunks.flatMap((chunk, i) => makeLines(chunk, i));
 
   fs.writeFileSync(assPath, header + events.join('\n') + '\n', 'utf8');
   return true;
@@ -351,12 +479,18 @@ const VOICES = {
 // ASS style definitions — each returns full ASS Style line values
 const CAPTION_STYLES = {
   // Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-  "classic": "Arial,18,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,40,1",
-  "tiktok":  "Arial,22,&H00FFFF00,&H000000FF,&H00000000,&HAA000000,1,0,0,0,100,100,0,0,3,2,0,2,10,10,40,1",
-  "bold":    "Arial,28,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,4,2,2,10,10,40,1",
-  "neon":    "Arial,20,&H007FFF00,&H000000FF,&H00003300,&H00000000,1,0,0,0,100,100,1,0,1,3,1,2,10,10,40,1",
-  "fire":    "Arial,22,&H000066FF,&H000000FF,&H00000099,&H00000000,1,0,0,0,100,100,0,0,1,3,1,2,10,10,40,1",
-  "minimal": "Arial,15,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,30,1",
+  "classic":    "Arial,26,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,1.5,2,20,20,80,1",
+  "tiktok":     "Arial,30,&H0000FFFF,&H000000FF,&H00000000,&H90000000,1,0,0,0,100,100,0,0,1,4,2,2,20,20,80,1",
+  "neon":       "Arial,26,&H007FFF00,&H000000FF,&H00003300,&H00000000,1,0,0,0,100,100,1,0,1,3,0,2,20,20,80,1",
+  "fire":       "Arial,28,&H000045FF,&H000000FF,&H00000099,&H00000000,1,0,0,0,100,100,0,0,1,3,1,2,20,20,80,1",
+  "sticker":    "Arial,26,&H00000000,&H000000FF,&H00FFFFFF,&H00FFFFFF,1,0,0,0,100,100,0,0,3,8,0,2,20,20,80,1",
+  "shadow3d":   "Arial,28,&H00FFFFFF,&H000000FF,&H00000000,&HAA333333,1,0,0,0,100,100,0,0,1,2,4,2,20,20,80,1",
+  "highlight":  "Arial,26,&H0000FFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,3,1,2,20,20,80,1",
+  "outline":    "Arial,28,&H00000000,&H000000FF,&H00FFFFFF,&H00000000,1,0,0,0,100,100,1,0,1,3,0,2,20,20,80,1",
+  "cinematic":  "Arial,22,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,1,0,0,100,100,3,0,1,1,2,2,20,20,120,1",
+  "minimal":    "Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,20,20,80,1",
+  "bold":       "Arial,32,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,5,3,2,20,20,80,1",
+  "purple":     "Arial,28,&H00FF00FF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,3,2,2,20,20,80,1",
 };
 
 app.post("/api/generate-audio", async (req, res) => {
@@ -672,36 +806,151 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
       fs.copyFileSync(clipPaths[0], concatPath);
     } else {
       // Build transitions between clips
-      const TMAP = {fade:'fade',slide:'slideleft',slideup:'slideup',zoom:'zoom',wipe:'wipeleft',blur:'fadeblack',dissolve:'dissolve',none:'fade'};
-      const xft = TMAP[transition] || 'fade';
-      const XDUR = transition === 'none' ? 0.01 : 0.5;
-      const inputs = clipPaths.map(p => `-i "${p}"`).join(' ');
+      const XFADE_MAP = {
+        fade:'fade', wipeleft:'wipeleft', wiperight:'wiperight', wipeup:'wipeup', wipedown:'wipedown',
+        slideleft:'slideleft', slideright:'slideright', slideup:'slideup', slidedown:'slidedown',
+        circlecrop:'circlecrop', rectcrop:'rectcrop', distance:'distance',
+        fadeblack:'fadeblack', fadewhite:'fadewhite', radial:'radial',
+        smoothleft:'smoothleft', smoothright:'smoothright', smoothup:'smoothup', smoothdown:'smoothdown',
+        circleopen:'circleopen', circleclose:'circleclose',
+        vertopen:'vertopen', vertclose:'vertclose', horzopen:'horzopen', horzclose:'horzclose',
+        dissolve:'dissolve', pixelize:'pixelize',
+        diagtl:'diagtl', diagtr:'diagtr', diagbl:'diagbl', diagbr:'diagbr',
+        hlslice:'hlslice', hrslice:'hrslice', vuslice:'vuslice', vdslice:'vdslice',
+        hblur:'hblur', fadegrays:'fadegrays',
+        wipetl:'wipetl', wipetr:'wipetr', wipebl:'wipebl', wipebr:'wipebr',
+        squeezeh:'squeezeh', squeezev:'squeezev', zoomin:'zoomin',
+        fadefast:'fadefast', fadeslow:'fadeslow',
+        hlwind:'hlwind', hrwind:'hrwind', vuwind:'vuwind', vdwind:'vdwind',
+        coverleft:'coverleft', coverright:'coverright', coverup:'coverup', coverdown:'coverdown',
+        revealleft:'revealleft', revealright:'revealright', revealup:'revealup', revealdown:'revealdown',
+        // friendly aliases
+        slide:'slideleft', zoom:'zoomin', wipe:'wipeleft', blur:'fadeblack',
+        flashwhite:'fadewhite', glitch:'hblur', zoomdrive:'zoomin',
+        swipeleft:'coverleft', filmburn:'fadegrays', pixelate:'pixelize',
+      };
+      const CUSTOM_TRANSITIONS = ['flashwhite','glitch','zoomdrive','swipeleft','filmburn','pixelate'];
+      const isCustom = CUSTOM_TRANSITIONS.includes(transition);
+      const isNone = transition === 'none';
+      const XDUR = 0.5;
       let filterComplex, mapArg;
-      if (transition === 'none' || clipPaths.length < 2) {
-        // Simple concat without transitions
+      let finalClipPaths = [...clipPaths]; // may be replaced for custom transitions
+
+      if (isNone || clipPaths.length < 2) {
+        // Hard cut — simple concat
+        const inputs2 = clipPaths.map(p => `-i "${p}"`).join(' ');
         const filterInputs = clipPaths.map((_, i) => `[${i}:v]`).join('');
         filterComplex = `${filterInputs}concat=n=${clipPaths.length}:v=1:a=0[vout]`;
         mapArg = '[vout]';
+        const cmd2 = `ffmpeg -y ${inputs2} -filter_complex "${filterComplex}" -map "${mapArg}" -c:v libx264 -preset fast -crf 26 "${concatPath}"`;
+        await new Promise((resolve, reject) => {
+          exec(cmd2, { timeout: 180000 }, (err, stdout, stderr) => {
+            if (err) { console.error("concat error:", stderr?.slice(-500)); return reject(new Error("concat failed")); }
+            resolve();
+          });
+        });
+
+      } else if (isCustom) {
+        // Two-pass: render each transition pair separately, then simple-concat all pieces
+        const getCustomFilter = (w, h) => {
+          switch(transition) {
+            case 'flashwhite':
+              return `[0:v][1:v]xfade=transition=fade:duration=${XDUR}:offset=0[xf];[xf]curves=all='0/0 0.3/1 0.5/1 0.7/1 1/0'[vout]`;
+            case 'glitch':
+              return `[0:v][1:v]xfade=transition=slideleft:duration=${XDUR}:offset=0[vout]`;
+            case 'zoomdrive':
+              return `[0:v]scale=${Math.round(w*1.15)}:${Math.round(h*1.15)},crop=${w}:${h}[zoomed];[zoomed][1:v]xfade=transition=fade:duration=${XDUR}:offset=0[vout]`;
+            case 'swipeleft':
+              return `[0:v][1:v]xfade=transition=slideleft:duration=${XDUR}:offset=0[vout]`;
+            case 'filmburn':
+              return `[0:v]curves=red='0/0 0.5/1 1/1':green='0/0 0.4/0.7 1/1':blue='0/0 0.2/0.2 1/0.5'[burned];[burned][1:v]xfade=transition=fadeblack:duration=${XDUR}:offset=0[vout]`;
+            case 'pixelate':
+              return `[0:v]scale=iw/12:ih/12,scale=iw*12:ih*12:flags=neighbor[pA];[1:v]scale=iw/12:ih/12,scale=iw*12:ih*12:flags=neighbor[pB];[pA][pB]xfade=transition=fade:duration=${XDUR}:offset=0[vout]`;
+            default:
+              return `[0:v][1:v]xfade=transition=fade:duration=${XDUR}:offset=0[vout]`;
+          }
+        };
+
+        const dims = aspectRatio === '9:16' ? {w:720,h:1280} : aspectRatio === '1:1' ? {w:720,h:720} : {w:1280,h:720};
+        const minDur = Math.min(...segDurations);
+        const safeXDUR = Math.min(XDUR, minDur * 0.4);
+        const transClips = [];
+
+        for (let i = 0; i < clipPaths.length - 1; i++) {
+          // Main body of clip A (without last safeXDUR seconds)
+          const bodyDur = Math.max(0.1, segDurations[i] - safeXDUR);
+          const bodyPath = path.join(videosDir, uniqueName("body", "mp4"));
+          await new Promise((resolve) => {
+            exec(`ffmpeg -y -i "${clipPaths[i]}" -t ${bodyDur} -c:v libx264 -preset fast -crf 26 "${bodyPath}"`, {timeout:60000}, () => resolve());
+          });
+          transClips.push(bodyPath);
+
+          // Transition clip: last safeXDUR of A blended with first safeXDUR of B
+          const tailPath = path.join(videosDir, uniqueName("tail", "mp4"));
+          const headPath = path.join(videosDir, uniqueName("head", "mp4"));
+          const transPath = path.join(videosDir, uniqueName("trans", "mp4"));
+          await new Promise((resolve) => {
+            exec(`ffmpeg -y -sseof -${safeXDUR} -i "${clipPaths[i]}" -c:v libx264 -preset fast -crf 26 "${tailPath}"`, {timeout:30000}, () => resolve());
+          });
+          await new Promise((resolve) => {
+            exec(`ffmpeg -y -i "${clipPaths[i+1]}" -t ${safeXDUR} -c:v libx264 -preset fast -crf 26 "${headPath}"`, {timeout:30000}, () => resolve());
+          });
+          const tFilter = getCustomFilter(dims.w, dims.h);
+          await new Promise((resolve) => {
+            exec(`ffmpeg -y -i "${tailPath}" -i "${headPath}" -filter_complex "${tFilter}" -map "[vout]" -c:v libx264 -preset fast -crf 26 "${transPath}"`, {timeout:60000}, (err,s,se) => {
+              if(err) console.error("trans pair error:", se?.slice(-300));
+              resolve();
+            });
+          });
+          fs.unlink(tailPath, ()=>{});
+          fs.unlink(headPath, ()=>{});
+          if (fs.existsSync(transPath)) transClips.push(transPath);
+        }
+        // Add last clip body
+        const lastBodyPath = path.join(videosDir, uniqueName("body", "mp4"));
+        const lastIdx = clipPaths.length - 1;
+        await new Promise((resolve) => {
+          exec(`ffmpeg -y -i "${clipPaths[lastIdx]}" -c copy "${lastBodyPath}"`, {timeout:60000}, () => resolve());
+        });
+        transClips.push(lastBodyPath);
+
+        // Simple concat all pieces
+        const concatList = path.join(videosDir, uniqueName("list", "txt"));
+        fs.writeFileSync(concatList, transClips.map(p => `file '${p}'`).join('\n'));
+        await new Promise((resolve, reject) => {
+          exec(`ffmpeg -y -f concat -safe 0 -i "${concatList}" -c:v libx264 -preset fast -crf 26 "${concatPath}"`, {timeout:180000}, (err,s,se) => {
+            if(err) { console.error("concat error:", se?.slice(-500)); return reject(new Error("concat failed")); }
+            resolve();
+          });
+        });
+        fs.unlink(concatList, ()=>{});
+        transClips.forEach(p => fs.unlink(p, ()=>{}));
+
       } else {
-        // xfade transitions
-        let parts = [], cumDur = 0, prevLabel = '0:v';
+        // Standard xfade transitions — single pass
+        const xft = XFADE_MAP[transition] || 'fade';
+        const minClipDur = Math.min(...segDurations);
+        const safeXDUR = Math.min(XDUR, minClipDur * 0.4);
+        const inputs3 = clipPaths.map(p => `-i "${p}"`).join(' ');
+        let parts = [], timeline = 0, prevLabel = '0:v';
         for (let i = 1; i < clipPaths.length; i++) {
-          cumDur += segDurations[i-1];
-          const offset = Math.max(0, cumDur - XDUR * i);
+          timeline += Math.max(safeXDUR + 0.01, segDurations[i-1] - safeXDUR);
+          const offset = parseFloat(timeline.toFixed(2));
           const outLabel = i === clipPaths.length - 1 ? 'vout' : `v${i}`;
-          parts.push(`[${prevLabel}][${i}:v]xfade=transition=${xft}:duration=${XDUR}:offset=${offset.toFixed(2)}[${outLabel}]`);
+          parts.push(`[${prevLabel}][${i}:v]xfade=transition=${xft}:duration=${safeXDUR}:offset=${offset}[${outLabel}]`);
           prevLabel = outLabel;
         }
         filterComplex = parts.join(';');
         mapArg = '[vout]';
-      }
-      const cmd = `ffmpeg -y ${inputs} -filter_complex "${filterComplex}" -map "${mapArg}" -c:v libx264 -preset fast -crf 26 "${concatPath}"`;
-      await new Promise((resolve, reject) => {
-        exec(cmd, { timeout: 180000 }, (err, stdout, stderr) => {
-          if (err) { console.error("concat error:", stderr?.slice(-500)); return reject(new Error("concat failed")); }
-          resolve();
+        const cmd3 = `ffmpeg -y ${inputs3} -filter_complex "${filterComplex}" -map "${mapArg}" -c:v libx264 -preset fast -crf 26 "${concatPath}"`;
+        await new Promise((resolve, reject) => {
+          exec(cmd3, { timeout: 180000 }, (err, stdout, stderr) => {
+            if (err) { console.error("concat error:", stderr?.slice(-500)); return reject(new Error("concat failed")); }
+            resolve();
+          });
         });
-      });
+      }
+// transition exec handled per-branch above
     }
     clipPaths.forEach(p => fs.unlink(p, () => {}));
 
@@ -713,7 +962,23 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
     const hasBgMusic = fs.existsSync(musicPath);
     const watermark = "drawtext=text='Tonefy AI':fontsize=18:fontcolor=white@0.5:x=(w-text_w)/2:y=h-th-20";
     const assPath = outputVideo.replace('.mp4', '.ass');
-    const hasCaptions = buildAssFile(voiceover || "", totalAudioDuration, assPath, captionStyle);
+    // Run whisper for word-level timestamps
+    let wordTimestamps = null;
+    try {
+      const whisperResult = await new Promise((resolve) => {
+        exec(`python3 /home/ahumuza/Tonefy-react/backend/whisper_align.py "${audioPathLocal}" 2>/dev/null`, 
+          { timeout: 60000 }, (err, stdout) => {
+          if (!err && stdout.trim()) {
+            try { resolve(JSON.parse(stdout.trim())); } catch(e) { resolve(null); }
+          } else { resolve(null); }
+        });
+      });
+      wordTimestamps = whisperResult;
+      if (wordTimestamps) console.log(`Whisper: ${wordTimestamps.length} words aligned`);
+    } catch(e) { console.warn('Whisper failed, using estimated timing'); }
+    console.log("ASS path:", assPath, "voiceover len:", (voiceover||"").length);
+    const hasCaptions = buildAssFile(voiceover || "", totalAudioDuration, assPath, captionStyle, wordTimestamps);
+    console.log("hasCaptions:", hasCaptions, "file exists:", fs.existsSync(assPath));
     const subsFilter = hasCaptions ? `,ass='${assPath.replace(/'/g, "\\'")}'` : '';
     const vf = `setsar=1${subsFilter},${watermark}`;
 
@@ -731,7 +996,7 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
     });
 
     fs.unlink(concatPath, () => {});
-    if (hasCaptions) fs.unlink(assPath, () => {});
+    
 
     // Upload to Firebase Storage
     const videoFilename2 = path.basename(outputVideo);
