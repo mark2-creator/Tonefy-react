@@ -1,11 +1,13 @@
 import express from "express";
 import crypto from 'crypto';
 import fetch from "node-fetch";
+import * as cheerio from "cheerio";
 import fs from "fs";
 import path from "path";
-import { exec } from "child_process";
+import { exec, execFile } from "child_process";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
+dotenv.config();
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -71,7 +73,6 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -90,6 +91,30 @@ function createJob() {
 }
 function updateJob(jobId, data) { if (jobs.has(jobId)) jobs.set(jobId, { ...jobs.get(jobId), ...data }); }
 
+// Concurrency limiter for FFmpeg-heavy video generation
+let activeVideoJobs = 0;
+const MAX_CONCURRENT_VIDEO_JOBS = 4;
+const videoJobQueue = [];
+
+function acquireVideoSlot() {
+  return new Promise(resolve => {
+    if (activeVideoJobs < MAX_CONCURRENT_VIDEO_JOBS) {
+      activeVideoJobs++;
+      resolve();
+    } else {
+      videoJobQueue.push(resolve);
+    }
+  });
+}
+
+function releaseVideoSlot() {
+  activeVideoJobs--;
+  if (videoJobQueue.length > 0) {
+    activeVideoJobs++;
+    videoJobQueue.shift()();
+  }
+}
+
 const videosDir = path.join(__dirname, "public", "videos");
 const audiosDir = path.join(__dirname, "public", "audios");
 const uploadsDir = path.join(__dirname, "uploads");
@@ -98,6 +123,30 @@ const uploadsDir = path.join(__dirname, "uploads");
 
 app.use("/videos", express.static(videosDir, { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); res.setHeader("Accept-Ranges", "bytes"); } }));
 app.use("/audios", express.static(audiosDir, { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
+app.use("/music", express.static(path.join(__dirname, "public", "music"), { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
+
+function trackIdToDisplayName(id) {
+  return id
+    .replace(/^mixkit-/, "")
+    .replace(/-\d+$/, "")
+    .replace(/-/g, " ")
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+
+app.get("/api/music-tracks", (req, res) => {
+  try {
+    const musicDir = path.join(__dirname, "public", "music");
+    const files = fs.readdirSync(musicDir).filter(f => f.endsWith(".mp3"));
+    const tracks = files.map(f => {
+      const id = f.replace(/\.mp3$/, "");
+      return { id, name: trackIdToDisplayName(id), previewUrl: `/music/${f}` };
+    }).sort((a, b) => a.name.localeCompare(b.name));
+    res.json({ tracks });
+  } catch (err) {
+    console.error("music-tracks error:", err.message);
+    res.status(500).json({ error: "Failed to list tracks" });
+  }
+});
 app.use("/uploads", express.static(uploadsDir));
 
 exec("ffmpeg -version", (err, stdout) => {
@@ -105,16 +154,44 @@ exec("ffmpeg -version", (err, stdout) => {
   else console.log("FFmpeg found:", stdout.split("\n")[0]);
 });
 
+app.set("trust proxy", 1);
 app.use(helmet());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.use((req, res, next) => { console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`); next(); });
+// Global rate limit
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 1000,
-  skip: (req) => req.path.startsWith('/api/job/')
+  max: 100,
+  message: { error: 'Too many requests, please try again later.' },
+  skip: (req) => req.path.startsWith('/api/job/'),
+  validate: { xForwardedForHeader: false }
 }));
+
+// Strict limit for video generation (expensive: Groq + ElevenLabs + FFmpeg)
+const videoGenLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: { error: 'Video generation limit reached. Max 20 per hour.' },
+  validate: { xForwardedForHeader: false }
+});
+
+// Script/audio generation limit
+const scriptLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: { error: 'Too many requests. Max 20 per hour.' },
+  validate: { xForwardedForHeader: false }
+});
+
+// Pexels search limit
+const pexelsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { error: 'Too many search requests. Max 30 per 15 minutes.' },
+  validate: { xForwardedForHeader: false }
+});
 
 // Protect all /api/* routes — TikTok OAuth routes stay public
 app.use("/api", verifyToken);
@@ -337,7 +414,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const popEnd = start + Math.min(0.15, dur * 0.35); // 150ms pop
     const text = (s.transform ? s.transform(chunk, i) : chunk).replace(/[}{]/g, '');
     const mv = getMarginV(i); // position variation
-     // center screen or default bottom
+    const pos = ''; // position override tag (empty = use style default)
 
     if (!isAnimated) {
       return [`Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,${mv},,${pos}${text}`];
@@ -408,7 +485,93 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   return true;
 }
 
-app.post("/api/generate-script", async (req, res) => {
+app.post("/api/extract-url", scriptLimiter, verifyToken, async (req, res) => {
+  const { url } = req.body;
+  if (!url?.trim()) return res.status(400).json({ error: "URL required" });
+
+  // Validate URL
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) throw new Error('Invalid protocol');
+  } catch (e) {
+    return res.status(400).json({ error: "Invalid URL" });
+  }
+
+  try {
+    // Fetch the page
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      timeout: 15000,
+    });
+
+    if (!response.ok) return res.status(400).json({ error: `Failed to fetch URL: ${response.status}` });
+
+    const html = await response.text();
+    const $ = cheerio.load(html);
+
+    // Remove unwanted elements
+    $('script, style, nav, footer, header, iframe, noscript, aside, .ad, .ads, .advertisement, .cookie, .popup, .modal').remove();
+
+    // Try to get main content
+    let text = '';
+    const mainSelectors = ['article', 'main', '.content', '.post-content', '.entry-content', '.article-body', '#content', '.story-body'];
+    for (const sel of mainSelectors) {
+      const el = $(sel);
+      if (el.length && el.text().trim().length > 200) {
+        text = el.text();
+        break;
+      }
+    }
+
+    // Fallback to body
+    if (!text || text.length < 200) {
+      text = $('body').text();
+    }
+
+    // Clean up whitespace
+    text = text.replace(/\s+/g, ' ').replace(/\n+/g, ' ').trim();
+
+    // Limit to ~3000 chars for Groq
+    if (text.length > 3000) text = text.substring(0, 3000);
+
+    if (text.length < 100) return res.status(400).json({ error: "Could not extract enough content from this URL" });
+
+    // Get page title
+    const title = $('title').text().trim() || $('h1').first().text().trim() || 'Article';
+
+    // Use Groq to summarize into a video script
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages: [{
+        role: "user",
+        content: `Convert this article/webpage content into a short, engaging video script (60-90 seconds when spoken). Write it as natural spoken narration, no headers or bullet points. Keep it informative and engaging.
+
+Title: ${title}
+
+Content: ${text}
+
+Video script:`
+      }],
+      max_tokens: 400,
+      temperature: 0.7,
+    });
+
+    const script = completion.choices[0]?.message?.content?.trim();
+    if (!script) return res.status(500).json({ error: "Failed to generate script from URL" });
+
+    res.json({ script, title, url });
+  } catch (err) {
+    console.error("extract-url error:", err.message);
+    res.status(500).json({ error: "Failed to process URL: " + err.message });
+  }
+});
+
+app.post("/api/generate-script", scriptLimiter, async (req, res) => {
   const { prompt } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
   try {
@@ -447,7 +610,7 @@ app.post("/api/extract-keywords", async (req, res) => {
   }
 });
 
-app.post("/api/search-pexels-videos", async (req, res) => {
+app.post("/api/search-pexels-videos", pexelsLimiter, async (req, res) => {
   const { query, keywords } = req.body;
   if (!query && !keywords) return res.status(400).json({ error: "Query required" });
   try {
@@ -493,7 +656,7 @@ const CAPTION_STYLES = {
   "purple":     "Arial,28,&H00FF00FF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,3,2,2,20,20,80,1",
 };
 
-app.post("/api/generate-audio", async (req, res) => {
+app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
   const { text, voiceId = "gtts-us" } = req.body;
   if (!text?.trim()) return res.status(400).json({ error: "Text is required" });
   try {
@@ -516,14 +679,14 @@ app.post("/api/generate-audio", async (req, res) => {
   }
 });
 
-app.post("/api/tts", async (req, res) => {
+app.post("/api/tts", scriptLimiter, async (req, res) => {
   const { text } = req.body;
   if (!text?.trim()) return res.status(400).json({ error: "text required" });
   try {
     const audioFilename = uniqueName("gtts", "mp3");
     const audioPath = path.join(audiosDir, audioFilename);
     await new Promise((resolve, reject) => {
-      exec(`python3 /home/ahumuza/Tonefy-react/backend/gtts_generate.py ${JSON.stringify(text)} ${JSON.stringify(audioPath)}`,
+      execFile('python3', ['/home/ahumuza/Tonefy-react/backend/gtts_generate.py', text, audioPath],
         (err) => err ? reject(err) : resolve());
     });
     res.json({ audioUrl: `/audios/${audioFilename}` });
@@ -538,8 +701,8 @@ app.get("/api/job/:jobId", (req, res) => {
   res.json(job);
 });
 
-app.post("/api/idea-to-video", async (req, res) => {
-  const { voiceover = "", selectedVideo, selectedVideos, audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic" } = req.body || {};
+app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
+  const { voiceover = "", selectedVideo, selectedVideos, audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0, transition = "fade" } = req.body || {};
   const jobId = createJob();
   res.json({ jobId }); // Return immediately
   try {
@@ -565,7 +728,7 @@ app.post("/api/idea-to-video", async (req, res) => {
       const audioFilename = uniqueName("gtts", "mp3");
       const ap = path.join(audiosDir, audioFilename);
       await new Promise((resolve, reject) => {
-        exec(`python3 /home/ahumuza/Tonefy-react/backend/gtts_generate.py ${JSON.stringify(voiceover)} ${JSON.stringify(ap)}`,
+        execFile('python3', ['/home/ahumuza/Tonefy-react/backend/gtts_generate.py', voiceover, ap],
           (err) => err ? reject(err) : resolve());
       });
       audioPathLocal = ap;
@@ -591,7 +754,8 @@ app.post("/api/idea-to-video", async (req, res) => {
     const outputVideo = path.join(videosDir, uniqueName("final", "mp4"));
 
     // Let FFmpeg download directly — avoids Pexels CDN 403 on server downloads
-    const safeTrack = ["background","chill","upbeat","dramatic","lofi"].includes(musicTrack) ? musicTrack : "background";
+    const availableTracks = fs.readdirSync(path.join(__dirname, "public", "music")).filter(f => f.endsWith(".mp3")).map(f => f.replace(/\.mp3$/, ""));
+    const safeTrack = availableTracks.includes(musicTrack) ? musicTrack : (availableTracks.includes("mixkit-deep-meditation-109") ? "mixkit-deep-meditation-109" : availableTracks[0]);
     const musicPath = path.join(__dirname, "public", "music", safeTrack + ".mp3");
     const hasBgMusic = fs.existsSync(musicPath);
     const watermark = "drawtext=text='Tonefy AI':fontsize=18:fontcolor=white@0.5:x=(w-text_w)/2:y=h-th-20";
@@ -609,9 +773,9 @@ app.post("/api/idea-to-video", async (req, res) => {
 
     let ffmpegCmd;
     if (hasBgMusic) {
-      ffmpegCmd = `ffmpeg -y -stream_loop -1 -i "${videoPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${audioDuration} -filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.15[music];[voice][music]amix=inputs=2:duration=first[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset fast -crf 26 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
+      ffmpegCmd = `ffmpeg -y -stream_loop -1 -i "${videoPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${audioDuration} -filter_complex "[1:a]volume=1.0,asplit=2[voice1][voice2];[2:a]volume=0.3[music_pre];[music_pre][voice1]sidechaincompress=threshold=0.03:ratio=8:attack=120:release=600:makeup=1[music_duck];[voice2][music_duck]amix=inputs=2:duration=first:normalize=0[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
     } else {
-      ffmpegCmd = `ffmpeg -y -stream_loop -1 -i "${videoPath}" -i "${audioPathLocal}" -t ${audioDuration} -vf "${vf}" -c:v libx264 -preset fast -crf 26 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
+      ffmpegCmd = `ffmpeg -y -stream_loop -1 -i "${videoPath}" -i "${audioPathLocal}" -t ${audioDuration} -vf "${vf}" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
     }
 
     updateJob(jobId, { progress: 40, message: "Merging video & audio..." });
@@ -681,7 +845,7 @@ Return ONLY a JSON array, no other text: [{"text":"...","keywords":"..."}]` },
   }
 });
 
-app.post("/api/search-pexels-segment", async (req, res) => {
+app.post("/api/search-pexels-segment", pexelsLimiter, async (req, res) => {
   const { keywords } = req.body;
   if (!keywords) return res.status(400).json({ error: "Keywords required" });
   try {
@@ -698,11 +862,12 @@ app.post("/api/search-pexels-segment", async (req, res) => {
   }
 });
 
-app.post("/api/idea-to-video-v2", async (req, res) => {
-  const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", transition = "fade", musicTrack = "background" } = req.body || {};
+app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
+  const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", transition = "fade", musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0 } = req.body || {};
   const jobId = createJob();
   res.json({ jobId });
 
+  await acquireVideoSlot();
   try {
     if (!segments.length) { updateJob(jobId, { status: "failed", message: "No segments provided" }); return; }
 
@@ -721,7 +886,7 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
       const audioFilename = uniqueName("gtts", "mp3");
       const ap = path.join(audiosDir, audioFilename);
       await new Promise((resolve, reject) => {
-        exec(`python3 /home/ahumuza/Tonefy-react/backend/gtts_generate.py ${JSON.stringify(voiceover)} ${JSON.stringify(ap)}`,
+        execFile('python3', ['/home/ahumuza/Tonefy-react/backend/gtts_generate.py', voiceover, ap],
           (err) => err ? reject(err) : resolve());
       });
       audioPathLocal = ap;
@@ -778,7 +943,7 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
       if (fs.existsSync(rawPath)) {
         // Trim/loop clip to exact segment duration, scale+crop, no audio
         await new Promise((resolve, reject) => {
-          const cmd = `ffmpeg -y -stream_loop -1 -i "${rawPath}" -t ${dur} -vf "${scaleFilter},setsar=1,fps=30" -an -c:v libx264 -preset fast -crf 26 -video_track_timescale 30000 "${trimmedPath}"`;
+          const cmd = `ffmpeg -y -stream_loop -1 -i "${rawPath}" -t ${dur} -vf "${scaleFilter},setsar=1,fps=30" -an -c:v libx264 -preset ultrafast -crf 28 -video_track_timescale 30000 "${trimmedPath}"`;
           exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
             if (err) { console.error("segment ffmpeg error:", stderr?.slice(-300)); return reject(new Error("segment ffmpeg failed")); }
             resolve();
@@ -790,7 +955,7 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
       if (!fs.existsSync(trimmedPath)) {
         // Fallback: black clip of correct duration
         await new Promise((resolve) => {
-          const cmd = `ffmpeg -y -f lavfi -i color=c=black:s=${aspectRatio === '9:16' ? '720x1280' : aspectRatio === '1:1' ? '720x720' : '1280x720'}:d=${dur}:r=30 -vf "setsar=1" -c:v libx264 -preset fast -crf 26 -video_track_timescale 30000 "${trimmedPath}"`;
+          const cmd = `ffmpeg -y -f lavfi -i color=c=black:s=${aspectRatio === '9:16' ? '720x1280' : aspectRatio === '1:1' ? '720x720' : '1280x720'}:d=${dur}:r=30 -vf "setsar=1" -c:v libx264 -preset ultrafast -crf 28 -video_track_timescale 30000 "${trimmedPath}"`;
           exec(cmd, { timeout: 30000 }, () => resolve());
         });
       }
@@ -842,7 +1007,7 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
         const filterInputs = clipPaths.map((_, i) => `[${i}:v]`).join('');
         filterComplex = `${filterInputs}concat=n=${clipPaths.length}:v=1:a=0[vout]`;
         mapArg = '[vout]';
-        const cmd2 = `ffmpeg -y ${inputs2} -filter_complex "${filterComplex}" -map "${mapArg}" -c:v libx264 -preset fast -crf 26 "${concatPath}"`;
+        const cmd2 = `ffmpeg -y ${inputs2} -filter_complex "${filterComplex}" -map "${mapArg}" -c:v libx264 -preset ultrafast -crf 28 "${concatPath}"`;
         await new Promise((resolve, reject) => {
           exec(cmd2, { timeout: 180000 }, (err, stdout, stderr) => {
             if (err) { console.error("concat error:", stderr?.slice(-500)); return reject(new Error("concat failed")); }
@@ -881,7 +1046,7 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
           const bodyDur = Math.max(0.1, segDurations[i] - safeXDUR);
           const bodyPath = path.join(videosDir, uniqueName("body", "mp4"));
           await new Promise((resolve) => {
-            exec(`ffmpeg -y -i "${clipPaths[i]}" -t ${bodyDur} -c:v libx264 -preset fast -crf 26 "${bodyPath}"`, {timeout:60000}, () => resolve());
+            exec(`ffmpeg -y -i "${clipPaths[i]}" -t ${bodyDur} -c:v libx264 -preset ultrafast -crf 28 "${bodyPath}"`, {timeout:60000}, () => resolve());
           });
           transClips.push(bodyPath);
 
@@ -890,14 +1055,14 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
           const headPath = path.join(videosDir, uniqueName("head", "mp4"));
           const transPath = path.join(videosDir, uniqueName("trans", "mp4"));
           await new Promise((resolve) => {
-            exec(`ffmpeg -y -sseof -${safeXDUR} -i "${clipPaths[i]}" -c:v libx264 -preset fast -crf 26 "${tailPath}"`, {timeout:30000}, () => resolve());
+            exec(`ffmpeg -y -sseof -${safeXDUR} -i "${clipPaths[i]}" -c:v libx264 -preset ultrafast -crf 28 "${tailPath}"`, {timeout:30000}, () => resolve());
           });
           await new Promise((resolve) => {
-            exec(`ffmpeg -y -i "${clipPaths[i+1]}" -t ${safeXDUR} -c:v libx264 -preset fast -crf 26 "${headPath}"`, {timeout:30000}, () => resolve());
+            exec(`ffmpeg -y -i "${clipPaths[i+1]}" -t ${safeXDUR} -c:v libx264 -preset ultrafast -crf 28 "${headPath}"`, {timeout:30000}, () => resolve());
           });
           const tFilter = getCustomFilter(dims.w, dims.h);
           await new Promise((resolve) => {
-            exec(`ffmpeg -y -i "${tailPath}" -i "${headPath}" -filter_complex "${tFilter}" -map "[vout]" -c:v libx264 -preset fast -crf 26 "${transPath}"`, {timeout:60000}, (err,s,se) => {
+            exec(`ffmpeg -y -i "${tailPath}" -i "${headPath}" -filter_complex "${tFilter}" -map "[vout]" -c:v libx264 -preset ultrafast -crf 28 "${transPath}"`, {timeout:60000}, (err,s,se) => {
               if(err) console.error("trans pair error:", se?.slice(-300));
               resolve();
             });
@@ -918,7 +1083,7 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
         const concatList = path.join(videosDir, uniqueName("list", "txt"));
         fs.writeFileSync(concatList, transClips.map(p => `file '${p}'`).join('\n'));
         await new Promise((resolve, reject) => {
-          exec(`ffmpeg -y -f concat -safe 0 -i "${concatList}" -c:v libx264 -preset fast -crf 26 "${concatPath}"`, {timeout:180000}, (err,s,se) => {
+          exec(`ffmpeg -y -f concat -safe 0 -i "${concatList}" -c:v libx264 -preset ultrafast -crf 28 "${concatPath}"`, {timeout:180000}, (err,s,se) => {
             if(err) { console.error("concat error:", se?.slice(-500)); return reject(new Error("concat failed")); }
             resolve();
           });
@@ -942,7 +1107,7 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
         }
         filterComplex = parts.join(';');
         mapArg = '[vout]';
-        const cmd3 = `ffmpeg -y ${inputs3} -filter_complex "${filterComplex}" -map "${mapArg}" -c:v libx264 -preset fast -crf 26 "${concatPath}"`;
+        const cmd3 = `ffmpeg -y ${inputs3} -filter_complex "${filterComplex}" -map "${mapArg}" -c:v libx264 -preset ultrafast -crf 28 "${concatPath}"`;
         await new Promise((resolve, reject) => {
           exec(cmd3, { timeout: 180000 }, (err, stdout, stderr) => {
             if (err) { console.error("concat error:", stderr?.slice(-500)); return reject(new Error("concat failed")); }
@@ -957,7 +1122,8 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
     // 5. Overlay audio + captions + watermark
     updateJob(jobId, { progress: 60, message: "Adding voiceover & captions..." });
     const outputVideo = path.join(videosDir, uniqueName("final", "mp4"));
-    const safeTrack = ["background","chill","upbeat","dramatic","lofi"].includes(musicTrack) ? musicTrack : "background";
+    const availableTracks = fs.readdirSync(path.join(__dirname, "public", "music")).filter(f => f.endsWith(".mp3")).map(f => f.replace(/\.mp3$/, ""));
+    const safeTrack = availableTracks.includes(musicTrack) ? musicTrack : (availableTracks.includes("mixkit-deep-meditation-109") ? "mixkit-deep-meditation-109" : availableTracks[0]);
     const musicPath = path.join(__dirname, "public", "music", safeTrack + ".mp3");
     const hasBgMusic = fs.existsSync(musicPath);
     const watermark = "drawtext=text='Tonefy AI':fontsize=18:fontcolor=white@0.5:x=(w-text_w)/2:y=h-th-20";
@@ -966,7 +1132,7 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
     let wordTimestamps = null;
     try {
       const whisperResult = await new Promise((resolve) => {
-        exec(`python3 /home/ahumuza/Tonefy-react/backend/whisper_align.py "${audioPathLocal}" 2>/dev/null`, 
+        execFile('python3', ['/home/ahumuza/Tonefy-react/backend/whisper_align.py', audioPathLocal],
           { timeout: 60000 }, (err, stdout) => {
           if (!err && stdout.trim()) {
             try { resolve(JSON.parse(stdout.trim())); } catch(e) { resolve(null); }
@@ -980,13 +1146,18 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
     const hasCaptions = buildAssFile(voiceover || "", totalAudioDuration, assPath, captionStyle, wordTimestamps);
     console.log("hasCaptions:", hasCaptions, "file exists:", fs.existsSync(assPath));
     const subsFilter = hasCaptions ? `,ass='${assPath.replace(/'/g, "\\'")}'` : '';
-    const vf = `setsar=1${subsFilter},${watermark}`;
+    const speedPts = videoSpeed && videoSpeed !== 1.0 ? `setpts=${(1/videoSpeed).toFixed(4)}*PTS,` : '';
+    const audioTempo = videoSpeed && videoSpeed !== 1.0 ? `atempo=${videoSpeed},` : '';
+    const adjustedDuration = videoSpeed && videoSpeed !== 1.0 ? (totalAudioDuration / videoSpeed).toFixed(2) : totalAudioDuration;
+    const vf = `${speedPts}setsar=1${subsFilter},${watermark}`;
 
     let ffmpegCmd;
     if (hasBgMusic) {
-      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${totalAudioDuration} -filter_complex "[1:a]volume=1.0[voice];[2:a]volume=0.15[music];[voice][music]amix=inputs=2:duration=first[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset fast -crf 26 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
+      const voiceFilter = audioTempo ? `[1:a]${audioTempo}volume=1.0,asplit=2[voice1][voice2]` : `[1:a]volume=1.0,asplit=2[voice1][voice2]`;
+      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${adjustedDuration} -filter_complex "${voiceFilter};[2:a]volume=0.3[music_pre];[music_pre][voice1]sidechaincompress=threshold=0.03:ratio=8:attack=120:release=600:makeup=1[music_duck];[voice2][music_duck]amix=inputs=2:duration=first:normalize=0[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
     } else {
-      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -t ${totalAudioDuration} -vf "${vf}" -c:v libx264 -preset fast -crf 26 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
+      const audioFilter = audioTempo ? `-af "${audioTempo}aresample=44100"` : "";
+      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -t ${adjustedDuration} -vf "${vf}" ${audioFilter} -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
     }
     await new Promise((resolve, reject) => {
       exec(ffmpegCmd, { timeout: 180000 }, (err, stdout, stderr) => {
@@ -1008,6 +1179,8 @@ app.post("/api/idea-to-video-v2", async (req, res) => {
   } catch (err) {
     console.error("idea-to-video-v2 error:", err.message);
     updateJob(jobId, { status: "failed", message: err.message });
+  } finally {
+    releaseVideoSlot();
   }
 });
 
