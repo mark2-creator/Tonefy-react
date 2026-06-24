@@ -7,3 +7,4 @@ backend/public/videos/*.mp4
 backend/public/audios/*.mp3
 backend/videos/*.mp4
 public/videos/*.ass
+backend/jobs.json

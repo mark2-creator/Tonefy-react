@@ -82,14 +82,54 @@ const PEXELS_API_KEY = process.env.PEXELS_API_KEY;
 if (!process.env.GROQ_API_KEY) throw new Error("GROQ_API_KEY not set in .env");
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// In-memory job store
+// In-memory job store, persisted to disk so jobs survive server restarts
 const jobs = new Map();
+const JOBS_FILE = path.join(__dirname, "jobs.json");
+
+function saveJobsToDisk() {
+  try {
+    const obj = Object.fromEntries(jobs);
+    fs.writeFileSync(JOBS_FILE, JSON.stringify(obj));
+  } catch (e) {
+    console.error("Failed to save jobs.json:", e.message);
+  }
+}
+
+function loadJobsFromDisk() {
+  try {
+    if (fs.existsSync(JOBS_FILE)) {
+      const obj = JSON.parse(fs.readFileSync(JOBS_FILE, "utf8"));
+      let staleCount = 0;
+      for (const [id, data] of Object.entries(obj)) {
+        // Any job still "pending" was interrupted by a restart — it can never finish, so fail it clearly
+        if (data.status === "pending") {
+          data.status = "failed";
+          data.message = "Generation was interrupted by a server restart. Please try again.";
+          staleCount++;
+        }
+        jobs.set(id, data);
+      }
+      console.log(`✅ Loaded ${jobs.size} job(s) from disk (${staleCount} marked failed due to interruption)`);
+      if (staleCount > 0) saveJobsToDisk();
+    }
+  } catch (e) {
+    console.error("Failed to load jobs.json:", e.message);
+  }
+}
+loadJobsFromDisk();
+
 function createJob() {
   const jobId = uuidv4();
   jobs.set(jobId, { status: 'pending', progress: 0, message: 'Starting...' });
+  saveJobsToDisk();
   return jobId;
 }
-function updateJob(jobId, data) { if (jobs.has(jobId)) jobs.set(jobId, { ...jobs.get(jobId), ...data }); }
+function updateJob(jobId, data) {
+  if (jobs.has(jobId)) {
+    jobs.set(jobId, { ...jobs.get(jobId), ...data });
+    saveJobsToDisk();
+  }
+}
 
 // Concurrency limiter for FFmpeg-heavy video generation
 let activeVideoJobs = 0;
