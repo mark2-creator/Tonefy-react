@@ -1,4 +1,5 @@
 import express from "express";
+import multer from "multer";
 import crypto from 'crypto';
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
@@ -61,7 +62,7 @@ try {
 
 // Auth middleware
 const verifyToken = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
+  const authHeader = req.headers.authorization || req.headers.Authorization;
   if (!authHeader?.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
   const token = authHeader.split("Bearer ")[1];
   try {
@@ -81,6 +82,73 @@ const app = express();
 const PEXELS_API_KEY = process.env.PEXELS_API_KEY;
 if (!process.env.GROQ_API_KEY) throw new Error("GROQ_API_KEY not set in .env");
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+// Script cache — avoids duplicate Groq calls for same prompt
+const scriptCache = new Map();
+const CACHE_TTL = 1000 * 60 * 60 * 6; // 6 hours
+
+function getCached(key) {
+  const entry = scriptCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL) { scriptCache.delete(key); return null; }
+  return entry.value;
+}
+function setCache(key, value) {
+  scriptCache.set(key, { value, ts: Date.now() });
+  // Keep cache small
+  if (scriptCache.size > 200) {
+    const firstKey = scriptCache.keys().next().value;
+    scriptCache.delete(firstKey);
+  }
+}
+
+// Fallback LLM — tries Groq first, falls back to Together AI free tier
+async function callLLM({ system, user, max_tokens = 400, temperature = 0.8 }) {
+  const messages = [];
+  if (system) messages.push({ role: 'system', content: system });
+  messages.push({ role: 'user', content: user });
+
+  // Try Groq first
+  try {
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.1-8b-instant',
+      messages,
+      max_tokens,
+      temperature,
+    });
+    return completion.choices[0].message.content.trim();
+  } catch (e) {
+    console.warn('Groq failed, trying fallback:', e.message);
+  }
+
+  // Fallback: Cloudflare Workers AI (free tier - 10k requests/day)
+  try {
+    const prompt = messages.map(m => `${m.role}: ${m.content}`).join('\n');
+    const cfRes = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.3-70b-instruct-fp8-fast`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.CLOUDFLARE_AI_TOKEN}`,
+        },
+        body: JSON.stringify({ messages, max_tokens, temperature }),
+      }
+    );
+    const cfData = await cfRes.json();
+    if (cfRes.ok) {
+      const text = cfData.result?.response?.trim();
+      if (text) {
+        console.log('[FALLBACK] Used Cloudflare Workers AI');
+        return text;
+      }
+    }
+  } catch (e) {
+    console.warn('Cloudflare AI fallback failed:', e.message);
+  }
+
+  throw new Error('All AI providers failed. Please try again later.');
+}
 
 // In-memory job store, persisted to disk so jobs survive server restarts
 const jobs = new Map();
@@ -158,6 +226,64 @@ function releaseVideoSlot() {
 const videosDir = path.join(__dirname, "public", "videos");
 const audiosDir = path.join(__dirname, "public", "audios");
 const uploadsDir = path.join(__dirname, "uploads");
+// Resolves a stored URL (e.g. "/uploads/abc.jpg" or "/music/track.mp3") back
+// to its real local file path. "/uploads/..." files live directly under
+// uploadsDir (a sibling of "public"), while other static assets (music,
+// videos, audios) are served from inside "public". Using a single "public"
+// prefix for everything was the root cause of "No such file or directory"
+// errors during export — uploaded clips/overlays/audio never actually
+// lived under public/uploads.
+// Callers pass URLs straight from request bodies, so this has to reject
+// anything that isn't one of our own stored files. Two things it guards:
+// a foreign URI scheme (a phone's "file:///data/user/0/..." path used to be
+// glued onto public/ and then handed to ffmpeg, which only ever produced a
+// confusing "No such file or directory"), and any path that escapes the media
+// directories once resolved - these paths end up inside a shell command.
+function resolveMediaPath(url) {
+  if (typeof url !== "string" || !url.trim()) {
+    throw new Error("Invalid media path");
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(url)) {
+    throw new Error("Not a stored media path: " + url.slice(0, 80));
+  }
+  const clean = url.replace(/^\//, "");
+  // Every stored name we generate is uuid- or hash-based, so this is only ever
+  // restrictive for hostile input - and these paths are interpolated into
+  // ffmpeg command lines elsewhere in this file.
+  if (!/^[A-Za-z0-9._/-]+$/.test(clean)) {
+    throw new Error("Media path has unexpected characters");
+  }
+  const base = clean.startsWith("uploads/") ? __dirname : path.join(__dirname, "public");
+  const resolved = path.resolve(base, clean);
+  const allowedRoots = [uploadsDir, path.join(__dirname, "public")].map(r => path.resolve(r) + path.sep);
+  if (!allowedRoots.some(root => resolved.startsWith(root))) {
+    throw new Error("Media path outside the allowed directories");
+  }
+  return resolved;
+}
+
+const EDIT_XFADE_MAP = {
+  fade:'fade', wipeleft:'wipeleft', wiperight:'wiperight', wipeup:'wipeup', wipedown:'wipedown',
+  slideleft:'slideleft', slideright:'slideright', slideup:'slideup', slidedown:'slidedown',
+  circlecrop:'circlecrop', rectcrop:'rectcrop', distance:'distance',
+  fadeblack:'fadeblack', fadewhite:'fadewhite', radial:'radial',
+  smoothleft:'smoothleft', smoothright:'smoothright', smoothup:'smoothup', smoothdown:'smoothdown',
+  circleopen:'circleopen', circleclose:'circleclose',
+  vertopen:'vertopen', vertclose:'vertclose', horzopen:'horzopen', horzclose:'horzclose',
+  dissolve:'dissolve', pixelize:'pixelize',
+  diagtl:'diagtl', diagtr:'diagtr', diagbl:'diagbl', diagbr:'diagbr',
+  hlslice:'hlslice', hrslice:'hrslice', vuslice:'vuslice', vdslice:'vdslice',
+  hblur:'hblur', fadegrays:'fadegrays',
+  wipetl:'wipetl', wipetr:'wipetr', wipebl:'wipebl', wipebr:'wipebr',
+  squeezeh:'squeezeh', squeezev:'squeezev', zoomin:'zoomin',
+  fadefast:'fadefast', fadeslow:'fadeslow',
+  hlwind:'hlwind', hrwind:'hrwind', vuwind:'vuwind', vdwind:'vdwind',
+  coverleft:'coverleft', coverright:'coverright', coverup:'coverup', coverdown:'coverdown',
+  revealleft:'revealleft', revealright:'revealright', revealup:'revealup', revealdown:'revealdown',
+  slide:'slideleft', zoom:'zoomin', wipe:'wipeleft', blur:'fadeblack',
+  flashwhite:'fadewhite', glitch:'hblur', zoomdrive:'zoomin',
+  swipeleft:'coverleft', filmburn:'fadegrays', pixelate:'pixelize',
+};
 
 [videosDir, audiosDir, uploadsDir].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
@@ -188,6 +314,7 @@ app.get("/api/music-tracks", (req, res) => {
   }
 });
 app.use("/uploads", express.static(uploadsDir));
+app.use("/auth", express.static(path.join(__dirname, "public", "auth")));
 
 exec("ffmpeg -version", (err, stdout) => {
   if (err) console.error("FFmpeg missing");
@@ -197,13 +324,107 @@ exec("ffmpeg -version", (err, stdout) => {
 app.set("trust proxy", 1);
 app.use(helmet());
 app.use(express.json({ limit: "10mb" }));
+
+app.post("/api/audio-waveform", verifyToken, async (req, res) => {
+  const { url, samples = 80 } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url required" });
+  try {
+    let srcPath;
+    if (url.startsWith('http')) {
+      srcPath = path.join(uploadsDir, uniqueName("wavesrc", "mp3"));
+      await downloadToFile(url, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+    } else {
+      srcPath = resolveMediaPath(url);
+    }
+
+    const pcmPath = path.join(uploadsDir, uniqueName("wavepcm", "raw"));
+    // execFile, not exec: srcPath comes from the request body and this endpoint
+    // is unauthenticated, so it must never reach a shell.
+    await new Promise((resolve, reject) => {
+      execFile("ffmpeg", ["-y", "-i", srcPath, "-ac", "1", "-ar", "8000", "-f", "s16le", "-acodec", "pcm_s16le", pcmPath],
+        { timeout: 30000 }, (err, stdout, stderr) => {
+          if (err) { console.error("Waveform ffmpeg error:", stderr?.slice(-300)); return reject(new Error("Waveform extraction failed")); }
+          resolve();
+        });
+    });
+
+    const buffer = fs.readFileSync(pcmPath);
+    const totalSamples = buffer.length / 2;
+    const blockSize = Math.max(1, Math.floor(totalSamples / samples));
+    const peaks = [];
+
+    for (let i = 0; i < samples; i++) {
+      const start = i * blockSize;
+      let sumSquares = 0;
+      let count = 0;
+      let peakAbs = 0;
+      for (let j = 0; j < blockSize && (start + j) < totalSamples; j++) {
+        const sampleVal = buffer.readInt16LE((start + j) * 2);
+        sumSquares += sampleVal * sampleVal;
+        const absVal = Math.abs(sampleVal);
+        if (absVal > peakAbs) peakAbs = absVal;
+        count++;
+      }
+      // Pure peak amplitude (no RMS averaging) so transients read as sharp,
+      // distinct spikes matching native waveform renderers like CapCut/TikTok.
+      const normalized = Math.min(1, peakAbs / 32768);
+      peaks.push(Math.round(normalized * 100) / 100);
+    }
+
+    try { fs.unlinkSync(pcmPath); } catch (e) {}
+    if (url.startsWith('http')) { try { fs.unlinkSync(srcPath); } catch (e) {} }
+
+    res.json({ peaks });
+  } catch (e) {
+    console.error("audio-waveform error:", e.message);
+    const badInput = /Invalid media path|Not a stored media path|outside the allowed|unexpected characters/.test(e.message);
+    res.status(badInput ? 400 : 500).json({ error: e.message });
+  }
+});
+
+app.post("/api/transcribe-voiceover", verifyToken, async (req, res) => {
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url required" });
+  try {
+    let srcPath;
+    if (url.startsWith('http')) {
+      srcPath = path.join(uploadsDir, uniqueName("transcribesrc", "mp3"));
+      await downloadToFile(url, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+    } else {
+      srcPath = resolveMediaPath(url);
+    }
+
+    console.log('TRANSCRIBE_DEBUG srcPath=', srcPath, 'exists=', fs.existsSync(srcPath));
+    const wordTimestamps = await new Promise((resolve) => {
+      execFile('python3', ['/home/ahumuza/Tonefy-react/backend/whisper_align.py', srcPath],
+        { timeout: 300000 }, (err, stdout, stderr) => {
+          if (err) { console.error('TRANSCRIBE_DEBUG execFile error:', err.message, 'killed:', err.killed, 'signal:', err.signal, 'code:', err.code, 'stderr:', stderr?.slice(-800)); return resolve(null); }
+          if (!stdout.trim()) { console.error('TRANSCRIBE_DEBUG empty stdout, stderr:', stderr?.slice(-500)); return resolve(null); }
+          if (stderr) { console.log('TRANSCRIBE_DEBUG success stderr:', stderr.slice(-500)); }
+          try { resolve(JSON.parse(stdout.trim())); } catch (e) { console.error('TRANSCRIBE_DEBUG JSON parse error:', e.message, 'stdout was:', stdout.slice(0,300)); resolve(null); }
+        });
+    });
+
+    if (url.startsWith('http')) { try { fs.unlinkSync(srcPath); } catch (e) {} }
+
+    if (!wordTimestamps || wordTimestamps.length === 0) {
+      return res.status(422).json({ error: "No speech detected in voiceover" });
+    }
+
+    res.json({ words: wordTimestamps });
+  } catch (e) {
+    console.error("transcribe-voiceover error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.use((req, res, next) => { console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`); next(); });
 // Global rate limit
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 500,
   message: { error: 'Too many requests, please try again later.' },
   skip: (req) => req.path.startsWith('/api/job/'),
   validate: { xForwardedForHeader: false }
@@ -238,6 +459,25 @@ app.use("/api", verifyToken);
 
 function uniqueName(prefix, ext) { return `${prefix}-${Date.now()}-${uuidv4()}.${ext}`; }
 
+// Anything built from a request must not reach a shell. run() spawns the binary
+// directly with an argument vector, so a quote, a semicolon or a $(...) in a
+// caption or a filename is just a character in an argument.
+function run(bin, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(bin, args.map(String), { timeout: 30000, ...opts }, (err, stdout, stderr) => {
+      if (err) { err.stderr = stderr; return reject(err); }
+      resolve(stdout);
+    });
+  });
+}
+
+// ImageMagick colour arguments: hex or a plain colour name, nothing else.
+function safeColor(value, fallback = '#ffffff') {
+  const v = String(value ?? '').trim();
+  return /^#[0-9a-fA-F]{3,8}$/.test(v) || /^[a-zA-Z]{1,20}$/.test(v) ? v : fallback;
+}
+const num = (value, fallback = 0) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+
 async function downloadToFile(url, outPath, headers = {}) {
   const res = await fetch(url, { headers, timeout: 60000 });
   if (!res.ok) throw new Error(`Download failed ${url}: ${res.status}`);
@@ -259,16 +499,31 @@ function pickBestMp4(videoObj) {
 
 function isHttpUrl(s) { return typeof s === "string" && /^https?:\/\//i.test(s); }
 
-function cleanupOldFiles(dir, maxAgeMs = 24 * 60 * 60 * 1000) {
-  fs.readdir(dir, (err, files) => {
+async function cleanupOldFiles(dir, maxAgeMs = 72 * 60 * 60 * 1000) {
+  fs.readdir(dir, async (err, files) => {
     if (err) return;
     const now = Date.now();
-    files.forEach(file => {
+    for (const file of files) {
       const filePath = path.join(dir, file);
-      fs.stat(filePath, (err, stats) => {
-        if (!err && now - stats.mtimeMs > maxAgeMs) fs.unlink(filePath, () => {});
-      });
-    });
+      try {
+        const stats = await fs.promises.stat(filePath);
+        if (now - stats.mtimeMs > maxAgeMs) {
+          await fs.promises.unlink(filePath);
+          // If it's a video file, delete matching Firestore record
+          if (dir === videosDir && (file.endsWith('.mp4') || file.endsWith('.ass'))) {
+            try {
+              const snap = await adminDb.collection('userVideos').where('filename', '==', file).get();
+              for (const doc of snap.docs) {
+                await doc.ref.delete();
+                console.log(`[Cleanup] Deleted Firestore record for ${file}`);
+              }
+            } catch (e) {
+              console.error(`[Cleanup] Firestore delete failed for ${file}:`, e.message);
+            }
+          }
+        }
+      } catch (e) {}
+    }
   });
 }
 setInterval(() => { cleanupOldFiles(videosDir); cleanupOldFiles(audiosDir); }, 10 * 60 * 1000);
@@ -615,14 +870,20 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
   const { prompt } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
   try {
-    const completion = await groq.chat.completions.create({
-      messages: [
-        { role: "system", content: "You are a professional video script writer. Create engaging 30-60 second video scripts for social media. Write ONLY spoken narration - no stage directions, no Narrator:, no timestamps, no scene descriptions. Just pure spoken words." },
-        { role: "user", content: `Create a short video script about: ${prompt}` }
-      ],
-      model: "llama-3.1-8b-instant", max_tokens: 400, temperature: 0.8,
+    const cacheKey = `script:${prompt.toLowerCase().trim()}`;
+    const cached = getCached(cacheKey);
+    if (cached) {
+      console.log('[CACHE HIT] generate-script:', prompt.substring(0, 40));
+      return res.json({ script: cached, cached: true });
+    }
+    const script = await callLLM({
+      system: "You are a professional video script writer. Create engaging 30-60 second video scripts for social media. Write ONLY spoken narration - no stage directions, no Narrator:, no timestamps, no scene descriptions. Just pure spoken words.",
+      user: `Create a short video script about: ${prompt}`,
+      max_tokens: 400,
+      temperature: 0.8,
     });
-    res.json({ script: completion.choices[0].message.content.trim() });
+    setCache(cacheKey, script);
+    res.json({ script });
   } catch (err) {
     console.error("Script error:", err.message);
     res.status(500).json({ error: "Failed to generate script" });
@@ -633,15 +894,19 @@ app.post("/api/extract-keywords", async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: "Text required" });
   try {
-    const completion = await groq.chat.completions.create({
-      messages: [
-        { role: "system", content: 'Extract 3 short visual search keywords from this text. Return ONLY a JSON array like: ["keyword1", "keyword2", "keyword3"]' },
-        { role: "user", content: text }
-      ],
-      model: "llama-3.1-8b-instant", max_tokens: 80, temperature: 0.3,
+    const cacheKey = `kw:${text.substring(0, 100)}`;
+    const cached = getCached(cacheKey);
+    if (cached) return res.json({ keywords: cached });
+    const result = await callLLM({
+      system: 'Extract 3 short visual search keywords from this text. Return ONLY a JSON array like: ["keyword1", "keyword2", "keyword3"]',
+      user: text,
+      max_tokens: 80,
+      temperature: 0.3,
     });
     try {
-      res.json({ keywords: JSON.parse(completion.choices[0].message.content.trim()) });
+      const keywords = JSON.parse(result);
+      setCache(cacheKey, keywords);
+      res.json({ keywords });
     } catch (e) {
       res.json({ keywords: [text.split(" ").slice(0, 3).join(" ")] });
     }
@@ -1406,7 +1671,523 @@ app.get('/tiktok/post-status/:openId/:publishId', async (req, res) => {
 });
 
 
-app.use((req, res) => res.status(404).json({ error: "Not found" }));
 
 const PORT = process.env.PORT || 5000;
+
+app.post('/api/edit-video', async (req, res) => {
+  const { videoUrl, script = "", captionStyle = "classic", userId, voiceoverUrl } = req.body || {};
+  if (!videoUrl) return res.status(400).json({ error: "videoUrl required" });
+
+  const jobId = createJob();
+  res.json({ jobId });
+
+  try {
+    updateJob(jobId, { progress: 5, message: "Loading video..." });
+
+    const srcPath = videoUrl.startsWith('http')
+      ? path.join(videosDir, uniqueName("editsrc", "mp4"))
+      : path.join(videosDir, path.basename(videoUrl));
+
+    if (videoUrl.startsWith('http')) {
+      await downloadToFile(videoUrl, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+    }
+
+    const duration = await new Promise((resolve) => {
+      exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${srcPath}"`, (err, stdout) => {
+        resolve(parseFloat(stdout?.trim()) || 60);
+      });
+    });
+
+    // If a voiceover track was supplied, transcribe it for real word-synced captions
+    // (TikTok-style auto captions) instead of relying on a manually-typed script.
+    let effectiveScript = script;
+    let wordTimestamps = null;
+    if (voiceoverUrl) {
+      updateJob(jobId, { progress: 15, message: "Transcribing voice..." });
+      let audioLocalPath;
+      try {
+        if (voiceoverUrl.startsWith('http')) {
+          audioLocalPath = path.join(uploadsDir, uniqueName("captionsrc", "mp3"));
+          await downloadToFile(voiceoverUrl, audioLocalPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+        } else {
+          audioLocalPath = resolveMediaPath(voiceoverUrl);
+        }
+        const whisperResult = await new Promise((resolve) => {
+          execFile('python3', ['/home/ahumuza/Tonefy-react/backend/whisper_align.py', audioLocalPath],
+            { timeout: 60000 }, (err, stdout) => {
+              if (!err && stdout.trim()) {
+                try { resolve(JSON.parse(stdout.trim())); } catch (e) { resolve(null); }
+              } else { resolve(null); }
+            });
+        });
+        wordTimestamps = whisperResult;
+        if (wordTimestamps && wordTimestamps.length > 0) {
+          effectiveScript = wordTimestamps.map(w => w.word).join(' ');
+          console.log(`Auto-caption transcription: ${wordTimestamps.length} words`);
+        }
+      } catch (e) { console.warn('Voiceover transcription failed:', e.message); }
+    }
+
+    updateJob(jobId, { progress: 30, message: "Generating subtitles..." });
+
+    const outputVideo = path.join(videosDir, uniqueName("edit", "mp4"));
+    const assPath = outputVideo.replace('.mp4', '.ass');
+    const hasCaptions = buildAssFile(effectiveScript, duration, assPath, captionStyle, wordTimestamps);
+    const subsFilter = hasCaptions ? `ass='${assPath.replace(/'/g, "\\'")}'` : null;
+
+    const ffmpegCmd = subsFilter
+      ? `ffmpeg -y -i "${srcPath}" -vf "${subsFilter}" -c:a copy -pix_fmt yuv420p "${outputVideo}"`
+      : `ffmpeg -y -i "${srcPath}" -c copy "${outputVideo}"`;
+
+    updateJob(jobId, { progress: 60, message: "Burning subtitles..." });
+    console.log("FFmpeg:", ffmpegCmd);
+
+    await new Promise((resolve, reject) => {
+      exec(ffmpegCmd, { timeout: 180000 }, (err, stdout, stderr) => {
+        if (err) { console.error("FFmpeg error:", stderr?.slice(-500)); return reject(new Error("FFmpeg failed")); }
+        resolve();
+      });
+    });
+
+    const filename = path.basename(outputVideo);
+    const localUrl = `/videos/${filename}`;
+
+    if (userId) {
+      await adminDb.collection('userVideos').add({
+        userId, filename, localUrl,
+        downloadUrl: `${process.env.BASE_URL || 'https://api.fitlifesolutions.site'}${localUrl}`,
+        prompt: script.slice(0, 100), aspectRatio: 'original', captionStyle,
+        createdAt: new Date().toISOString(),
+        size: fs.statSync(outputVideo).size,
+      });
+    }
+
+    updateJob(jobId, { status: 'done', progress: 100, videoUrl: localUrl, message: "Done!" });
+  } catch (e) {
+    console.error("Edit video error:", e.message);
+    updateJob(jobId, { status: 'error', error: e.message });
+  }
+});
+
+
+
+const upload = multer({ dest: uploadsDir });
+
+app.post('/api/upload-media', upload.array('files', 20), async (req, res) => {
+  try {
+    const urls = (req.files || []).map(f => {
+      const ext = (path.extname(f.originalname) || '').toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12);
+      const finalName = `${f.filename}${ext}`;
+      fs.renameSync(f.path, path.join(uploadsDir, finalName));
+      const type = f.mimetype.startsWith('image') ? 'image' : 'video';
+      return { url: `/uploads/${finalName}`, type };
+    });
+    res.json({ items: urls });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function escDrawtext(s) {
+  return String(s || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, '\u2019')
+    .replace(/%/g, '\\%')
+    .replace(/\n/g, ' ');
+}
+
+const RES_MAP = { '720p': [720, 1280], '1080p': [1080, 1920], '4K': [2160, 3840] };
+
+// The app ships the same TTFs and picks from the same list of family names, so the
+// name -> file mapping is a manifest kept next to the fonts rather than a literal
+// here that has to be edited in step with the app. Read once and cached: it is
+// static for the life of the process, and this sits in the render loop.
+//
+// The fallback is the twenty-one families that were hardcoded before the manifest
+// existed. It only matters if fonts/manifest.json goes missing, in which case an
+// overlay in a family outside that set renders in ImageMagick's default face -
+// the same thing that happened to every unmapped font before.
+let FONT_FILE_MAP_CACHE = null;
+function loadFontFileMap() {
+  if (FONT_FILE_MAP_CACHE) return FONT_FILE_MAP_CACHE;
+  try {
+    const raw = fs.readFileSync(path.join(__dirname, 'fonts', 'manifest.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && Object.keys(parsed).length) {
+      FONT_FILE_MAP_CACHE = parsed;
+      return FONT_FILE_MAP_CACHE;
+    }
+    console.warn('[fonts] manifest.json is empty, using built-in map');
+  } catch (e) {
+    console.warn('[fonts] manifest.json unreadable, using built-in map:', e.message);
+  }
+  FONT_FILE_MAP_CACHE = {
+    'Montserrat': 'Montserrat-Bold.ttf',
+    'Poppins': 'Poppins-Bold.ttf',
+    'Bebas Neue': 'BebasNeue-Regular.ttf',
+    'Anton': 'Anton-Regular.ttf',
+    'Playfair Display': 'PlayfairDisplay-Bold.ttf',
+    'Oswald': 'Oswald-Bold.ttf',
+    'Caveat': 'Caveat-Bold.ttf',
+    'Pacifico': 'Pacifico-Regular.ttf',
+    'Lobster': 'Lobster-Regular.ttf',
+    'Roboto Mono': 'RobotoMono-Bold.ttf',
+    'Raleway': 'Raleway-Bold.ttf',
+    'Inter': 'Inter-Bold.ttf',
+    'Merriweather': 'Merriweather-Bold.ttf',
+    'Lora': 'Lora-Bold.ttf',
+    'Dancing Script': 'DancingScript-Bold.ttf',
+    'Great Vibes': 'GreatVibes-Regular.ttf',
+    'Space Mono': 'SpaceMono-Bold.ttf',
+    'Archivo Black': 'ArchivoBlack-Regular.ttf',
+    'Alfa Slab One': 'AlfaSlabOne-Regular.ttf',
+    'Fredoka': 'Fredoka-Bold.ttf',
+    'Bungee Inline': 'BungeeInline-Regular.ttf',
+  };
+  return FONT_FILE_MAP_CACHE;
+}
+
+app.post('/api/media-to-video', async (req, res) => {
+  const { mediaItems = [], userId, resolution = '1080p', textOverlays = [], overlays = [], audioTracks = [], previewWidth } = req.body || {};
+  if (!mediaItems.length) return res.status(400).json({ error: "mediaItems required" });
+
+  const jobId = createJob();
+  res.json({ jobId });
+
+  try {
+    updateJob(jobId, { progress: 5, message: "Preparing clips..." });
+    const [W, H] = RES_MAP[resolution] || RES_MAP['1080p'];
+
+    const tempClips = [];
+    for (let i = 0; i < mediaItems.length; i++) {
+      const item = mediaItems[i];
+      const srcPath = resolveMediaPath(item.url);
+      console.log('CLIPDEBUG url=', item.url, 'resolved=', srcPath, 'exists=', fs.existsSync(srcPath));
+      const clipOut = path.join(videosDir, uniqueName("clip", "mp4"));
+
+      let cmd;
+      if (item.type === "image") {
+        cmd = `ffmpeg -y -loop 1 -i "${srcPath}" -t 3 -vf "scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1" -pix_fmt yuv420p -r 30 "${clipOut}"`;
+      } else {
+        cmd = `ffmpeg -y -i "${srcPath}" -vf "scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1" -pix_fmt yuv420p -r 30 -an "${clipOut}"`;
+      }
+      await new Promise((resolve, reject) => {
+        exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+          if (err) { console.error("Clip prep error:", stderr?.slice(-300)); return reject(new Error("Clip prep failed")); }
+          resolve();
+        });
+      });
+      tempClips.push(clipOut);
+      updateJob(jobId, { progress: 5 + Math.round((i + 1) / mediaItems.length * 40), message: `Processing clip ${i + 1}/${mediaItems.length}...` });
+    }
+
+    // Concat via xfade chain (per-boundary transitions from mediaItems[i].transition)
+    async function getClipDurationSecs(filePath) {
+      return new Promise((resolve) => {
+        exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`, (err, stdout) => {
+          resolve(parseFloat(stdout?.trim()) || 3);
+        });
+      });
+    }
+
+    let outputVideo = path.join(videosDir, uniqueName("media", "mp4"));
+    updateJob(jobId, { progress: 50, message: "Combining clips..." });
+
+    if (tempClips.length === 1) {
+      fs.copyFileSync(tempClips[0], outputVideo);
+    } else {
+      const clipDurations = [];
+      for (const c of tempClips) clipDurations.push(await getClipDurationSecs(c));
+
+      const XDUR = 0.5;
+      const inputsX = tempClips.map(p => `-i "${p}"`).join(' ');
+      let parts = [], timeline = 0, prevLabel = '0:v';
+      for (let i = 1; i < tempClips.length; i++) {
+        const boundaryTransition = mediaItems[i - 1]?.transition;
+        const hasTransition = boundaryTransition && boundaryTransition !== 'none';
+        const xft = hasTransition ? (EDIT_XFADE_MAP[boundaryTransition] || 'fade') : 'fade';
+        const prevDur = clipDurations[i - 1];
+        const safeXDUR = hasTransition ? Math.min(XDUR, prevDur * 0.4) : Math.min(0.05, prevDur * 0.4);
+        timeline += Math.max(safeXDUR + 0.01, prevDur - safeXDUR);
+        const offset = parseFloat(timeline.toFixed(2));
+        const outLabel = i === tempClips.length - 1 ? 'vout' : `v${i}`;
+        parts.push(`[${prevLabel}][${i}:v]xfade=transition=${xft}:duration=${safeXDUR}:offset=${offset}[${outLabel}]`);
+        prevLabel = outLabel;
+      }
+      const filterComplex = parts.join(';');
+      const xfadeCmd = `ffmpeg -y ${inputsX} -filter_complex "${filterComplex}" -map "[vout]" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p "${outputVideo}"`;
+
+      await new Promise((resolve, reject) => {
+        exec(xfadeCmd, { timeout: 180000 }, (err, stdout, stderr) => {
+          if (err) { console.error("Xfade concat error:", stderr?.slice(-500)); return reject(new Error("Concat failed")); }
+          resolve();
+        });
+      });
+    }
+
+    tempClips.forEach(c => { try { fs.unlinkSync(c); } catch (e) {} });
+
+    // Burn in text overlays + image/video overlays
+    if (textOverlays.length > 0 || overlays.length > 0) {
+      updateJob(jobId, { progress: 60, message: "Adding text & overlays..." });
+      const withOverlaysOut = path.join(videosDir, uniqueName("withoverlays", "mp4"));
+
+      let filterParts = [];
+      let inputs = [`-i "${outputVideo}"`];
+      let lastLabel = '0:v';
+
+      overlays.forEach((ov, idx) => {
+        const ovPath = resolveMediaPath(ov.url);
+        inputs.push(`-i "${ovPath}"`);
+        const inIdx = idx + 1;
+        const newLabel = `ov${idx}`;
+        filterParts.push(`[${lastLabel}][${inIdx}:v]overlay=(W-w)/2:(H-h)/2[${newLabel}]`);
+        lastLabel = newLabel;
+      });
+
+      const FONT_FILE_MAP = loadFontFileMap();
+      const FONTS_DIR = path.join(__dirname, 'fonts');
+
+      function wrapTextLinesServer(text, maxWordsPerLine = 4) {
+        const words = (text || '').split(/\s+/).filter(Boolean);
+        const lines = [];
+        let current = [];
+        for (const word of words) {
+          current.push(word);
+          if (current.length >= maxWordsPerLine) {
+            lines.push(current.join(' '));
+            current = [];
+          }
+        }
+        if (current.length > 0) lines.push(current.join(' '));
+        return lines.length > 0 ? lines : [''];
+      }
+
+      const EXPORT_SCALE = W / (previewWidth || 360);
+      const renderedTextPngs = [];
+
+      for (const t of textOverlays) {
+        const isGradient = Array.isArray(t.gradient) && t.gradient.length >= 2;
+        const fontFileName = FONT_FILE_MAP[t.font];
+        const fontPath = fontFileName ? path.join(FONTS_DIR, fontFileName) : null;
+        const fontArg = fontPath ? `-font "${fontPath}"` : '';
+        const fontSizePx = Math.round((t.size || 18) * EXPORT_SCALE);
+        const lines = wrapTextLinesServer(t.text, 4);
+        const multilineText = lines.join('\n');
+        // Only the backslash needs removing (ImageMagick escape syntax). Quotes
+        // used to be rewritten to apostrophes to survive the shell; with execFile
+        // they render as the user typed them.
+        const safeText = multilineText.replace(/\\/g, '');
+
+        const base = path.join(uploadsDir, uniqueName('txtrender', 'png'));
+        const maskPng = base.replace('.png', '_mask.png');
+        const alphaPng = base.replace('.png', '_alpha.png');
+        const fillPng = base.replace('.png', '_fill.png');
+        const coloredPng = base.replace('.png', '_colored.png');
+        const outPng = base;
+
+        const gravityArg = t.isAutoCaption ? 'Center' : 'West';
+        await run('convert', [
+          '-background', 'none', '-fill', 'white',
+          ...(fontPath ? ['-font', fontPath] : []),
+          '-pointsize', Math.max(1, Math.round(fontSizePx)),
+          '-gravity', gravityArg,
+          `label:${safeText}`,
+          maskPng,
+        ]).catch(e => { console.error('Text mask render error:', e.stderr?.slice(-500) || e.message); throw new Error('Text mask render failed'); });
+
+        await run('convert', [maskPng, '-alpha', 'extract', alphaPng])
+          .catch(e => { console.error('Alpha extract error:', e.stderr?.slice(-500) || e.message); throw new Error('Alpha extract failed'); });
+
+        const { Wt, Ht } = await run('identify', ['-format', '%w %h', maskPng], { timeout: 15000 })
+          .then(out => { const p = out.trim().split(' ').map(Number); return { Wt: p[0], Ht: p[1] }; })
+          .catch(() => { throw new Error('identify failed'); });
+
+        if (isGradient) {
+          const g0 = safeColor(t.gradient[0]);
+          const g1 = safeColor(t.gradient[1]);
+          await run('convert', ['-size', `${Wt}x${Ht}`, '-define', 'gradient:direction=East', `gradient:${g0}-${g1}`, fillPng])
+            .catch(e => { console.error('Gradient fill error:', e.stderr?.slice(-500) || e.message); throw new Error('Gradient fill failed'); });
+        } else {
+          await run('convert', ['-size', `${Wt}x${Ht}`, `xc:${safeColor(t.color)}`, fillPng])
+            .catch(e => { console.error('Flat fill error:', e.stderr?.slice(-500) || e.message); throw new Error('Flat fill failed'); });
+        }
+
+        await run('convert', [fillPng, alphaPng, '-alpha', 'off', '-compose', 'CopyOpacity', '-composite', coloredPng])
+          .catch(e => { console.error('CopyOpacity composite error:', e.stderr?.slice(-500) || e.message); throw new Error('Composite failed'); });
+
+        let effWt = Wt, effHt = Ht;
+
+        // Shadow variants for auto-captions (TikTok-style caption presets)
+        const SHADOW_CONFIG = {
+          shadow3d: { color: '#555555', offsetX: 6, offsetY: 6, blur: 0 },
+          neon: { color: safeColor(t.color, '#7FFF00'), offsetX: 0, offsetY: 0, blur: 6 },
+        };
+        const wantsDefaultShadow = t.isAutoCaption && t.captionShadow !== false && !SHADOW_CONFIG[t.captionStyleId] && t.captionStyleId !== 'sticker' && t.captionStyleId !== 'outline';
+        const shadowCfg = SHADOW_CONFIG[t.captionStyleId] || (wantsDefaultShadow ? { color: '#000000', offsetX: 2, offsetY: 2, blur: 2 } : null);
+
+        if (shadowCfg) {
+          const pad = Math.ceil(shadowCfg.blur * 3 + Math.max(Math.abs(shadowCfg.offsetX), Math.abs(shadowCfg.offsetY)) + 6);
+          const paddedW = Wt + pad * 2;
+          const paddedH = Ht + pad * 2;
+          const shadowFillPng = base.replace('.png', '_shadowfill.png');
+          const shadowSilPng = base.replace('.png', '_shadowsil.png');
+          const combinedPng = base.replace('.png', '_combined.png');
+
+          await run('convert', ['-size', `${Wt}x${Ht}`, `xc:${safeColor(shadowCfg.color, '#000000')}`, shadowFillPng])
+            .catch(e => { console.error('Shadow fill error:', e.stderr?.slice(-500) || e.message); throw new Error('Shadow fill failed'); });
+          await run('convert', [shadowFillPng, alphaPng, '-alpha', 'off', '-compose', 'CopyOpacity', '-composite', shadowSilPng])
+            .catch(e => { console.error('Shadow silhouette error:', e.stderr?.slice(-500) || e.message); throw new Error('Shadow silhouette failed'); });
+          if (shadowCfg.blur > 0) {
+            await run('convert', [shadowSilPng, '-blur', `0x${num(shadowCfg.blur)}`, shadowSilPng])
+              .catch(e => { console.error('Shadow blur error:', e.stderr?.slice(-500) || e.message); throw new Error('Shadow blur failed'); });
+          }
+          await run('convert', [
+            '-size', `${paddedW}x${paddedH}`, 'xc:none',
+            shadowSilPng, '-geometry', `+${pad + num(shadowCfg.offsetX)}+${pad + num(shadowCfg.offsetY)}`, '-composite',
+            coloredPng, '-geometry', `+${pad}+${pad}`, '-composite',
+            combinedPng,
+          ]).catch(e => { console.error('Shadow combine error:', e.stderr?.slice(-500) || e.message); throw new Error('Shadow combine failed'); });
+          try { fs.unlinkSync(coloredPng); } catch (e) {}
+          fs.copyFileSync(combinedPng, coloredPng);
+          try { fs.unlinkSync(combinedPng); } catch (e) {}
+          try { fs.unlinkSync(shadowFillPng); } catch (e) {}
+          try { fs.unlinkSync(shadowSilPng); } catch (e) {}
+          effWt = paddedW;
+          effHt = paddedH;
+        }
+
+        const rotationDeg = num(t.rotation, 0);
+        let WR = effWt, HR = effHt;
+        if (Math.abs(rotationDeg) > 0.01) {
+          await run('convert', [coloredPng, '-background', 'none', '-rotate', rotationDeg, outPng])
+            .catch(e => { console.error('Rotate error:', e.stderr?.slice(-500) || e.message); throw new Error('Rotate failed'); });
+          const rotDim = await run('identify', ['-format', '%w %h', outPng], { timeout: 15000 })
+            .then(out => { const p = out.trim().split(' ').map(Number); return { w: p[0], h: p[1] }; })
+            .catch(() => { throw new Error('identify rotated failed'); });
+          WR = rotDim.w; HR = rotDim.h;
+          try { fs.unlinkSync(coloredPng); } catch (e) {}
+        } else {
+          fs.copyFileSync(coloredPng, outPng);
+          try { fs.unlinkSync(coloredPng); } catch (e) {}
+        }
+
+        const centerX = t.isAutoCaption ? (W / 2) : (((t.x ?? 50) / 100) * W + Wt / 2);
+        const centerY = ((t.y ?? 80) / 100) * H + effHt / 2;
+        const placeX = Math.round(centerX - WR / 2);
+        const placeY = Math.round(centerY - HR / 2);
+
+        renderedTextPngs.push({ t, outPng, placeX, placeY });
+
+        try { fs.unlinkSync(maskPng); } catch (e) {}
+        try { fs.unlinkSync(alphaPng); } catch (e) {}
+        try { fs.unlinkSync(fillPng); } catch (e) {}
+      }
+
+      renderedTextPngs.forEach(({ t, outPng, placeX, placeY }, idx) => {
+        inputs.push(`-i "${outPng}"`);
+        const inIdx = inputs.length - 1;
+        const newLabel = `txt${idx}`;
+        const hasTiming = typeof t.startTime === 'number' && typeof t.endTime === 'number';
+        const enableArg = hasTiming ? `:enable='between(t\,${t.startTime}\,${t.endTime})'` : '';
+        filterParts.push(`[${lastLabel}][${inIdx}:v]overlay=x=${placeX}:y=${placeY}${enableArg}[${newLabel}]`);
+        lastLabel = newLabel;
+      });
+
+      const filterComplex = filterParts.join(';');
+      const overlayCmd = `ffmpeg -y ${inputs.join(' ')} -filter_complex "${filterComplex}" -map "[${lastLabel}]" -map 0:a? -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -c:a copy "${withOverlaysOut}"`;
+
+      await new Promise((resolve, reject) => {
+        exec(overlayCmd, { timeout: 180000 }, (err, stdout, stderr) => {
+          if (err) { console.error("Overlay/text burn error:", stderr?.slice(-500)); return reject(new Error("Overlay burn failed")); }
+          resolve();
+        });
+      });
+      try { fs.unlinkSync(outputVideo); } catch (e) {}
+      outputVideo = withOverlaysOut;
+    }
+
+    // Mix in audio tracks (voiceover + music)
+    if (audioTracks.length > 0) {
+      updateJob(jobId, { progress: 80, message: "Mixing audio..." });
+      const withAudioOut = path.join(videosDir, uniqueName("withaudio", "mp4"));
+
+      let inputs = [`-i "${outputVideo}"`];
+      audioTracks.forEach(track => {
+        if (track.url.startsWith('http')) {
+          inputs.push(`-i "${track.url}"`);
+        } else {
+          const trackPath = resolveMediaPath(track.url);
+          inputs.push(`-i "${trackPath}"`);
+        }
+      });
+
+      // Each track carries its own placement from the editor timeline:
+      //   atrim/asetpts  - the trimmed region of the source file
+      //   adelay         - where that region starts in the finished video
+      //   volume         - the track's own level (already scaled by master)
+      // Without these every track started at 0:00 and ran its full length,
+      // so the export never matched what the timeline preview played.
+      const sec = (v) => Math.max(0, Math.round(Number(v) * 1000) / 1000);
+      const audioLabels = audioTracks.map((t, i) => {
+        const chain = [];
+        const trimStart = Number(t.trimStart) > 0 ? sec(t.trimStart) : 0;
+        const trimEnd = Number(t.trimEnd) > trimStart ? sec(t.trimEnd) : null;
+        if (trimStart > 0 || trimEnd !== null) {
+          const args = [];
+          if (trimStart > 0) args.push(`start=${trimStart}`);
+          if (trimEnd !== null) args.push(`end=${trimEnd}`);
+          chain.push(`atrim=${args.join(':')}`, 'asetpts=PTS-STARTPTS');
+        }
+        const startOffset = Number(t.startOffset) > 0 ? sec(t.startOffset) : 0;
+        if (startOffset > 0) chain.push(`adelay=${Math.round(startOffset * 1000)}:all=1`);
+        const volume = Number.isFinite(Number(t.volume)) ? Math.max(0, Math.min(4, Number(t.volume))) : 1;
+        chain.push(`volume=${volume}`);
+        return `[${i + 1}:a]${chain.join(',')}[a${i}]`;
+      }).join(';');
+      const mixInputs = audioTracks.map((t, i) => `[a${i}]`).join('');
+      // duration=longest so a delayed track isn't cut off by an earlier one
+      // ending, normalize=0 so amix doesn't silently divide every level by the
+      // track count, and apad so the mix always outlasts the video - with
+      // -shortest that pins the export to the video length. Previously
+      // duration=first + -shortest truncated the whole video to the length of
+      // the first audio track (a 6s voiceover cut a 12s video down to 6s).
+      const filterComplex = `${audioLabels};${mixInputs}amix=inputs=${audioTracks.length}:duration=longest:dropout_transition=2:normalize=0[amixed];[amixed]apad[aout]`;
+
+      const audioCmd = `ffmpeg -y ${inputs.join(' ')} -filter_complex "${filterComplex}" -map 0:v -map "[aout]" -c:v copy -c:a aac -shortest "${withAudioOut}"`;
+
+      await new Promise((resolve, reject) => {
+        exec(audioCmd, { timeout: 180000 }, (err, stdout, stderr) => {
+          if (err) { console.error("Audio mix error:", stderr?.slice(-500)); return reject(new Error("Audio mix failed")); }
+          resolve();
+        });
+      });
+      try { fs.unlinkSync(outputVideo); } catch (e) {}
+      outputVideo = withAudioOut;
+    }
+
+    const filename = path.basename(outputVideo);
+    const localUrl = `/videos/${filename}`;
+
+    if (userId) {
+      await adminDb.collection('userVideos').add({
+        userId, filename, localUrl,
+        downloadUrl: `${process.env.BASE_URL || 'https://api.fitlifesolutions.site'}${localUrl}`,
+        prompt: "Uploaded media video", aspectRatio: "9:16",
+        createdAt: new Date().toISOString(),
+        size: fs.statSync(outputVideo).size,
+      });
+    }
+
+    updateJob(jobId, { status: 'done', progress: 100, videoUrl: localUrl, message: "Done!" });
+  } catch (e) {
+    console.error("Media-to-video error:", e.message);
+    updateJob(jobId, { status: 'error', error: e.message });
+  }
+});
+
+
+app.use((req, res) => res.status(404).json({ error: "Not found" }));
+
 app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
