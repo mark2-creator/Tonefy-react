@@ -2033,6 +2033,71 @@ app.post('/api/media-to-video', async (req, res) => {
         return lines.length > 0 ? lines : [''];
       }
 
+      // Where a single word sits inside a rendered `label:`. The chip that follows
+      // the voice has to be drawn behind one word of a phrase, and ImageMagick will
+      // not report where a word landed - but it will measure any string, and a
+      // label's internal padding is constant for a given font and size, so it
+      // cancels in a difference:
+      //
+      //   x of word = W(prefix) - pad        width = W(prefix + word) - W(prefix)
+      //
+      // Checked against a render rather than reasoned about: the last word's right
+      // edge lands exactly on the measured width of the whole phrase.
+      const labelPadCache = new Map();
+
+      const labelWidth = async (fontPath, pointsize, kerning, text) => {
+        const out = await run('convert', [
+          '-background', 'none', '-fill', 'white',
+          ...(fontPath ? ['-font', fontPath] : []),
+          '-pointsize', pointsize,
+          ...(kerning != null ? ['-kerning', kerning] : []),
+          `label:${text}`, '-format', '%w', 'info:',
+        ], { timeout: 15000 });
+        return parseInt(String(out).trim(), 10) || 0;
+      };
+
+      // pad = 2*W(c) - W(cc), for any c. Cached: it depends only on the font, the
+      // size and the tracking, and a caption measures several words at each of them.
+      const labelPad = async (fontPath, pointsize, kerning) => {
+        const key = `${fontPath}|${pointsize}|${kerning}`;
+        if (labelPadCache.has(key)) return labelPadCache.get(key);
+        const one = await labelWidth(fontPath, pointsize, kerning, 'M');
+        const two = await labelWidth(fontPath, pointsize, kerning, 'MM');
+        const pad = Math.max(0, one * 2 - two);
+        labelPadCache.set(key, pad);
+        return pad;
+      };
+
+      const wordBoxInLabel = async ({ fontPath, pointsize, kerning, lines, wordIndex, Wt, Ht }) => {
+        let remaining = wordIndex;
+        let lineIndex = -1;
+        let inLine = -1;
+        for (let i = 0; i < lines.length; i++) {
+          const n = lines[i].split(/\s+/).filter(Boolean).length;
+          if (remaining < n) { lineIndex = i; inLine = remaining; break; }
+          remaining -= n;
+        }
+        if (lineIndex < 0) return null;
+
+        const words = lines[lineIndex].split(/\s+/).filter(Boolean);
+        const pad = await labelPad(fontPath, pointsize, kerning);
+        const lineW = (await labelWidth(fontPath, pointsize, kerning, lines[lineIndex])) - pad;
+        const prefixW = inLine === 0
+          ? 0
+          : (await labelWidth(fontPath, pointsize, kerning, words.slice(0, inLine).join(' ') + ' ')) - pad;
+        const uptoW = (await labelWidth(fontPath, pointsize, kerning, words.slice(0, inLine + 1).join(' '))) - pad;
+
+        // Lines are centred within the label, so a short line starts inset by half
+        // the difference rather than at zero.
+        const lineH = Ht / lines.length;
+        return {
+          x: (Wt - lineW) / 2 + prefixW,
+          y: lineIndex * lineH,
+          w: Math.max(1, uptoW - prefixW),
+          h: lineH,
+        };
+      };
+
       const EXPORT_SCALE = W / (previewWidth || 360);
       const renderedTextPngs = [];
 
@@ -2089,13 +2154,44 @@ app.post('/api/media-to-video', async (req, res) => {
           .then(out => { const p = out.trim().split(' ').map(Number); return { Wt: p[0], Ht: p[1] }; })
           .catch(() => { throw new Error('identify failed'); });
 
+        // Which word this overlay is showing as spoken. The client sends one overlay
+        // per word for a highlight style - the phrase is on screen throughout, but
+        // which word is chipped changes within it, and an overlay is one still.
+        const hlCfg = spec && spec.highlight ? spec.highlight : null;
+        const hlIndex = Number.isInteger(t.activeWord) ? t.activeWord : -1;
+        const hlKerning = spec && spec.spacing ? (num(spec.spacing) * sscale).toFixed(2) : null;
+        let wordBox = null;
+        if (hlCfg && hlIndex >= 0) {
+          // A phrase that cannot be measured still has to render. Losing the chip
+          // is a worse caption; losing the caption is a broken video.
+          wordBox = await wordBoxInLabel({
+            fontPath, pointsize: Math.max(1, Math.round(fontSizePx)), kerning: hlKerning,
+            lines, wordIndex: hlIndex, Wt, Ht,
+          }).catch(e => {
+            console.error('Word box measure failed, drawing caption without chip:', e.message);
+            return null;
+          });
+        }
+
         if (isGradient) {
           const g0 = safeColor(t.gradient[0]);
           const g1 = safeColor(t.gradient[1]);
           await run('convert', ['-size', `${Wt}x${Ht}`, '-define', 'gradient:direction=East', `gradient:${g0}-${g1}`, fillPng])
             .catch(e => { console.error('Gradient fill error:', e.stderr?.slice(-500) || e.message); throw new Error('Gradient fill failed'); });
         } else {
-          await run('convert', ['-size', `${Wt}x${Ht}`, `xc:${safeColor(t.color)}`, fillPng])
+          const fillArgs = ['-size', `${Wt}x${Ht}`, `xc:${safeColor(t.color)}`];
+          // The spoken word is recoloured by painting its box into the fill before
+          // the glyph alpha is applied, so only the letters take the new colour -
+          // the rectangle itself never survives the CopyOpacity below.
+          if (wordBox && hlCfg.textColor) {
+            fillArgs.push(
+              '-fill', safeColor(hlCfg.textColor, '#000000'),
+              '-draw', `rectangle ${Math.round(wordBox.x)},${Math.round(wordBox.y)} `
+                + `${Math.round(wordBox.x + wordBox.w)},${Math.round(wordBox.y + wordBox.h)}`,
+            );
+          }
+          fillArgs.push(fillPng);
+          await run('convert', fillArgs)
             .catch(e => { console.error('Flat fill error:', e.stderr?.slice(-500) || e.message); throw new Error('Flat fill failed'); });
         }
 
@@ -2127,12 +2223,21 @@ app.post('/api/media-to-video', async (req, res) => {
         // gets from eight copies offset around the fill, so the two agree.
         const strokeR = spec && spec.stroke ? Math.max(0.5, num(spec.stroke.width) * sscale) : 0;
 
-        if (shadowCfg || glowCfg || strokeR > 0) {
-          const pad = Math.ceil(
-            strokeR
-            + (glowCfg ? glowCfg.radius * 3 : 0)
-            + (shadowCfg ? shadowCfg.radius * 3 + Math.max(Math.abs(shadowCfg.dx), Math.abs(shadowCfg.dy)) : 0)
-            + 6
+        // A chip enters the layered path even with nothing else to stack, because it
+        // needs the same margin: drawn on a canvas cropped to the glyphs, its own
+        // padding would be clipped off at the edges of the first and last word.
+        const hlPadX = wordBox ? num(hlCfg.padX) * sscale : 0;
+        const hlPadY = wordBox ? num(hlCfg.padY) * sscale : 0;
+
+        if (shadowCfg || glowCfg || strokeR > 0 || wordBox) {
+          const pad = Math.max(
+            Math.ceil(Math.max(hlPadX, hlPadY)) + 2,
+            Math.ceil(
+              strokeR
+              + (glowCfg ? glowCfg.radius * 3 : 0)
+              + (shadowCfg ? shadowCfg.radius * 3 + Math.max(Math.abs(shadowCfg.dx), Math.abs(shadowCfg.dy)) : 0)
+              + 6
+            )
           );
           const paddedW = Wt + pad * 2;
           const paddedH = Ht + pad * 2;
@@ -2166,6 +2271,35 @@ app.post('/api/media-to-video', async (req, res) => {
           const geo = (x, y) => `${x >= 0 ? '+' : ''}${Math.round(x)}${y >= 0 ? '+' : ''}${Math.round(y)}`;
 
           const args = ['-size', `${paddedW}x${paddedH}`, 'xc:none'];
+
+          // First, so it sits under everything - as it does in the app. Painted over
+          // the stroke instead, the chip would swallow the outline of the very word
+          // it is meant to sit behind.
+          if (wordBox) {
+            const chipPng = base.replace('.png', '_chip.png');
+            scratch.push(chipPng);
+            const x0 = Math.round(pad + wordBox.x - hlPadX);
+            const y0 = Math.round(pad + wordBox.y - hlPadY);
+            const x1 = Math.round(pad + wordBox.x + wordBox.w + hlPadX);
+            const y1 = Math.round(pad + wordBox.y + wordBox.h + hlPadY);
+            const radius = Math.max(0, Math.min(
+              Math.round(num(hlCfg.radius, 0) * sscale),
+              Math.floor(Math.min(x1 - x0, y1 - y0) / 2)
+            ));
+            // A roundrectangle of radius 0 draws nothing at all - not a
+            // square-cornered box, nothing - so a hard-edged chip asks for a
+            // rectangle by name. The app's chip is square, so this is the usual case.
+            const draw = radius >= 1
+              ? `roundrectangle ${x0},${y0} ${x1},${y1} ${radius},${radius}`
+              : `rectangle ${x0},${y0} ${x1},${y1}`;
+            await run('convert', [
+              '-size', `${paddedW}x${paddedH}`, 'xc:none',
+              '-fill', safeColor(hlCfg.color, '#FFE24A'),
+              '-draw', draw,
+              chipPng,
+            ]).catch(e => { console.error('Chip draw error:', e.stderr?.slice(-500) || e.message); throw new Error('Chip draw failed'); });
+            args.push(chipPng, '-geometry', '+0+0', '-composite');
+          }
 
           if (shadowCfg) {
             const shadowPng = base.replace('.png', '_shadow.png');

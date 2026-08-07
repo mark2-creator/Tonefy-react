@@ -16,6 +16,7 @@
     "firebase-admin": "^14.0.0",
     "groq-sdk": "^1.2.1",
     "helmet": "^8.1.0",
+    "multer": "^2.2.0",
     "node-fetch": "^3.3.2",
     "uuid": "^13.0.0"
   },
