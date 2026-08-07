@@ -1965,12 +1965,27 @@ app.post('/api/media-to-video', async (req, res) => {
       const look = clipLookFilter(item);
       const vf = `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1${look}`;
 
+      // Every prepared clip carries an audio stream, even when that stream is
+      // silence. Clips used to be prepped with -an, so the original sound was thrown
+      // away here and an export had nothing in it but the voiceover and music the
+      // user added - a project of plain camera clips came out silent. Giving even
+      // stills and muted clips a real silent track keeps the concat below uniform:
+      // one branch that always has [n:a] to work with, rather than a chain that has
+      // to know which clips happen to have sound.
+      const SILENCE_IN = '-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100';
+      const clipVol = Number.isFinite(Number(item.volume))
+        ? Math.max(0, Math.min(4, Number(item.volume)))
+        : 1;
+      // Muting is the clip's own switch; volume 0 is the same outcome by another
+      // route, and either way there is no point decoding audio to silence it.
+      const wantsSound = !item.muted && clipVol > 0;
+
       let cmd;
       if (item.type === "image") {
         // A still is held for as long as the timeline holds it. Three seconds was
         // the app's default, not its answer.
         const stillDur = Number(item.duration) > 0 ? Number(item.duration) : 3;
-        cmd = `ffmpeg -y -loop 1 -i "${srcPath}" -t ${stillDur.toFixed(3)} -vf "${vf}" -pix_fmt yuv420p -r 30 "${clipOut}"`;
+        cmd = `ffmpeg -y -loop 1 -i "${srcPath}" ${SILENCE_IN} -t ${stillDur.toFixed(3)} -vf "${vf}" -pix_fmt yuv420p -r 30 -c:a aac -shortest "${clipOut}"`;
       } else {
         // trimStart/trimEnd are absolute offsets into the source, so the clip runs for
         // the difference. -ss before -i so the seek does not decode everything ahead
@@ -1979,7 +1994,15 @@ app.post('/api/media-to-video', async (req, res) => {
         const te = Number(item.trimEnd) > ss ? Number(item.trimEnd) : null;
         const seek = ss > 0 ? `-ss ${ss.toFixed(3)} ` : '';
         const span = te !== null ? `-t ${(te - ss).toFixed(3)} ` : '';
-        cmd = `ffmpeg -y ${seek}-i "${srcPath}" ${span}-vf "${vf}" -pix_fmt yuv420p -r 30 -an "${clipOut}"`;
+        // A source with no audio track of its own - a screen recording, a GIF turned
+        // mp4 - would leave the map unsatisfied, so ask first rather than let the
+        // whole clip prep fail on it.
+        const srcHasAudio = wantsSound ? await hasAudioStream(srcPath) : false;
+        if (srcHasAudio) {
+          cmd = `ffmpeg -y ${seek}-i "${srcPath}" ${span}-vf "${vf}" -af "volume=${clipVol}" -pix_fmt yuv420p -r 30 -c:a aac "${clipOut}"`;
+        } else {
+          cmd = `ffmpeg -y ${seek}-i "${srcPath}" ${SILENCE_IN} ${span}-vf "${vf}" -pix_fmt yuv420p -r 30 -map 0:v:0 -map 1:a:0 -c:a aac -shortest "${clipOut}"`;
+        }
       }
       await new Promise((resolve, reject) => {
         exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
@@ -1992,6 +2015,13 @@ app.post('/api/media-to-video', async (req, res) => {
     }
 
     // Concat via xfade chain (per-boundary transitions from mediaItems[i].transition)
+    async function hasAudioStream(filePath) {
+      return new Promise((resolve) => {
+        exec(`ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${filePath}"`,
+          (err, stdout) => resolve(!!(stdout && stdout.trim())));
+      });
+    }
+
     async function getClipDurationSecs(filePath) {
       return new Promise((resolve) => {
         exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`, (err, stdout) => {
@@ -2012,6 +2042,11 @@ app.post('/api/media-to-video', async (req, res) => {
       const XDUR = 0.5;
       const inputsX = tempClips.map(p => `-i "${p}"`).join(' ');
       let parts = [], timeline = 0, prevLabel = '0:v';
+      // The audio is joined with acrossfade at the same durations the video is
+      // xfaded at, so the two stay the same length and a transition sounds like it
+      // looks. Both shorten the result by the fade duration at each join, which is
+      // what keeps them in step.
+      let aParts = [], prevALabel = '0:a';
       for (let i = 1; i < tempClips.length; i++) {
         const boundaryTransition = mediaItems[i - 1]?.transition;
         const hasTransition = boundaryTransition && boundaryTransition !== 'none';
@@ -2023,9 +2058,12 @@ app.post('/api/media-to-video', async (req, res) => {
         const outLabel = i === tempClips.length - 1 ? 'vout' : `v${i}`;
         parts.push(`[${prevLabel}][${i}:v]xfade=transition=${xft}:duration=${safeXDUR}:offset=${offset}[${outLabel}]`);
         prevLabel = outLabel;
+        const outALabel = i === tempClips.length - 1 ? 'aout' : `a${i}`;
+        aParts.push(`[${prevALabel}][${i}:a]acrossfade=d=${safeXDUR}:c1=tri:c2=tri[${outALabel}]`);
+        prevALabel = outALabel;
       }
-      const filterComplex = parts.join(';');
-      const xfadeCmd = `ffmpeg -y ${inputsX} -filter_complex "${filterComplex}" -map "[vout]" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p "${outputVideo}"`;
+      const filterComplex = parts.concat(aParts).join(';');
+      const xfadeCmd = `ffmpeg -y ${inputsX} -filter_complex "${filterComplex}" -map "[vout]" -map "[aout]" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -c:a aac "${outputVideo}"`;
 
       await new Promise((resolve, reject) => {
         exec(xfadeCmd, { timeout: 180000 }, (err, stdout, stderr) => {
@@ -2542,14 +2580,18 @@ app.post('/api/media-to-video', async (req, res) => {
         chain.push(`volume=${volume}`);
         return `[${i + 1}:a]${chain.join(',')}[a${i}]`;
       }).join(';');
-      const mixInputs = audioTracks.map((t, i) => `[a${i}]`).join('');
+      // The video's own sound is now one of the things being mixed. It used to be
+      // left out entirely: the mix took only the uploaded tracks and mapped the video
+      // for its picture alone, so adding any voiceover silenced whatever the clips
+      // themselves were saying.
+      const mixInputs = `[0:a]` + audioTracks.map((t, i) => `[a${i}]`).join('');
       // duration=longest so a delayed track isn't cut off by an earlier one
       // ending, normalize=0 so amix doesn't silently divide every level by the
       // track count, and apad so the mix always outlasts the video - with
       // -shortest that pins the export to the video length. Previously
       // duration=first + -shortest truncated the whole video to the length of
       // the first audio track (a 6s voiceover cut a 12s video down to 6s).
-      const filterComplex = `${audioLabels};${mixInputs}amix=inputs=${audioTracks.length}:duration=longest:dropout_transition=2:normalize=0[amixed];[amixed]apad[aout]`;
+      const filterComplex = `${audioLabels};${mixInputs}amix=inputs=${audioTracks.length + 1}:duration=longest:dropout_transition=2:normalize=0[amixed];[amixed]apad[aout]`;
 
       const audioCmd = `ffmpeg -y ${inputs.join(' ')} -filter_complex "${filterComplex}" -map 0:v -map "[aout]" -c:v copy -c:a aac -shortest "${withAudioOut}"`;
 
