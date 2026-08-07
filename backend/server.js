@@ -1917,6 +1917,28 @@ function loadFontFileMap() {
   return FONT_FILE_MAP_CACHE;
 }
 
+// The graded and mirrored part of a clip's video filter chain, appended after the
+// scale and crop so it works on the framed picture rather than on the source.
+// Returns '' for a clip that asks for nothing, so the chain is unchanged for it.
+function clipLookFilter(item = {}) {
+  const parts = [];
+  // Mirroring is about the framing, so it comes before the grade.
+  if (item.flipH) parts.push('hflip');
+  if (item.flipV) parts.push('vflip');
+  switch (item.filter) {
+    case 'Bright': parts.push('eq=brightness=0.10'); break;
+    case 'Contrast': parts.push('eq=contrast=1.30'); break;
+    // Warm and Cool move the red and blue gammas apart rather than shifting every
+    // channel's brightness, which would wash the picture out instead of tinting it.
+    case 'Warm': parts.push('eq=gamma_r=1.12:gamma_b=0.92'); break;
+    case 'Cool': parts.push('eq=gamma_r=0.92:gamma_b=1.12'); break;
+    case 'Fade': parts.push('eq=contrast=0.85:brightness=0.06:saturation=0.80'); break;
+    case 'B&W': parts.push('hue=s=0'); break;
+    default: break;
+  }
+  return parts.length ? ',' + parts.join(',') : '';
+}
+
 app.post('/api/media-to-video', async (req, res) => {
   const { mediaItems = [], userId, resolution = '1080p', textOverlays = [], overlays = [], audioTracks = [], previewWidth } = req.body || {};
   if (!mediaItems.length) return res.status(400).json({ error: "mediaItems required" });
@@ -1935,11 +1957,29 @@ app.post('/api/media-to-video', async (req, res) => {
       console.log('CLIPDEBUG url=', item.url, 'resolved=', srcPath, 'exists=', fs.existsSync(srcPath));
       const clipOut = path.join(videosDir, uniqueName("clip", "mp4"));
 
+      // Everything the clip carries beyond its pixels: where it starts and stops, how
+      // long a still is held, which way round it is and what it has been graded to.
+      // All of it used to be dropped here - the app sent trimStart, trimEnd, duration
+      // and filter on every clip and this read none of them, so a trim you could see
+      // on the timeline came back untrimmed in the file you exported.
+      const look = clipLookFilter(item);
+      const vf = `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1${look}`;
+
       let cmd;
       if (item.type === "image") {
-        cmd = `ffmpeg -y -loop 1 -i "${srcPath}" -t 3 -vf "scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1" -pix_fmt yuv420p -r 30 "${clipOut}"`;
+        // A still is held for as long as the timeline holds it. Three seconds was
+        // the app's default, not its answer.
+        const stillDur = Number(item.duration) > 0 ? Number(item.duration) : 3;
+        cmd = `ffmpeg -y -loop 1 -i "${srcPath}" -t ${stillDur.toFixed(3)} -vf "${vf}" -pix_fmt yuv420p -r 30 "${clipOut}"`;
       } else {
-        cmd = `ffmpeg -y -i "${srcPath}" -vf "scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1" -pix_fmt yuv420p -r 30 -an "${clipOut}"`;
+        // trimStart/trimEnd are absolute offsets into the source, so the clip runs for
+        // the difference. -ss before -i so the seek does not decode everything ahead
+        // of the in point; ffmpeg has seeked accurately from that position for years.
+        const ss = Number(item.trimStart) > 0 ? Number(item.trimStart) : 0;
+        const te = Number(item.trimEnd) > ss ? Number(item.trimEnd) : null;
+        const seek = ss > 0 ? `-ss ${ss.toFixed(3)} ` : '';
+        const span = te !== null ? `-t ${(te - ss).toFixed(3)} ` : '';
+        cmd = `ffmpeg -y ${seek}-i "${srcPath}" ${span}-vf "${vf}" -pix_fmt yuv420p -r 30 -an "${clipOut}"`;
       }
       await new Promise((resolve, reject) => {
         exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
