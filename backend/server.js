@@ -478,6 +478,58 @@ function safeColor(value, fallback = '#ffffff') {
 }
 const num = (value, fallback = 0) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
 
+// ASS wants &HAABBGGRR: the channels run backwards from CSS, and so does alpha -
+// 00 is fully opaque there and FF is invisible, the opposite of an #RRGGBBAA.
+function assColour(hex, fallback = '&H00FFFFFF') {
+  const m = /^#?([0-9a-fA-F]{6})([0-9a-fA-F]{2})?$/.exec(String(hex ?? '').trim());
+  if (!m) return fallback;
+  const rgb = m[1];
+  const alpha = m[2] ? (255 - parseInt(m[2], 16)) : 0;
+  return ('&H' + alpha.toString(16).padStart(2, '0')
+    + rgb.slice(4, 6) + rgb.slice(2, 4) + rgb.slice(0, 2)).toUpperCase();
+}
+
+// libass resolves Fontname through fontconfig, which does not know the families
+// this app ships. Without the directory every custom face silently becomes
+// DejaVu Sans - it renders, it just renders in the wrong typeface.
+const ASS_FONTS_DIR = path.join(__dirname, 'fonts');
+function assFilter(assPath) {
+  return `ass='${assPath.replace(/'/g, "\\'")}':fontsdir='${ASS_FONTS_DIR.replace(/'/g, "\\'")}'`;
+}
+
+// The burn-in path gets the same style spec the app previews and the ImageMagick
+// export honours, so all three agree. ASS has native outline, box, shadow and
+// tracking, which covers everything a spec carries except a gradient fill - that
+// falls back to the first stop, since per-glyph colour tags cannot coexist with
+// the karaoke timing tags this file already emits.
+function assStyleFromSpec(meta) {
+  const fontsize = Math.max(8, Math.round(num(meta.size, 26) * 1.6));
+  const scale = fontsize / 18;
+  const spec = meta.spec || {};
+  const hasBox = !!spec.box;
+  return {
+    fontname: meta.font || 'Arial',
+    fontsize,
+    bold: 0,
+    italic: 0,
+    primary: assColour(meta.color, '&H00FFFFFF'),
+    // BorderStyle 3 repurposes the outline colour as the box fill, so a style
+    // cannot have both a chip and a ring; the chip wins, as it does in the app
+    // where the ring would be hidden behind it anyway.
+    outline: hasBox ? assColour(spec.box.color, '&H80000000')
+      : (spec.stroke ? assColour(spec.stroke.color, '&H00000000') : '&H00000000'),
+    back: hasBox ? assColour(spec.box.color, '&H80000000') : '&H80000000',
+    outline_w: hasBox ? Math.max(2, Math.round(num(spec.box.padX, 8) * scale * 0.5))
+      : (spec.stroke ? Math.max(1, Math.round(num(spec.stroke.width) * scale)) : 0),
+    shadow: spec.shadow ? Math.max(0, Math.round(Math.max(num(spec.shadow.dx), num(spec.shadow.dy)) * scale)) : 0,
+    alignment: 2,
+    marginV: 80,
+    spacing: spec.spacing ? Number((num(spec.spacing) * scale).toFixed(1)) : 0,
+    borderStyle: hasBox ? 3 : 1,
+    transform: meta.upper ? (t => t.toUpperCase()) : (t => t),
+  };
+}
+
 async function downloadToFile(url, outPath, headers = {}) {
   const res = await fetch(url, { headers, timeout: 60000 });
   if (!res.ok) throw new Error(`Download failed ${url}: ${res.status}`);
@@ -547,7 +599,7 @@ function buildCaptionFilter(script, audioDuration) {
   });
   return filters.join(',');
 }
-function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestamps = null) {
+function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestamps = null, captionMeta = null) {
   const words = script.replace(/[\n\r]+/g, ' ').trim().split(/\s+/).filter(Boolean);
   if (words.length === 0) return false;
 
@@ -556,22 +608,26 @@ function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestam
   if (wordTimestamps && wordTimestamps.length > 0) {
     // Animated styles: one word per line with exact timing
     const ANIMATED = ['highlight','sticker','shadow3d','tiktok','neon','fire','bold','purple'];
-    if (ANIMATED.includes(captionStyle)) {
+    const perWord = captionMeta && captionMeta.words
+      ? captionMeta.words === 1
+      : ANIMATED.includes(captionStyle);
+    if (perWord) {
       chunks = wordTimestamps.map(w => w.word);
       chunkTimings = wordTimestamps.map(w => ({ start: w.start, end: w.end }));
     } else {
-      // Group into 3-word chunks using whisper timing
+      // Group into the style's own chunk size using whisper timing
+      const per = Math.max(1, (captionMeta && captionMeta.words) || 3);
       chunks = [];
       chunkTimings = [];
-      for (let i = 0; i < wordTimestamps.length; i += 3) {
-        const group = wordTimestamps.slice(i, i + 3);
+      for (let i = 0; i < wordTimestamps.length; i += per) {
+        const group = wordTimestamps.slice(i, i + per);
         chunks.push(group.map(w => w.word).join(' '));
         chunkTimings.push({ start: group[0].start, end: group[group.length-1].end });
       }
     }
   } else {
     // Fallback: estimate timing
-    const chunkSize = captionStyle === 'word' ? 1 : 3;
+    const chunkSize = Math.max(1, (captionMeta && captionMeta.words) || (captionStyle === 'word' ? 1 : 3));
     chunks = [];
     for (let i = 0; i < words.length; i += chunkSize) {
       chunks.push(words.slice(i, i + chunkSize).join(' '));
@@ -676,7 +732,12 @@ function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestam
     },
   };
 
-  const s = STYLES[captionStyle] || STYLES["classic"];
+  // A spec from the app wins over the twelve ids this file happens to know: the
+  // catalogue has a hundred and thirty, and an id lookup would quietly render the
+  // other hundred and eighteen as "classic".
+  const s = (captionMeta && captionMeta.spec)
+    ? assStyleFromSpec(captionMeta)
+    : (STYLES[captionStyle] || STYLES["classic"]);
 
   const header = `[Script Info]
 ScriptType: v4.00+
@@ -694,7 +755,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
   const ANIMATED_STYLES = ['highlight','sticker','shadow3d','tiktok','neon','fire','bold','purple'];
-  const isAnimated = ANIMATED_STYLES.includes(captionStyle) && wordTimestamps?.length > 0;
+  // Word-by-word is what the pop animation is for; a style that holds a whole
+  // phrase on screen should not jump every time the phrase changes.
+  const wantsAnimation = captionMeta && captionMeta.words
+    ? captionMeta.words === 1
+    : ANIMATED_STYLES.includes(captionStyle);
+  const isAnimated = wantsAnimation && wordTimestamps?.length > 0;
 
   // Position variation — alternate center/bottom every 5 words
   const getMarginV = (i) => {
@@ -1073,7 +1139,7 @@ app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
     const assPath = outputVideo.replace('.mp4', '.ass');
     const hasCaptions = buildAssFile(voiceover || "", audioDuration, assPath, captionStyle);
     // subtitles filter burns SRT into video — handles any length efficiently
-    const subsFilter = hasCaptions ? `,ass='${assPath.replace(/'/g, "\\'")}'` : '';
+    const subsFilter = hasCaptions ? ',' + assFilter(assPath) : '';
     const vf = `${scaleFilter},setsar=1${subsFilter},${watermark}`;
 
     let ffmpegCmd;
@@ -1450,7 +1516,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
     console.log("ASS path:", assPath, "voiceover len:", (voiceover||"").length);
     const hasCaptions = buildAssFile(voiceover || "", totalAudioDuration, assPath, captionStyle, wordTimestamps);
     console.log("hasCaptions:", hasCaptions, "file exists:", fs.existsSync(assPath));
-    const subsFilter = hasCaptions ? `,ass='${assPath.replace(/'/g, "\\'")}'` : '';
+    const subsFilter = hasCaptions ? ',' + assFilter(assPath) : '';
     const speedPts = videoSpeed && videoSpeed !== 1.0 ? `setpts=${(1/videoSpeed).toFixed(4)}*PTS,` : '';
     const audioTempo = videoSpeed && videoSpeed !== 1.0 ? `atempo=${videoSpeed},` : '';
     const adjustedDuration = videoSpeed && videoSpeed !== 1.0 ? (totalAudioDuration / videoSpeed).toFixed(2) : totalAudioDuration;
@@ -1675,7 +1741,10 @@ app.get('/tiktok/post-status/:openId/:publishId', async (req, res) => {
 const PORT = process.env.PORT || 5000;
 
 app.post('/api/edit-video', async (req, res) => {
-  const { videoUrl, script = "", captionStyle = "classic", userId, voiceoverUrl } = req.body || {};
+  // captionMeta is the app's style spec - font, size, colour, cadence and the
+  // stroke/glow/shadow/box parts. captionStyle stays for older clients that send
+  // an id and nothing else.
+  const { videoUrl, script = "", captionStyle = "classic", captionMeta = null, userId, voiceoverUrl } = req.body || {};
   if (!videoUrl) return res.status(400).json({ error: "videoUrl required" });
 
   const jobId = createJob();
@@ -1732,8 +1801,8 @@ app.post('/api/edit-video', async (req, res) => {
 
     const outputVideo = path.join(videosDir, uniqueName("edit", "mp4"));
     const assPath = outputVideo.replace('.mp4', '.ass');
-    const hasCaptions = buildAssFile(effectiveScript, duration, assPath, captionStyle, wordTimestamps);
-    const subsFilter = hasCaptions ? `ass='${assPath.replace(/'/g, "\\'")}'` : null;
+    const hasCaptions = buildAssFile(effectiveScript, duration, assPath, captionStyle, wordTimestamps, captionMeta);
+    const subsFilter = hasCaptions ? assFilter(assPath) : null;
 
     const ffmpegCmd = subsFilter
       ? `ffmpeg -y -i "${srcPath}" -vf "${subsFilter}" -c:a copy -pix_fmt yuv420p "${outputVideo}"`
@@ -1973,6 +2042,14 @@ app.post('/api/media-to-video', async (req, res) => {
         const fontPath = fontFileName ? path.join(FONTS_DIR, fontFileName) : null;
         const fontArg = fontPath ? `-font "${fontPath}"` : '';
         const fontSizePx = Math.round((t.size || 18) * EXPORT_SCALE);
+        // A caption style arrives as a spec of typographic parts - stroke, glow,
+        // shadow, box, tracking - rather than an id this file has to recognise, so
+        // a style added to the app's catalogue renders here without a deploy on
+        // this side. Overlays made before the catalogue existed carry no spec and
+        // fall through to the old id-keyed behaviour below.
+        const spec = (t.captionSpec && typeof t.captionSpec === 'object') ? t.captionSpec : null;
+        // Every length in a spec is points at the app's 18pt caption base.
+        const sscale = fontSizePx / 18;
         const lines = wrapTextLinesServer(t.text, 4);
         const multilineText = lines.join('\n');
         // Only the backslash needs removing (ImageMagick escape syntax). Quotes
@@ -1992,6 +2069,9 @@ app.post('/api/media-to-video', async (req, res) => {
           '-background', 'none', '-fill', 'white',
           ...(fontPath ? ['-font', fontPath] : []),
           '-pointsize', Math.max(1, Math.round(fontSizePx)),
+          // Tracking has to go on here rather than at composite time - it changes
+          // the glyph positions, and every layer below is cut from this one mask.
+          ...(spec && spec.spacing ? ['-kerning', (num(spec.spacing) * sscale).toFixed(2)] : []),
           '-gravity', gravityArg,
           `label:${safeText}`,
           maskPng,
@@ -2019,43 +2099,142 @@ app.post('/api/media-to-video', async (req, res) => {
 
         let effWt = Wt, effHt = Ht;
 
-        // Shadow variants for auto-captions (TikTok-style caption presets)
-        const SHADOW_CONFIG = {
-          shadow3d: { color: '#555555', offsetX: 6, offsetY: 6, blur: 0 },
-          neon: { color: safeColor(t.color, '#7FFF00'), offsetX: 0, offsetY: 0, blur: 6 },
+        // Overlays with no spec: the two id-keyed looks this file used to know,
+        // plus the plain drop shadow everything else got.
+        const LEGACY_SHADOW = {
+          shadow3d: { color: '#555555', dx: 6, dy: 6, radius: 0 },
+          neon: { color: safeColor(t.color, '#7FFF00'), dx: 0, dy: 0, radius: 6 },
         };
-        const wantsDefaultShadow = t.isAutoCaption && t.captionShadow !== false && !SHADOW_CONFIG[t.captionStyleId] && t.captionStyleId !== 'sticker' && t.captionStyleId !== 'outline';
-        const shadowCfg = SHADOW_CONFIG[t.captionStyleId] || (wantsDefaultShadow ? { color: '#000000', offsetX: 2, offsetY: 2, blur: 2 } : null);
+        const legacyWantsShadow = t.isAutoCaption && t.captionShadow !== false
+          && !LEGACY_SHADOW[t.captionStyleId] && t.captionStyleId !== 'sticker' && t.captionStyleId !== 'outline';
+        const shadowCfg = spec
+          ? (spec.shadow ? {
+              color: spec.shadow.color,
+              dx: num(spec.shadow.dx) * sscale,
+              dy: num(spec.shadow.dy) * sscale,
+              radius: num(spec.shadow.radius) * sscale,
+            } : null)
+          : (LEGACY_SHADOW[t.captionStyleId] || (legacyWantsShadow ? { color: '#000000', dx: 2, dy: 2, radius: 2 } : null));
+        const glowCfg = spec && spec.glow
+          ? { color: spec.glow.color, radius: Math.max(1, num(spec.glow.radius, 8) * sscale) }
+          : null;
+        // The ring reaches `width` beyond the glyph edge - the same measure the app
+        // gets from eight copies offset around the fill, so the two agree.
+        const strokeR = spec && spec.stroke ? Math.max(0.5, num(spec.stroke.width) * sscale) : 0;
 
-        if (shadowCfg) {
-          const pad = Math.ceil(shadowCfg.blur * 3 + Math.max(Math.abs(shadowCfg.offsetX), Math.abs(shadowCfg.offsetY)) + 6);
+        if (shadowCfg || glowCfg || strokeR > 0) {
+          const pad = Math.ceil(
+            strokeR
+            + (glowCfg ? glowCfg.radius * 3 : 0)
+            + (shadowCfg ? shadowCfg.radius * 3 + Math.max(Math.abs(shadowCfg.dx), Math.abs(shadowCfg.dy)) : 0)
+            + 6
+          );
           const paddedW = Wt + pad * 2;
           const paddedH = Ht + pad * 2;
-          const shadowFillPng = base.replace('.png', '_shadowfill.png');
-          const shadowSilPng = base.replace('.png', '_shadowsil.png');
           const combinedPng = base.replace('.png', '_combined.png');
+          const alphaPadPng = base.replace('.png', '_alphapad.png');
+          const scratch = [alphaPadPng];
 
-          await run('convert', ['-size', `${Wt}x${Ht}`, `xc:${safeColor(shadowCfg.color, '#000000')}`, shadowFillPng])
-            .catch(e => { console.error('Shadow fill error:', e.stderr?.slice(-500) || e.message); throw new Error('Shadow fill failed'); });
-          await run('convert', [shadowFillPng, alphaPng, '-alpha', 'off', '-compose', 'CopyOpacity', '-composite', shadowSilPng])
-            .catch(e => { console.error('Shadow silhouette error:', e.stderr?.slice(-500) || e.message); throw new Error('Shadow silhouette failed'); });
-          if (shadowCfg.blur > 0) {
-            await run('convert', [shadowSilPng, '-blur', `0x${num(shadowCfg.blur)}`, shadowSilPng])
-              .catch(e => { console.error('Shadow blur error:', e.stderr?.slice(-500) || e.message); throw new Error('Shadow blur failed'); });
+          // The pad goes on before the dilate, not after: dilating an alpha cropped
+          // to the glyphs squares the ring off at the text's bounding box, which
+          // reads as a black slab behind the word rather than an outline round it.
+          await run('convert', [alphaPng, '-bordercolor', 'black', '-border', pad, alphaPadPng])
+            .catch(e => { console.error('Alpha pad error:', e.stderr?.slice(-500) || e.message); throw new Error('Alpha pad failed'); });
+
+          let ringPng = alphaPadPng;
+          if (strokeR > 0) {
+            ringPng = base.replace('.png', '_ring.png');
+            scratch.push(ringPng);
+            await run('convert', [alphaPadPng, '-morphology', 'Dilate', 'Disk:' + strokeR.toFixed(2), ringPng])
+              .catch(e => { console.error('Stroke dilate error:', e.stderr?.slice(-500) || e.message); throw new Error('Stroke dilate failed'); });
           }
-          await run('convert', [
-            '-size', `${paddedW}x${paddedH}`, 'xc:none',
-            shadowSilPng, '-geometry', `+${pad + num(shadowCfg.offsetX)}+${pad + num(shadowCfg.offsetY)}`, '-composite',
-            coloredPng, '-geometry', `+${pad}+${pad}`, '-composite',
-            combinedPng,
-          ]).catch(e => { console.error('Shadow combine error:', e.stderr?.slice(-500) || e.message); throw new Error('Shadow combine failed'); });
+
+          // A flat colour cut to a silhouette by the given mask, optionally blurred.
+          const tint = async (colour, maskPath, outPath, blur) => {
+            const src = outPath.replace('.png', '_src.png');
+            await run('convert', ['-size', `${paddedW}x${paddedH}`, `xc:${safeColor(colour, '#000000')}`, src]);
+            await run('convert', [src, maskPath, '-alpha', 'off', '-compose', 'CopyOpacity', '-composite', outPath]);
+            if (blur > 0) await run('convert', [outPath, '-blur', `0x${blur.toFixed(2)}`, outPath]);
+            try { fs.unlinkSync(src); } catch (e) {}
+          };
+          // ImageMagick reads "+-3+0" as malformed rather than as a negative offset.
+          const geo = (x, y) => `${x >= 0 ? '+' : ''}${Math.round(x)}${y >= 0 ? '+' : ''}${Math.round(y)}`;
+
+          const args = ['-size', `${paddedW}x${paddedH}`, 'xc:none'];
+
+          if (shadowCfg) {
+            const shadowPng = base.replace('.png', '_shadow.png');
+            scratch.push(shadowPng);
+            await tint(shadowCfg.color, ringPng, shadowPng, shadowCfg.radius)
+              .catch(e => { console.error('Shadow layer error:', e.stderr?.slice(-500) || e.message); throw new Error('Shadow layer failed'); });
+            args.push(shadowPng, '-geometry', geo(shadowCfg.dx, shadowCfg.dy), '-composite');
+          }
+
+          if (glowCfg) {
+            const glowPng = base.replace('.png', '_glow.png');
+            scratch.push(glowPng);
+            await tint(glowCfg.color, ringPng, glowPng, glowCfg.radius)
+              .catch(e => { console.error('Glow layer error:', e.stderr?.slice(-500) || e.message); throw new Error('Glow layer failed'); });
+            // Laid down twice, as the app does: stacking the same halo reads brighter,
+            // where one pass at a wider radius only spreads the same ink thinner.
+            args.push(glowPng, '-geometry', '+0+0', '-composite');
+            args.push(glowPng, '-geometry', '+0+0', '-composite');
+          }
+
+          if (strokeR > 0) {
+            const strokePng = base.replace('.png', '_stroke.png');
+            scratch.push(strokePng);
+            await tint(spec.stroke.color, ringPng, strokePng, 0)
+              .catch(e => { console.error('Stroke layer error:', e.stderr?.slice(-500) || e.message); throw new Error('Stroke layer failed'); });
+            args.push(strokePng, '-geometry', '+0+0', '-composite');
+          }
+
+          args.push(coloredPng, '-geometry', `+${pad}+${pad}`, '-composite', combinedPng);
+          await run('convert', args)
+            .catch(e => { console.error('Layer combine error:', e.stderr?.slice(-500) || e.message); throw new Error('Layer combine failed'); });
+
           try { fs.unlinkSync(coloredPng); } catch (e) {}
           fs.copyFileSync(combinedPng, coloredPng);
           try { fs.unlinkSync(combinedPng); } catch (e) {}
-          try { fs.unlinkSync(shadowFillPng); } catch (e) {}
-          try { fs.unlinkSync(shadowSilPng); } catch (e) {}
+          scratch.forEach(f => { try { fs.unlinkSync(f); } catch (e) {} });
           effWt = paddedW;
           effHt = paddedH;
+        }
+
+        // The chip is drawn last so it sits behind the finished stack, and hugs it
+        // rather than the caption's full column width.
+        if (spec && spec.box) {
+          const padX = Math.round(num(spec.box.padX) * sscale);
+          const padY = Math.round(num(spec.box.padY) * sscale);
+          const boxW = effWt + padX * 2;
+          const boxH = effHt + padY * 2;
+          // A pill is written as a radius larger than the chip; clamp it to what a
+          // rounded rectangle can actually be before ImageMagick draws nothing.
+          const radius = Math.max(0, Math.min(
+            Math.round(num(spec.box.radius) * sscale),
+            Math.floor(Math.min(boxW, boxH) / 2)
+          ));
+          const boxPng = base.replace('.png', '_box.png');
+          const boxedPng = base.replace('.png', '_boxed.png');
+          // A roundrectangle of radius 0 draws nothing at all - not a square-cornered
+          // box, nothing - so a hard-edged chip has to ask for a rectangle by name.
+          const boxDraw = radius >= 1
+            ? `roundrectangle 0,0 ${boxW - 1},${boxH - 1} ${radius},${radius}`
+            : `rectangle 0,0 ${boxW - 1},${boxH - 1}`;
+          await run('convert', [
+            '-size', `${boxW}x${boxH}`, 'xc:none',
+            '-fill', safeColor(spec.box.color, '#000000'),
+            '-draw', boxDraw,
+            boxPng,
+          ]).catch(e => { console.error('Box draw error:', e.stderr?.slice(-500) || e.message); throw new Error('Box draw failed'); });
+          await run('convert', [boxPng, coloredPng, '-geometry', `+${padX}+${padY}`, '-composite', boxedPng])
+            .catch(e => { console.error('Box composite error:', e.stderr?.slice(-500) || e.message); throw new Error('Box composite failed'); });
+          try { fs.unlinkSync(coloredPng); } catch (e) {}
+          fs.copyFileSync(boxedPng, coloredPng);
+          try { fs.unlinkSync(boxedPng); } catch (e) {}
+          try { fs.unlinkSync(boxPng); } catch (e) {}
+          effWt = boxW;
+          effHt = boxH;
         }
 
         const rotationDeg = num(t.rotation, 0);
