@@ -1073,7 +1073,7 @@ app.get("/api/job/:jobId", (req, res) => {
 });
 
 app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
-  const { voiceover = "", selectedVideo, selectedVideos, audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0, transition = "fade" } = req.body || {};
+  const { voiceover = "", selectedVideo, selectedVideos, audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0, transition = "fade" } = req.body || {};
   const jobId = createJob();
   res.json({ jobId }); // Return immediately
   try {
@@ -1137,7 +1137,7 @@ app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
     else scaleFilter = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720";
 
     const assPath = outputVideo.replace('.mp4', '.ass');
-    const hasCaptions = buildAssFile(voiceover || "", audioDuration, assPath, captionStyle);
+    const hasCaptions = buildAssFile(voiceover || "", audioDuration, assPath, captionStyle, null, captionMeta);
     // subtitles filter burns SRT into video — handles any length efficiently
     const subsFilter = hasCaptions ? ',' + assFilter(assPath) : '';
     const vf = `${scaleFilter},setsar=1${subsFilter},${watermark}`;
@@ -1234,7 +1234,7 @@ app.post("/api/search-pexels-segment", pexelsLimiter, async (req, res) => {
 });
 
 app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
-  const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", transition = "fade", musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0 } = req.body || {};
+  const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, transition = "fade", musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0 } = req.body || {};
   const jobId = createJob();
   res.json({ jobId });
 
@@ -1514,7 +1514,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
       if (wordTimestamps) console.log(`Whisper: ${wordTimestamps.length} words aligned`);
     } catch(e) { console.warn('Whisper failed, using estimated timing'); }
     console.log("ASS path:", assPath, "voiceover len:", (voiceover||"").length);
-    const hasCaptions = buildAssFile(voiceover || "", totalAudioDuration, assPath, captionStyle, wordTimestamps);
+    const hasCaptions = buildAssFile(voiceover || "", totalAudioDuration, assPath, captionStyle, wordTimestamps, captionMeta);
     console.log("hasCaptions:", hasCaptions, "file exists:", fs.existsSync(assPath));
     const subsFilter = hasCaptions ? ',' + assFilter(assPath) : '';
     const speedPts = videoSpeed && videoSpeed !== 1.0 ? `setpts=${(1/videoSpeed).toFixed(4)}*PTS,` : '';
@@ -2064,7 +2064,12 @@ app.post('/api/media-to-video', async (req, res) => {
         const coloredPng = base.replace('.png', '_colored.png');
         const outPng = base;
 
-        const gravityArg = t.isAutoCaption ? 'Center' : 'West';
+        // Overlays the editor can rotate and scale carry their CENTRE as x/y, since
+        // a top-left corner is not a position you can turn something about - spin an
+        // element and the corner describes a circle while the thing being aimed
+        // stays put. Older clients send a top-left and are placed the old way.
+        const centreAnchored = t.anchor === 'center';
+        const gravityArg = (centreAnchored || t.isAutoCaption) ? 'Center' : 'West';
         await run('convert', [
           '-background', 'none', '-fill', 'white',
           ...(fontPath ? ['-font', fontPath] : []),
@@ -2252,8 +2257,12 @@ app.post('/api/media-to-video', async (req, res) => {
           try { fs.unlinkSync(coloredPng); } catch (e) {}
         }
 
-        const centerX = t.isAutoCaption ? (W / 2) : (((t.x ?? 50) / 100) * W + Wt / 2);
-        const centerY = ((t.y ?? 80) / 100) * H + effHt / 2;
+        const centerX = centreAnchored
+          ? ((t.x ?? 50) / 100) * W
+          : (t.isAutoCaption ? (W / 2) : (((t.x ?? 50) / 100) * W + Wt / 2));
+        const centerY = centreAnchored
+          ? ((t.y ?? 80) / 100) * H
+          : (((t.y ?? 80) / 100) * H + effHt / 2);
         const placeX = Math.round(centerX - WR / 2);
         const placeY = Math.round(centerY - HR / 2);
 
