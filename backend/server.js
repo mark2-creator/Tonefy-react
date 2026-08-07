@@ -2051,7 +2051,41 @@ app.post('/api/media-to-video', async (req, res) => {
         inputs.push(`-i "${ovPath}"`);
         const inIdx = idx + 1;
         const newLabel = `ov${idx}`;
-        filterParts.push(`[${lastLabel}][${inIdx}:v]overlay=(W-w)/2:(H-h)/2[${newLabel}]`);
+
+        // A client that sends no geometry gets what it has always got: centred, at
+        // the source's own size, for the whole video.
+        if (ov.widthPercent == null && ov.x == null && ov.y == null) {
+          filterParts.push(`[${lastLabel}][${inIdx}:v]overlay=(W-w)/2:(H-h)/2[${newLabel}]`);
+          lastLabel = newLabel;
+          return;
+        }
+
+        const prepped = `ovp${idx}`;
+        const wPct = Math.max(1, Math.min(400, Number(ov.widthPercent) || 40));
+        // -2 rather than -1: the height has to stay even for libx264, and an odd one
+        // fails the encode rather than rounding itself.
+        const targetW = Math.max(2, Math.round((W * wPct) / 100));
+        let chain = `[${inIdx}:v]scale=${targetW}:-2`;
+
+        const rot = Number(ov.rotation) || 0;
+        if (Math.abs(rot) > 0.01) {
+          // Turning a frame leaves triangular gaps at the corners. Without an alpha
+          // channel to put them in they fill black, which reads as a rectangle behind
+          // the overlay rather than as the overlay being rotated - so format=rgba
+          // comes first, and c=none keeps the new corners transparent. ow/oh grow the
+          // canvas to fit the turned frame instead of cropping it back to its old box.
+          const rad = ((rot * Math.PI) / 180).toFixed(6);
+          chain += `,format=rgba,rotate=${rad}:ow=rotw(${rad}):oh=roth(${rad}):c=none`;
+        }
+        filterParts.push(chain + `[${prepped}]`);
+
+        // x and y are the overlay's CENTRE as a fraction of the frame - the anchor the
+        // canvas positions by, and the same one text overlays already use. ffmpeg
+        // places a top-left corner, so half the overlay's own scaled (and rotated)
+        // size comes back off; w and h here are the prepared input's, not the source's.
+        const xFrac = ((ov.x == null ? 50 : Number(ov.x)) / 100).toFixed(6);
+        const yFrac = ((ov.y == null ? 50 : Number(ov.y)) / 100).toFixed(6);
+        filterParts.push(`[${lastLabel}][${prepped}]overlay=x=(W*${xFrac}-w/2):y=(H*${yFrac}-h/2)[${newLabel}]`);
         lastLabel = newLabel;
       });
 
