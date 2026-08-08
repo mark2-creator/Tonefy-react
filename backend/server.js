@@ -1920,6 +1920,19 @@ function loadFontFileMap() {
 // The graded and mirrored part of a clip's video filter chain, appended after the
 // scale and crop so it works on the framed picture rather than on the source.
 // Returns '' for a clip that asks for nothing, so the chain is unchanged for it.
+// atempo only accepts 0.5..2.0 in one pass, so a rate outside that is reached by
+// multiplying stages together - 3x is 2.0 then 1.5, 0.3x is 0.5 then 0.6. Without
+// this the filter is rejected outright and the whole clip prep fails, which is worse
+// than the audio simply not keeping up.
+function atempoChain(speed) {
+  const parts = [];
+  let remaining = speed;
+  while (remaining > 2.0) { parts.push('atempo=2.0'); remaining /= 2.0; }
+  while (remaining < 0.5) { parts.push('atempo=0.5'); remaining /= 0.5; }
+  if (Math.abs(remaining - 1) > 0.001) parts.push(`atempo=${remaining.toFixed(6)}`);
+  return parts;
+}
+
 function clipLookFilter(item = {}) {
   const parts = [];
   // Mirroring is about the framing, so it comes before the grade.
@@ -1979,6 +1992,12 @@ app.post('/api/media-to-video', async (req, res) => {
       // Muting is the clip's own switch; volume 0 is the same outcome by another
       // route, and either way there is no point decoding audio to silence it.
       const wantsSound = !item.muted && clipVol > 0;
+      // Speed was sent on every clip and read by nothing here, so a clip set to 2x on
+      // the timeline exported at 1x - and ran for twice as long as the timeline said,
+      // pushing everything after it out of sync.
+      const rawSpeed = Number(item.speed);
+      const spd = Number.isFinite(rawSpeed) && rawSpeed > 0 ? Math.max(0.1, Math.min(10, rawSpeed)) : 1;
+      const speedVf = spd !== 1 ? `,setpts=${(1 / spd).toFixed(6)}*PTS` : '';
 
       let cmd;
       if (item.type === "image") {
@@ -1993,15 +2012,25 @@ app.post('/api/media-to-video', async (req, res) => {
         const ss = Number(item.trimStart) > 0 ? Number(item.trimStart) : 0;
         const te = Number(item.trimEnd) > ss ? Number(item.trimEnd) : null;
         const seek = ss > 0 ? `-ss ${ss.toFixed(3)} ` : '';
+        // -t goes before -i, so it bounds how much of the SOURCE is read rather than
+        // how long the output runs. As an output option it would fight the speed
+        // filter: a clip slowed to 0.5x runs twice the span, and -t would cut it in
+        // half again - the trim would silently shorten as soon as speed was applied.
         const span = te !== null ? `-t ${(te - ss).toFixed(3)} ` : '';
+        const inSpec = `${seek}${span}-i "${srcPath}"`;
         // A source with no audio track of its own - a screen recording, a GIF turned
         // mp4 - would leave the map unsatisfied, so ask first rather than let the
         // whole clip prep fail on it.
         const srcHasAudio = wantsSound ? await hasAudioStream(srcPath) : false;
         if (srcHasAudio) {
-          cmd = `ffmpeg -y ${seek}-i "${srcPath}" ${span}-vf "${vf}" -af "volume=${clipVol}" -pix_fmt yuv420p -r 30 -c:a aac "${clipOut}"`;
+          // atempo changes tempo and leaves pitch alone, so a sped-up voice stays the
+          // same voice. The preview is told to correct pitch too (shouldCorrectPitch),
+          // because the two have to agree - expo-av left to its default shifts pitch
+          // with rate, and the export would then not sound like what was auditioned.
+          const af = ['volume=' + clipVol].concat(spd !== 1 ? atempoChain(spd) : []).join(',');
+          cmd = `ffmpeg -y ${inSpec} -vf "${vf}${speedVf}" -af "${af}" -pix_fmt yuv420p -r 30 -c:a aac "${clipOut}"`;
         } else {
-          cmd = `ffmpeg -y ${seek}-i "${srcPath}" ${SILENCE_IN} ${span}-vf "${vf}" -pix_fmt yuv420p -r 30 -map 0:v:0 -map 1:a:0 -c:a aac -shortest "${clipOut}"`;
+          cmd = `ffmpeg -y ${inSpec} ${SILENCE_IN} -vf "${vf}${speedVf}" -pix_fmt yuv420p -r 30 -map 0:v:0 -map 1:a:0 -c:a aac -shortest "${clipOut}"`;
         }
       }
       await new Promise((resolve, reject) => {
