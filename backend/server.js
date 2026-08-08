@@ -289,6 +289,10 @@ const EDIT_XFADE_MAP = {
 
 app.use("/videos", express.static(videosDir, { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); res.setHeader("Accept-Ranges", "bytes"); } }));
 app.use("/audios", express.static(audiosDir, { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
+// Transition previews, one animated webp per catalogue entry, rendered by
+// scripts/gen-transition-previews.mjs in the app repo. Immutable once written -
+// a preview only changes when its recipe does, and then it gets a new render.
+app.use("/transitions", express.static(path.join(__dirname, "public", "transitions"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/music", express.static(path.join(__dirname, "public", "music"), { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 
 function trackIdToDisplayName(id) {
@@ -2078,14 +2082,43 @@ app.post('/api/media-to-video', async (req, res) => {
       let aParts = [], prevALabel = '0:a';
       for (let i = 1; i < tempClips.length; i++) {
         const boundaryTransition = mediaItems[i - 1]?.transition;
-        const hasTransition = boundaryTransition && boundaryTransition !== 'none';
-        const xft = hasTransition ? (EDIT_XFADE_MAP[boundaryTransition] || 'fade') : 'fade';
+        // The app sends the recipe - an xfade base plus an fx chain gated to the join -
+        // so the catalogue lives in one place and a transition added there needs no
+        // deploy here. An older client sends only an id, and EDIT_XFADE_MAP still
+        // answers for those.
+        const spec = mediaItems[i - 1]?.transitionSpec || null;
+        const hasTransition = spec
+          ? !!spec.base
+          : (boundaryTransition && boundaryTransition !== 'none');
+        const xft = hasTransition
+          ? (spec ? spec.base : (EDIT_XFADE_MAP[boundaryTransition] || 'fade'))
+          : 'fade';
         const prevDur = clipDurations[i - 1];
         const safeXDUR = hasTransition ? Math.min(XDUR, prevDur * 0.4) : Math.min(0.05, prevDur * 0.4);
         timeline += Math.max(safeXDUR + 0.01, prevDur - safeXDUR);
         const offset = parseFloat(timeline.toFixed(2));
         const outLabel = i === tempClips.length - 1 ? 'vout' : `v${i}`;
-        parts.push(`[${prevLabel}][${i}:v]xfade=transition=${xft}:duration=${safeXDUR}:offset=${offset}[${outLabel}]`);
+        const fx = (hasTransition && spec && Array.isArray(spec.fx)) ? spec.fx : [];
+        if (fx.length) {
+          // The xfade writes to a private label and the fx chain carries it to the one
+          // the next boundary expects, so adding character never changes the shape of
+          // the chain around it.
+          const xfLabel = `xf${i}`;
+          parts.push(`[${prevLabel}][${i}:v]xfade=transition=${xft}:duration=${safeXDUR}:offset=${offset}[${xfLabel}]`);
+          let cur = xfLabel;
+          const from = offset.toFixed(3);
+          const to = (offset + safeXDUR).toFixed(3);
+          fx.forEach((f, k) => {
+            const dst = k === fx.length - 1 ? outLabel : `fx${i}_${k}`;
+            // enable confines the effect to the join. Without it a grade or a blur
+            // meant for half a second would sit over the whole finished video.
+            const sep = String(f).includes('=') ? ':' : '=';
+            parts.push(`[${cur}]${f}${sep}enable='between(t,${from},${to})'[${dst}]`);
+            cur = dst;
+          });
+        } else {
+          parts.push(`[${prevLabel}][${i}:v]xfade=transition=${xft}:duration=${safeXDUR}:offset=${offset}[${outLabel}]`);
+        }
         prevLabel = outLabel;
         const outALabel = i === tempClips.length - 1 ? 'aout' : `a${i}`;
         aParts.push(`[${prevALabel}][${i}:a]acrossfade=d=${safeXDUR}:c1=tri:c2=tri[${outALabel}]`);
