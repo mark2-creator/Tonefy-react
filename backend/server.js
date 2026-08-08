@@ -2603,6 +2603,21 @@ app.post('/api/media-to-video', async (req, res) => {
           if (trimEnd !== null) args.push(`end=${trimEnd}`);
           chain.push(`atrim=${args.join(':')}`, 'asetpts=PTS-STARTPTS');
         }
+        // Fades belong to the audio, not to where the audio sits, so they go on
+        // before adelay: st is then measured from the start of the trimmed region
+        // rather than from the start of the finished video.
+        const runLen = trimEnd !== null ? Math.max(0, trimEnd - trimStart) : null;
+        const fadeIn = Math.max(0, Number(t.fadeIn) || 0);
+        const fadeOut = Math.max(0, Number(t.fadeOut) || 0);
+        if (fadeIn > 0) chain.push(`afade=t=in:st=0:d=${sec(fadeIn)}`);
+        // A fade out has to know where the end is. Without a trimEnd the length is
+        // whatever the file turns out to be, and a guessed st would ramp down in the
+        // wrong place - better to leave it alone than to fade the middle.
+        if (fadeOut > 0 && runLen !== null && runLen > 0) {
+          const st = Math.max(0, runLen - fadeOut);
+          chain.push(`afade=t=out:st=${sec(st)}:d=${sec(Math.min(fadeOut, runLen))}`);
+        }
+
         const startOffset = Number(t.startOffset) > 0 ? sec(t.startOffset) : 0;
         if (startOffset > 0) chain.push(`adelay=${Math.round(startOffset * 1000)}:all=1`);
         const volume = Number.isFinite(Number(t.volume)) ? Math.max(0, Math.min(4, Number(t.volume))) : 1;
