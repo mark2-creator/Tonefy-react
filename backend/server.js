@@ -1983,6 +1983,31 @@ function safeFilterChain(chain) {
   return ok.length ? ok : null;
 }
 
+// How the footage meets the frame.
+//
+// Fill is the original behaviour and is emitted byte-identically, so a project that
+// says nothing about a background renders exactly as it did.
+//
+// Fit scales the whole shot inside the frame and fills what is left. Colour is a pad;
+// blur splits the input, uses a cropped-and-blurred copy as the backdrop and lays the
+// contained copy over it - which is the only one of the two that needs a graph rather
+// than a chain, because the same frame has to be used twice.
+function frameFitFilter(W, H, bg) {
+  const fill = `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}`;
+  if (!bg || bg.fit !== 'fit') return fill;
+
+  const contain = `scale=${W}:${H}:force_original_aspect_ratio=decrease`;
+  if (bg.type === 'colour') {
+    // pad centres the scaled frame and paints the remainder in one filter.
+    return `${contain},pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=${safeColor(bg.colour, '#000000')}`;
+  }
+  const sigma = Math.max(0, Math.min(60, Number(bg.blur) || 0)).toFixed(1);
+  return `split[bgsrc][fgsrc];`
+    + `[bgsrc]${fill},gblur=sigma=${sigma}[bgblur];`
+    + `[fgsrc]${contain}[fgfit];`
+    + `[bgblur][fgfit]overlay=(W-w)/2:(H-h)/2`;
+}
+
 function clipLookFilter(item = {}) {
   const parts = [];
   // Mirroring is about the framing, so it comes before the grade.
@@ -2013,7 +2038,7 @@ function clipLookFilter(item = {}) {
 }
 
 app.post('/api/media-to-video', async (req, res) => {
-  const { mediaItems = [], userId, resolution = '1080p', aspectRatio = '9:16', textOverlays = [], overlays = [], audioTracks = [], previewWidth } = req.body || {};
+  const { mediaItems = [], userId, resolution = '1080p', aspectRatio = '9:16', background = null, textOverlays = [], overlays = [], audioTracks = [], previewWidth } = req.body || {};
   if (!mediaItems.length) return res.status(400).json({ error: "mediaItems required" });
 
   const jobId = createJob();
@@ -2036,7 +2061,7 @@ app.post('/api/media-to-video', async (req, res) => {
       // and filter on every clip and this read none of them, so a trim you could see
       // on the timeline came back untrimmed in the file you exported.
       const look = clipLookFilter(item);
-      const vf = `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1${look}`;
+      const vf = `${frameFitFilter(W, H, background)},setsar=1${look}`;
 
       // Every prepared clip carries an audio stream, even when that stream is
       // silence. Clips used to be prepped with -an, so the original sound was thrown
