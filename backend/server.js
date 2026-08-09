@@ -1871,7 +1871,28 @@ function escDrawtext(s) {
     .replace(/\n/g, ' ');
 }
 
-const RES_MAP = { '720p': [720, 1280], '1080p': [1080, 1920], '4K': [2160, 3840] };
+// Resolution is the SHORT edge. It used to be a fixed [w,h] pair, which hardcoded
+// every export to 9:16 - the app's resolution picker chose between three portrait
+// sizes and there was no way to render anything else.
+const SHORT_EDGE = { '720p': 720, '1080p': 1080, '4K': 2160 };
+const ASPECTS = {
+  '9:16': [9, 16], '4:5': [4, 5], '1:1': [1, 1],
+  '16:9': [16, 9], '3:4': [3, 4], '2:3': [2, 3],
+};
+
+// libx264 needs even dimensions and rejects odd ones outright, so both are rounded
+// to an even number rather than left to chance on a ratio like 2:3.
+const even = n => Math.max(2, Math.round(n / 2) * 2);
+
+function frameSize(resolution, aspectRatio) {
+  const short = SHORT_EDGE[resolution] || SHORT_EDGE['1080p'];
+  const [aw, ah] = ASPECTS[aspectRatio] || ASPECTS['9:16'];
+  // The short edge keeps the chosen resolution whichever way round the frame is, so
+  // switching a 1080p project from portrait to landscape does not halve its height.
+  return aw <= ah
+    ? [even(short), even((short * ah) / aw)]
+    : [even((short * aw) / ah), even(short)];
+}
 
 // The app ships the same TTFs and picks from the same list of family names, so the
 // name -> file mapping is a manifest kept next to the fonts rather than a literal
@@ -1988,7 +2009,7 @@ function clipLookFilter(item = {}) {
 }
 
 app.post('/api/media-to-video', async (req, res) => {
-  const { mediaItems = [], userId, resolution = '1080p', textOverlays = [], overlays = [], audioTracks = [], previewWidth } = req.body || {};
+  const { mediaItems = [], userId, resolution = '1080p', aspectRatio = '9:16', textOverlays = [], overlays = [], audioTracks = [], previewWidth } = req.body || {};
   if (!mediaItems.length) return res.status(400).json({ error: "mediaItems required" });
 
   const jobId = createJob();
@@ -1996,7 +2017,7 @@ app.post('/api/media-to-video', async (req, res) => {
 
   try {
     updateJob(jobId, { progress: 5, message: "Preparing clips..." });
-    const [W, H] = RES_MAP[resolution] || RES_MAP['1080p'];
+    const [W, H] = frameSize(resolution, aspectRatio);
 
     const tempClips = [];
     for (let i = 0; i < mediaItems.length; i++) {
