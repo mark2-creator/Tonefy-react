@@ -2219,7 +2219,12 @@ app.post('/api/media-to-video', async (req, res) => {
       // edge lands exactly on the measured width of the whole phrase.
       const labelPadCache = new Map();
 
+      // Cached. A highlight caption measures the same line once per word in it, and
+      // the same words again for every still of that phrase - all identical calls.
+      const labelWidthCache = new Map();
       const labelWidth = async (fontPath, pointsize, kerning, text) => {
+        const wkey = `${fontPath}|${pointsize}|${kerning}|${text}`;
+        if (labelWidthCache.has(wkey)) return labelWidthCache.get(wkey);
         const out = await run('convert', [
           '-background', 'none', '-fill', 'white',
           ...(fontPath ? ['-font', fontPath] : []),
@@ -2227,8 +2232,23 @@ app.post('/api/media-to-video', async (req, res) => {
           ...(kerning != null ? ['-kerning', kerning] : []),
           `label:${text}`, '-format', '%w', 'info:',
         ], { timeout: 15000 });
-        return parseInt(String(out).trim(), 10) || 0;
+        const w = parseInt(String(out).trim(), 10) || 0;
+        labelWidthCache.set(wkey, w);
+        return w;
       };
+
+      // The layers of a caption that do not depend on WHICH word is chipped.
+      //
+      // A highlight style arrives as one still per word, and every one of them was
+      // rebuilding the whole stack: the mask, the alpha, the dilate, and a blurred
+      // tint for each of shadow, glow and stroke. Measured at the real export size,
+      // the dilate alone is 380ms and each blur about 360ms - so a four-word phrase
+      // paid roughly 5.6 seconds to draw the same picture four times with the chip
+      // in a different place. That is what made the export look hung.
+      //
+      // Keyed on everything that actually changes those layers. The chip's position
+      // is not in the key, because it is composited on top of them.
+      const phraseLayerCache = new Map();
 
       // pad = 2*W(c) - W(cc), for any c. Cached: it depends only on the font, the
       // size and the tracking, and a caption measures several words at each of them.
@@ -2417,21 +2437,44 @@ app.post('/api/media-to-video', async (req, res) => {
           const paddedH = Ht + pad * 2;
           const combinedPng = base.replace('.png', '_combined.png');
           const alphaPadPng = base.replace('.png', '_alphapad.png');
-          const scratch = [alphaPadPng];
+          // Everything below is shared by every still of this phrase; only the chip's
+          // position differs. Files in the cache must outlive the overlay that made
+          // them, so they are kept out of `scratch` and swept at the end of the job.
+          const layerKey = JSON.stringify([
+            safeText, fontPath, Math.round(fontSizePx),
+            spec && spec.spacing ? num(spec.spacing) : 0,
+            spec && spec.stroke ? [spec.stroke.color, num(spec.stroke.width)] : 0,
+            spec && spec.glow ? [spec.glow.color, num(spec.glow.radius)] : 0,
+            spec && spec.shadow ? [spec.shadow.color, num(spec.shadow.radius), num(spec.shadow.dx), num(spec.shadow.dy)] : 0,
+            paddedW, paddedH, pad, gravityArg,
+          ]);
+          const cachedLayers = phraseLayerCache.get(layerKey) || null;
+          const layers = cachedLayers || {};
+          // alphaPadPng is cached and reused by the next word, so it must NOT be in
+          // scratch - it would be deleted at the end of this still and the next one
+          // would dilate a file that is gone. Only genuinely per-word files go here.
+          const scratch = [];
 
           // The pad goes on before the dilate, not after: dilating an alpha cropped
           // to the glyphs squares the ring off at the text's bounding box, which
           // reads as a black slab behind the word rather than an outline round it.
-          await run('convert', [alphaPng, '-bordercolor', 'black', '-border', pad, alphaPadPng])
+          if (!cachedLayers) await run('convert', [alphaPng, '-bordercolor', 'black', '-border', pad, alphaPadPng])
             .catch(e => { console.error('Alpha pad error:', e.stderr?.slice(-500) || e.message); throw new Error('Alpha pad failed'); });
 
-          let ringPng = alphaPadPng;
+          let ringPng = layers.alphaPadPng || alphaPadPng;
           if (strokeR > 0) {
-            ringPng = base.replace('.png', '_ring.png');
-            scratch.push(ringPng);
-            await run('convert', [alphaPadPng, '-morphology', 'Dilate', 'Disk:' + strokeR.toFixed(2), ringPng])
-              .catch(e => { console.error('Stroke dilate error:', e.stderr?.slice(-500) || e.message); throw new Error('Stroke dilate failed'); });
+            if (cachedLayers) {
+              ringPng = layers.ringPng;
+            } else {
+              ringPng = base.replace('.png', '_ring.png');
+              // The single most expensive call in the whole caption path - 380ms at
+              // export size - and identical for every word of a phrase.
+              await run('convert', [alphaPadPng, '-morphology', 'Dilate', 'Disk:' + strokeR.toFixed(2), ringPng])
+                .catch(e => { console.error('Stroke dilate error:', e.stderr?.slice(-500) || e.message); throw new Error('Stroke dilate failed'); });
+              layers.ringPng = ringPng;
+            }
           }
+          if (!cachedLayers) layers.alphaPadPng = alphaPadPng;
 
           // A flat colour cut to a silhouette by the given mask, optionally blurred.
           const tint = async (colour, maskPath, outPath, blur) => {
@@ -2476,29 +2519,29 @@ app.post('/api/media-to-video', async (req, res) => {
           }
 
           if (shadowCfg) {
-            const shadowPng = base.replace('.png', '_shadow.png');
-            scratch.push(shadowPng);
-            await tint(shadowCfg.color, ringPng, shadowPng, shadowCfg.radius)
+            const shadowPng = layers.shadowPng || base.replace('.png', '_shadow.png');
+            if (!layers.shadowPng) await tint(shadowCfg.color, ringPng, shadowPng, shadowCfg.radius)
               .catch(e => { console.error('Shadow layer error:', e.stderr?.slice(-500) || e.message); throw new Error('Shadow layer failed'); });
+            layers.shadowPng = shadowPng;
             args.push(shadowPng, '-geometry', geo(shadowCfg.dx, shadowCfg.dy), '-composite');
           }
 
           if (glowCfg) {
-            const glowPng = base.replace('.png', '_glow.png');
-            scratch.push(glowPng);
-            await tint(glowCfg.color, ringPng, glowPng, glowCfg.radius)
+            const glowPng = layers.glowPng || base.replace('.png', '_glow.png');
+            if (!layers.glowPng) await tint(glowCfg.color, ringPng, glowPng, glowCfg.radius)
               .catch(e => { console.error('Glow layer error:', e.stderr?.slice(-500) || e.message); throw new Error('Glow layer failed'); });
             // Laid down twice, as the app does: stacking the same halo reads brighter,
             // where one pass at a wider radius only spreads the same ink thinner.
+            layers.glowPng = glowPng;
             args.push(glowPng, '-geometry', '+0+0', '-composite');
             args.push(glowPng, '-geometry', '+0+0', '-composite');
           }
 
           if (strokeR > 0) {
-            const strokePng = base.replace('.png', '_stroke.png');
-            scratch.push(strokePng);
-            await tint(spec.stroke.color, ringPng, strokePng, 0)
+            const strokePng = layers.strokePng || base.replace('.png', '_stroke.png');
+            if (!layers.strokePng) await tint(spec.stroke.color, ringPng, strokePng, 0)
               .catch(e => { console.error('Stroke layer error:', e.stderr?.slice(-500) || e.message); throw new Error('Stroke layer failed'); });
+            layers.strokePng = strokePng;
             args.push(strokePng, '-geometry', '+0+0', '-composite');
           }
 
@@ -2509,6 +2552,9 @@ app.post('/api/media-to-video', async (req, res) => {
           try { fs.unlinkSync(coloredPng); } catch (e) {}
           fs.copyFileSync(combinedPng, coloredPng);
           try { fs.unlinkSync(combinedPng); } catch (e) {}
+          // Kept for the next still of this phrase. `scratch` holds only the files
+          // that are genuinely per-word, so this cannot delete something still needed.
+          phraseLayerCache.set(layerKey, layers);
           scratch.forEach(f => { try { fs.unlinkSync(f); } catch (e) {} });
           effWt = paddedW;
           effHt = paddedH;
@@ -2590,6 +2636,14 @@ app.post('/api/media-to-video', async (req, res) => {
         filterParts.push(`[${lastLabel}][${inIdx}:v]overlay=x=${placeX}:y=${placeY}${enableArg}[${newLabel}]`);
         lastLabel = newLabel;
       });
+
+      // The cached phrase layers have outlived their usefulness now every still is
+      // rendered. Without this they would accumulate in uploads/ for the life of the
+      // process - one dilate and three blurred tints per distinct caption.
+      for (const l of phraseLayerCache.values()) {
+        for (const f of Object.values(l)) { try { fs.unlinkSync(f); } catch (e) {} }
+      }
+      phraseLayerCache.clear();
 
       const filterComplex = filterParts.join(';');
       const overlayCmd = `ffmpeg -y ${inputs.join(' ')} -filter_complex "${filterComplex}" -map "[${lastLabel}]" -map 0:a? -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -c:a copy "${withOverlaysOut}"`;
