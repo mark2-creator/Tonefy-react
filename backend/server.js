@@ -292,6 +292,7 @@ app.use("/audios", express.static(audiosDir, { setHeaders: (res) => { res.setHea
 // Transition previews, one animated webp per catalogue entry, rendered by
 // scripts/gen-transition-previews.mjs in the app repo. Immutable once written -
 // a preview only changes when its recipe does, and then it gets a new render.
+app.use("/filters", express.static(path.join(__dirname, "public", "filters"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/transitions", express.static(path.join(__dirname, "public", "transitions"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/music", express.static(path.join(__dirname, "public", "music"), { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 
@@ -1937,11 +1938,41 @@ function atempoChain(speed) {
   return parts;
 }
 
+// Only these may appear in a client-sent grade. The chain is interpolated into an
+// ffmpeg -vf argument, so an unrestricted string would let a crafted request add
+// arbitrary filters - and the app only ever sends the handful below.
+const ALLOWED_FILTER_OPS = new Set([
+  'eq', 'colorbalance', 'curves', 'hue', 'colorchannelmixer',
+  'vignette', 'noise', 'unsharp',
+]);
+
+function safeFilterChain(chain) {
+  if (!Array.isArray(chain)) return null;
+  const ok = chain.filter(part => {
+    const str = String(part);
+    // No shell metacharacters, no chaining out of the op, and a known op name.
+    if (/[;"'`$\\\n]/.test(str)) return false;
+    const op = str.split('=')[0].trim();
+    return ALLOWED_FILTER_OPS.has(op);
+  });
+  return ok.length ? ok : null;
+}
+
 function clipLookFilter(item = {}) {
   const parts = [];
   // Mirroring is about the framing, so it comes before the grade.
   if (item.flipH) parts.push('hflip');
   if (item.flipV) parts.push('vflip');
+
+  // The app sends the grade as a chain, so the catalogue lives in one place and a
+  // filter added there renders without a deploy here. Older clients send only a name
+  // and fall through to the seven below.
+  const spec = safeFilterChain(item.filterSpec);
+  if (spec) {
+    parts.push(...spec);
+    return parts.length ? ',' + parts.join(',') : '';
+  }
+
   switch (item.filter) {
     case 'Bright': parts.push('eq=brightness=0.10'); break;
     case 'Contrast': parts.push('eq=contrast=1.30'); break;
