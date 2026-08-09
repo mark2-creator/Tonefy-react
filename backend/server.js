@@ -1992,6 +1992,28 @@ function safeFilterChain(chain) {
 // blur splits the input, uses a cropped-and-blurred copy as the backdrop and lays the
 // contained copy over it - which is the only one of the two that needs a graph rather
 // than a chain, because the same frame has to be used twice.
+// The user's crop, applied to the SOURCE before it meets the frame.
+//
+// Stored as fractions rather than pixels so one rectangle is correct for the phone's
+// preview and for a 4K master. Expressed with iw/ih for the same reason - ffmpeg
+// resolves them against whatever the real frame turns out to be, so nothing here has
+// to know the source's dimensions.
+function sourceCropFilter(crop) {
+  if (!crop) return null;
+  const n = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+  const x = Math.min(Math.max(n(crop.x, 0), 0), 1);
+  const y = Math.min(Math.max(n(crop.y, 0), 0), 1);
+  const w = Math.min(Math.max(n(crop.w, 1), 0.01), 1 - x);
+  const h = Math.min(Math.max(n(crop.h, 1), 0.01), 1 - y);
+  // A full-frame crop is not a crop, and emitting one would change nothing while
+  // costing a filter pass on every clip in every project.
+  if (x === 0 && y === 0 && w === 1 && h === 1) return null;
+  // Even dimensions: libx264 rejects odd ones, and a fractional crop of an arbitrary
+  // source will produce them.
+  return `crop=floor(iw*${w.toFixed(5)}/2)*2:floor(ih*${h.toFixed(5)}/2)*2`
+    + `:floor(iw*${x.toFixed(5)}):floor(ih*${y.toFixed(5)})`;
+}
+
 function frameFitFilter(W, H, bg) {
   const fill = `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}`;
   if (!bg || bg.fit !== 'fit') return fill;
@@ -2061,7 +2083,11 @@ app.post('/api/media-to-video', async (req, res) => {
       // and filter on every clip and this read none of them, so a trim you could see
       // on the timeline came back untrimmed in the file you exported.
       const look = clipLookFilter(item);
-      const vf = `${frameFitFilter(W, H, background)},setsar=1${look}`;
+      // Crop the source first, then fit what is left into the frame. The other order
+      // would crop the FRAME - taking a corner out of the finished video rather than
+      // choosing which part of the shot is used.
+      const srcCrop = sourceCropFilter(item.crop);
+      const vf = `${srcCrop ? srcCrop + ',' : ''}${frameFitFilter(W, H, background)},setsar=1${look}`;
 
       // Every prepared clip carries an audio stream, even when that stream is
       // silence. Clips used to be prepped with -an, so the original sound was thrown
