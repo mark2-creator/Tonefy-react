@@ -1851,7 +1851,13 @@ app.post('/api/edit-video', async (req, res) => {
 
 const upload = multer({ dest: uploadsDir });
 
-app.post('/api/upload-media', upload.array('files', 20), async (req, res) => {
+// 60, not 20. A project accumulates clips over a whole editing session - split,
+// replace, add again - and easily passes what one picker selection (selectionLimit:
+// 20 in the app) allows in a single pick. The old cap threw multer's own
+// LIMIT_UNEXPECTED_FILE for the 21st file, whose default .message is literally
+// "Unexpected field" - so a real project's export failed with an error that read
+// like a client bug rather than a limit being hit.
+app.post('/api/upload-media', upload.array('files', 60), async (req, res) => {
   try {
     const urls = (req.files || []).map(f => {
       const ext = (path.extname(f.originalname) || '').toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12);
@@ -2865,5 +2871,23 @@ app.post('/api/media-to-video', async (req, res) => {
 
 
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
+
+// Nothing in this file caught an error that reached here - not multer's, not a
+// synchronous throw in any route. Both fell through to EXPRESS'S OWN error page: an
+// HTML stack trace. The app calls res.json() on every response it gets back, so that
+// page reached res.json() and failed as an opaque "Unexpected character: <" instead
+// of showing whatever the real problem was. This is that real message, as JSON,
+// for anything that ends up here - the multer file-count limit above included.
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err?.message || err);
+  if (err?.name === 'MulterError') {
+    const known = {
+      LIMIT_FILE_SIZE: 'One of those files is too large.',
+      LIMIT_UNEXPECTED_FILE: 'Too many files in one upload.',
+    };
+    return res.status(400).json({ error: known[err.code] || err.message });
+  }
+  res.status(500).json({ error: err?.message || 'Server error' });
+});
 
 app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
