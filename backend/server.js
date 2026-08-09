@@ -292,6 +292,10 @@ app.use("/audios", express.static(audiosDir, { setHeaders: (res) => { res.setHea
 // Transition previews, one animated webp per catalogue entry, rendered by
 // scripts/gen-transition-previews.mjs in the app repo. Immutable once written -
 // a preview only changes when its recipe does, and then it gets a new render.
+// Sticker artwork. Served to the picker, and read straight off this disk when a
+// sticker is burned in - a sticker is the one overlay that never needs uploading,
+// because the file the export composites is the file the app was already showing.
+app.use("/stickers", express.static(path.join(__dirname, "public", "stickers"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/filters", express.static(path.join(__dirname, "public", "filters"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/transitions", express.static(path.join(__dirname, "public", "transitions"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/music", express.static(path.join(__dirname, "public", "music"), { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
