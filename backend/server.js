@@ -566,7 +566,38 @@ function pickBestMp4(videoObj) {
 
 function isHttpUrl(s) { return typeof s === "string" && /^https?:\/\//i.test(s); }
 
-async function cleanupOldFiles(dir, maxAgeMs = 72 * 60 * 60 * 1000) {
+// Retention promise: free users keep 72h, paid users (any plan other than
+// "free") keep 30 days. Both live on this VPS's disk - there's no permanent
+// tier yet. Upgrading that promise later (e.g. to real cloud storage) is
+// easy; downgrading one already made to a paying user is not, which is why
+// free stays exactly what it's always been rather than shrinking to make
+// room for the paid tier.
+const FREE_RETENTION_MS = 72 * 60 * 60 * 1000;
+const PAID_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+// A video file's owning user's plan, via userVideos.userId -> users/{uid}.plan.
+// Always resolves to a plan string - 'free' when there's genuinely no owner to
+// protect (no matching record, no userId, no user doc, no plan field) - and
+// throws only when the lookup itself failed (a real Firestore error), which
+// callers must treat as paid, not as free: deleting someone's video because
+// Firestore blipped is a far worse failure than holding a file one extra
+// 10-minute cycle.
+//
+// This is also where a future subscription-lapse grace period hooks in: once
+// billing exists and a plan can lapse, that check belongs here, as another
+// reason (alongside "lookup failed") to keep treating someone as paid for a
+// while rather than reclassifying them as free the instant a payment fails.
+async function getOwnerPlan(filename) {
+  const snap = await adminDb.collection('userVideos').where('filename', '==', filename).get();
+  if (snap.empty) return 'free';
+  const userId = snap.docs[0].data().userId;
+  if (!userId) return 'free';
+  const userDoc = await adminDb.collection('users').doc(userId).get();
+  if (!userDoc.exists) return 'free';
+  return userDoc.data().plan || 'free';
+}
+
+async function cleanupOldFiles(dir, maxAgeMs = FREE_RETENTION_MS) {
   fs.readdir(dir, async (err, files) => {
     if (err) return;
     const now = Date.now();
@@ -574,26 +605,86 @@ async function cleanupOldFiles(dir, maxAgeMs = 72 * 60 * 60 * 1000) {
       const filePath = path.join(dir, file);
       try {
         const stats = await fs.promises.stat(filePath);
-        if (now - stats.mtimeMs > maxAgeMs) {
-          await fs.promises.unlink(filePath);
-          // If it's a video file, delete matching Firestore record
-          if (dir === videosDir && (file.endsWith('.mp4') || file.endsWith('.ass'))) {
-            try {
-              const snap = await adminDb.collection('userVideos').where('filename', '==', file).get();
-              for (const doc of snap.docs) {
-                await doc.ref.delete();
-                console.log(`[Cleanup] Deleted Firestore record for ${file}`);
-              }
-            } catch (e) {
-              console.error(`[Cleanup] Firestore delete failed for ${file}:`, e.message);
+        const ageMs = now - stats.mtimeMs;
+        // Not even old enough for the free tier - never worth a Firestore
+        // lookup, and this keeps every sweep cheap for the common case.
+        if (ageMs <= maxAgeMs) continue;
+
+        let effectiveMaxAgeMs = maxAgeMs;
+        const isVideoFile = dir === videosDir && (file.endsWith('.mp4') || file.endsWith('.ass'));
+        if (isVideoFile) {
+          try {
+            const plan = await getOwnerPlan(file);
+            effectiveMaxAgeMs = plan === 'free' ? FREE_RETENTION_MS : PAID_RETENTION_MS;
+          } catch (e) {
+            console.error(`[Cleanup] Plan lookup failed for ${file}, holding this cycle:`, e.message);
+            continue;
+          }
+        }
+        if (ageMs <= effectiveMaxAgeMs) continue;
+
+        await fs.promises.unlink(filePath);
+        // If it's a video file, delete matching Firestore record
+        if (isVideoFile) {
+          try {
+            const snap = await adminDb.collection('userVideos').where('filename', '==', file).get();
+            for (const doc of snap.docs) {
+              await doc.ref.delete();
+              console.log(`[Cleanup] Deleted Firestore record for ${file}`);
             }
+          } catch (e) {
+            console.error(`[Cleanup] Firestore delete failed for ${file}:`, e.message);
           }
         }
       } catch (e) {}
     }
   });
 }
-setInterval(() => { cleanupOldFiles(videosDir); cleanupOldFiles(audiosDir); }, 10 * 60 * 1000);
+
+// Scratch files created mid-render (waveform extraction sources, transcription
+// copies, composited text-overlay PNGs) - see the request handlers that build
+// each prefix for why it exists. Every one of these is meant to be unlinked
+// right after the request that made it finishes; this sweep is a backstop for
+// the error paths that skip their own cleanup, not the primary mechanism.
+// 48h rather than the video tiers below: nothing legitimate ever references
+// one of these past a single request's lifetime.
+const SCRATCH_PREFIXES = ['wavesrc-', 'wavepcm-', 'transcribesrc-', 'captionsrc-', 'txtrender-'];
+const SCRATCH_RETENTION_MS = 48 * 60 * 60 * 1000;
+
+// Genuine user uploads (/api/upload-media) back an in-progress editor draft,
+// and the app's own draft storage (utils/draft.js) has no expiry of its own -
+// a draft can be offered for restore regardless of age. 30 days is
+// deliberately generous and NOT tied to the video retention tiers above:
+// unlike finished videos, uploads have no per-file owner record the way
+// userVideos does, so this can't be made plan-aware without adding that
+// bookkeeping first. Erring generous - breaking someone's in-progress draft
+// is worse than the disk cost of holding an upload longer than it turns out
+// to be needed.
+const UPLOAD_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+function cleanupUploads() {
+  fs.readdir(uploadsDir, async (err, files) => {
+    if (err) return;
+    const now = Date.now();
+    for (const file of files) {
+      const isScratch = SCRATCH_PREFIXES.some(p => file.startsWith(p));
+      const maxAgeMs = isScratch ? SCRATCH_RETENTION_MS : UPLOAD_RETENTION_MS;
+      const filePath = path.join(uploadsDir, file);
+      try {
+        const stats = await fs.promises.stat(filePath);
+        if (now - stats.mtimeMs > maxAgeMs) {
+          await fs.promises.unlink(filePath);
+        }
+      } catch (e) {}
+    }
+  });
+}
+
+setInterval(() => {
+  cleanupOldFiles(videosDir);
+  cleanupOldFiles(audiosDir);
+  cleanupUploads();
+}, 10 * 60 * 1000);
 
 function buildCaptionFilter(script, audioDuration) {
   // Split script into short chunks of ~5 words each
