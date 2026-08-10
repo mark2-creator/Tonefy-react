@@ -18,6 +18,7 @@ import { initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
 import { getFirestore as getAdminFirestore } from "firebase-admin/firestore";
+import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed } from "./tiers.js";
 
 // Firebase Storage + Firestore (Admin) — initialized after initializeApp()
 let bucket, adminDb;
@@ -2004,6 +2005,20 @@ function frameSize(resolution, aspectRatio) {
     : [even((short * aw) / ah), even(short)];
 }
 
+// The same "ffprobe a file's duration" line already appears inline three
+// times elsewhere in this file (audio duration checks) - not touched, since
+// those are unrelated to credits and re-plumbing working code for the sake
+// of sharing three lines isn't worth the churn. This is for the new credit-
+// deduction call sites, which all need the same thing: the REAL duration of
+// a finished export, never an estimate.
+function probeDurationSeconds(filePath) {
+  return new Promise((resolve) => {
+    exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`, (err, stdout) => {
+      resolve(parseFloat(stdout?.trim()) || 0);
+    });
+  });
+}
+
 // The app ships the same TTFs and picks from the same list of family names, so the
 // name -> file mapping is a manifest kept next to the fonts rather than a literal
 // here that has to be edited in step with the app. Read once and cached: it is
@@ -2165,6 +2180,26 @@ function clipLookFilter(item = {}) {
   return parts.length ? ',' + parts.join(',') : '';
 }
 
+// A pre-flight estimate only - gates the per-video duration cap before any
+// rendering starts. The real credit deduction after success uses ffprobe on
+// the actual output, never this. Mirrors the same per-item duration logic
+// the clip-prep loop below actually renders with: a still runs for its
+// duration field (3s default, matching that loop), a video clip runs for
+// (trimEnd - trimStart) adjusted by speed - a 10s trimmed span at 2x speed
+// renders out to 5s, matching the setpts filter applied below.
+function estimateMediaItemsDurationSeconds(mediaItems) {
+  return mediaItems.reduce((total, item) => {
+    if (item.type === 'image') {
+      return total + (Number(item.duration) > 0 ? Number(item.duration) : 3);
+    }
+    const ss = Number(item.trimStart) > 0 ? Number(item.trimStart) : 0;
+    const te = Number(item.trimEnd) > ss ? Number(item.trimEnd) : ss + (Number(item.duration) > 0 ? Number(item.duration) : 5);
+    const rawSpeed = Number(item.speed);
+    const spd = Number.isFinite(rawSpeed) && rawSpeed > 0 ? Math.max(0.1, Math.min(10, rawSpeed)) : 1;
+    return total + (te - ss) / spd;
+  }, 0);
+}
+
 app.post('/api/media-to-video', async (req, res) => {
   const { mediaItems = [], resolution = '1080p', aspectRatio = '9:16', background = null, textOverlays = [], overlays = [], audioTracks = [], previewWidth } = req.body || {};
   // The uid this render (and, once credits exist, its cost) is attributed to
@@ -2174,12 +2209,22 @@ app.post('/api/media-to-video', async (req, res) => {
   const userId = req.user?.uid;
   if (!mediaItems.length) return res.status(400).json({ error: "mediaItems required" });
 
+  // Credits and caps are checked BEFORE a job is created - a rejected
+  // request must not get a jobId back, or the client has no way to tell
+  // "this was declined" from "this is queued."
+  const estimatedSeconds = estimateMediaItemsDurationSeconds(mediaItems);
+  const allowed = await checkRenderAllowed(adminDb, userId, {
+    requestedDurationSeconds: estimatedSeconds,
+    requestedResolution: resolution,
+  });
+  if (!allowed.ok) return res.status(allowed.status).json({ error: allowed.error });
+
   const jobId = createJob();
   res.json({ jobId });
 
   try {
     updateJob(jobId, { progress: 5, message: "Preparing clips..." });
-    const [W, H] = frameSize(resolution, aspectRatio);
+    const [W, H] = frameSize(allowed.resolution, aspectRatio);
 
     const tempClips = [];
     for (let i = 0; i < mediaItems.length; i++) {
@@ -2963,8 +3008,29 @@ app.post('/api/media-to-video', async (req, res) => {
       outputVideo = withAudioOut;
     }
 
+    // Free tier only - matches the same watermark text/placement already
+    // burned in unconditionally by idea-to-video/idea-to-video-v2, so a
+    // watermarked export looks the same regardless of which path made it.
+    // media-to-video (the timeline editor's own export) had no watermark at
+    // all before this - leaving it out here would have made "no watermark"
+    // a Pro benefit only for AI-generated videos, not the editor most
+    // projects actually go through.
+    if (allowed.watermark) {
+      const watermarked = path.join(videosDir, uniqueName("wm", "mp4"));
+      const watermark = "drawtext=text='Tonefy AI':fontsize=18:fontcolor=white@0.5:x=(w-text_w)/2:y=h-th-20";
+      await new Promise((resolve, reject) => {
+        exec(`ffmpeg -y -i "${outputVideo}" -vf "${watermark}" -c:a copy "${watermarked}"`, { timeout: 120000 }, (err, stdout, stderr) => {
+          if (err) { console.error("Watermark burn error:", stderr?.slice(-500)); return reject(new Error("Watermark burn failed")); }
+          resolve();
+        });
+      });
+      try { fs.unlinkSync(outputVideo); } catch (e) {}
+      outputVideo = watermarked;
+    }
+
     const filename = path.basename(outputVideo);
     const localUrl = `/videos/${filename}`;
+    const actualDurationSeconds = await probeDurationSeconds(outputVideo);
 
     if (userId) {
       await adminDb.collection('userVideos').add({
@@ -2973,7 +3039,12 @@ app.post('/api/media-to-video', async (req, res) => {
         prompt: "Uploaded media video", aspectRatio: "9:16",
         createdAt: new Date().toISOString(),
         size: fs.statSync(outputVideo).size,
+        durationSeconds: actualDurationSeconds,
       });
+      // Deducted from the REAL output, never the pre-flight estimate, and
+      // only after the render actually succeeded - a failed render must not
+      // cost anything.
+      await deductCredits(adminDb, userId, actualDurationSeconds);
     }
 
     updateJob(jobId, { status: 'done', progress: 100, videoUrl: localUrl, message: "Done!" });
