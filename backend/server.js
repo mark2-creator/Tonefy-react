@@ -337,16 +337,20 @@ app.use(express.json({ limit: "10mb" }));
 app.post("/api/audio-waveform", verifyToken, async (req, res) => {
   const { url, samples = 80 } = req.body || {};
   if (!url) return res.status(400).json({ error: "url required" });
+  // Declared outside the try so the finally block below can clean them up
+  // regardless of whether extraction succeeds or the ffmpeg call throws -
+  // previously a failed extraction left wavesrc/wavepcm on disk forever.
+  let srcPath, pcmPath, ownSrcPath = false;
   try {
-    let srcPath;
     if (url.startsWith('http')) {
       srcPath = path.join(uploadsDir, uniqueName("wavesrc", "mp3"));
+      ownSrcPath = true;
       await downloadToFile(url, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
     } else {
       srcPath = resolveMediaPath(url);
     }
 
-    const pcmPath = path.join(uploadsDir, uniqueName("wavepcm", "raw"));
+    pcmPath = path.join(uploadsDir, uniqueName("wavepcm", "raw"));
     // execFile, not exec: srcPath comes from the request body and this endpoint
     // is unauthenticated, so it must never reach a shell.
     await new Promise((resolve, reject) => {
@@ -380,14 +384,16 @@ app.post("/api/audio-waveform", verifyToken, async (req, res) => {
       peaks.push(Math.round(normalized * 100) / 100);
     }
 
-    try { fs.unlinkSync(pcmPath); } catch (e) {}
-    if (url.startsWith('http')) { try { fs.unlinkSync(srcPath); } catch (e) {} }
-
     res.json({ peaks });
   } catch (e) {
     console.error("audio-waveform error:", e.message);
     const badInput = /Invalid media path|Not a stored media path|outside the allowed|unexpected characters/.test(e.message);
     res.status(badInput ? 400 : 500).json({ error: e.message });
+  } finally {
+    if (pcmPath) { try { fs.unlinkSync(pcmPath); } catch (e) {} }
+    // Only ours to delete if we downloaded it ourselves - resolveMediaPath's
+    // branch points at real stored media that must survive this request.
+    if (ownSrcPath && srcPath) { try { fs.unlinkSync(srcPath); } catch (e) {} }
   }
 });
 
@@ -2761,14 +2767,23 @@ app.post('/api/media-to-video', async (req, res) => {
       const filterComplex = filterParts.join(';');
       const overlayCmd = `ffmpeg -y ${inputs.join(' ')} -filter_complex "${filterComplex}" -map "[${lastLabel}]" -map 0:a? -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -c:a copy "${withOverlaysOut}"`;
 
-      await new Promise((resolve, reject) => {
-        exec(overlayCmd, { timeout: 180000 }, (err, stdout, stderr) => {
-          if (err) { console.error("Overlay/text burn error:", stderr?.slice(-500)); return reject(new Error("Overlay burn failed")); }
-          resolve();
+      // Each renderedTextPngs entry's outPng was only ever an input to this one
+      // ffmpeg call - once it's composited into withOverlaysOut (or the call
+      // fails outright) nothing references it again, so it must go either way.
+      // Left unhandled before, these accumulated in uploads/ forever: one
+      // txtrender-*.png per text overlay per export, never unlinked.
+      try {
+        await new Promise((resolve, reject) => {
+          exec(overlayCmd, { timeout: 180000 }, (err, stdout, stderr) => {
+            if (err) { console.error("Overlay/text burn error:", stderr?.slice(-500)); return reject(new Error("Overlay burn failed")); }
+            resolve();
+          });
         });
-      });
-      try { fs.unlinkSync(outputVideo); } catch (e) {}
-      outputVideo = withOverlaysOut;
+        try { fs.unlinkSync(outputVideo); } catch (e) {}
+        outputVideo = withOverlaysOut;
+      } finally {
+        for (const { outPng } of renderedTextPngs) { try { fs.unlinkSync(outPng); } catch (e) {} }
+      }
     }
 
     // Mix in audio tracks (voiceover + music)
