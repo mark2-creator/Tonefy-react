@@ -2163,7 +2163,12 @@ function clipLookFilter(item = {}) {
 }
 
 app.post('/api/media-to-video', async (req, res) => {
-  const { mediaItems = [], userId, resolution = '1080p', aspectRatio = '9:16', background = null, textOverlays = [], overlays = [], audioTracks = [], previewWidth } = req.body || {};
+  const { mediaItems = [], resolution = '1080p', aspectRatio = '9:16', background = null, textOverlays = [], overlays = [], audioTracks = [], previewWidth } = req.body || {};
+  // The uid this render (and, once credits exist, its cost) is attributed to
+  // must come from the verified token, never the request body - a body field
+  // is just a value the client typed, and trusting it let anyone render
+  // against, or misattribute a record to, any other account.
+  const userId = req.user?.uid;
   if (!mediaItems.length) return res.status(400).json({ error: "mediaItems required" });
 
   const jobId = createJob();
