@@ -203,13 +203,19 @@ function updateJob(jobId, data) {
 // Concurrency limiter for FFmpeg-heavy video generation
 let activeVideoJobs = 0;
 const MAX_CONCURRENT_VIDEO_JOBS = 4;
-const videoJobQueue = [];
+const videoJobQueue = [];         // free/pro
+const priorityVideoJobQueue = []; // creator - always drained first once a slot frees up
 
-function acquireVideoSlot() {
+// priority=true (Creator tier) queues ahead of whatever's already waiting -
+// it does NOT touch activeVideoJobs or preempt anything already occupying
+// one of the 4 slots, only which waiter gets the NEXT one that frees up.
+function acquireVideoSlot(priority = false) {
   return new Promise(resolve => {
     if (activeVideoJobs < MAX_CONCURRENT_VIDEO_JOBS) {
       activeVideoJobs++;
       resolve();
+    } else if (priority) {
+      priorityVideoJobQueue.push(resolve);
     } else {
       videoJobQueue.push(resolve);
     }
@@ -218,9 +224,10 @@ function acquireVideoSlot() {
 
 function releaseVideoSlot() {
   activeVideoJobs--;
-  if (videoJobQueue.length > 0) {
+  const nextQueue = priorityVideoJobQueue.length > 0 ? priorityVideoJobQueue : videoJobQueue;
+  if (nextQueue.length > 0) {
     activeVideoJobs++;
-    videoJobQueue.shift()();
+    nextQueue.shift()();
   }
 }
 
@@ -1374,7 +1381,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
   const jobId = createJob();
   res.json({ jobId });
 
-  await acquireVideoSlot();
+  await acquireVideoSlot(allowed.tier.queuePriority > 0);
   try {
     if (!segments.length) { updateJob(jobId, { status: "failed", message: "No segments provided" }); return; }
 
