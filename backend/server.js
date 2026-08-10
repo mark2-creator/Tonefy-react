@@ -1906,25 +1906,34 @@ app.post('/api/edit-video', async (req, res) => {
   const userId = req.user?.uid;
   if (!videoUrl) return res.status(400).json({ error: "videoUrl required" });
 
+  // Unlike idea-to-video-v2, the real duration is cheaply knowable up front
+  // here - this endpoint burns captions onto a video that already exists,
+  // it doesn't generate one from scratch - so the full check (credits,
+  // duration cap, caption style) can happen synchronously, before a job
+  // is ever created, same as media-to-video. No resolution cap: this
+  // endpoint doesn't scale or re-encode to a chosen resolution, it burns
+  // captions onto the input at whatever resolution it already is - there's
+  // nothing here to clamp without adding a re-encode step that isn't
+  // otherwise part of this endpoint's job.
+  const srcPath = videoUrl.startsWith('http')
+    ? path.join(videosDir, uniqueName("editsrc", "mp4"))
+    : path.join(videosDir, path.basename(videoUrl));
+  if (videoUrl.startsWith('http')) {
+    await downloadToFile(videoUrl, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+  }
+  const duration = await probeDurationSeconds(srcPath);
+
+  const allowed = await checkRenderAllowed(adminDb, userId, { requestedDurationSeconds: duration });
+  if (!allowed.ok) return res.status(allowed.status).json({ error: allowed.error });
+  if (!captionStyleAllowed(allowed.plan, captionStyle)) {
+    return res.status(403).json({ error: `The "${captionStyle}" caption style needs a Pro or Creator plan.` });
+  }
+
   const jobId = createJob();
   res.json({ jobId });
 
   try {
     updateJob(jobId, { progress: 5, message: "Loading video..." });
-
-    const srcPath = videoUrl.startsWith('http')
-      ? path.join(videosDir, uniqueName("editsrc", "mp4"))
-      : path.join(videosDir, path.basename(videoUrl));
-
-    if (videoUrl.startsWith('http')) {
-      await downloadToFile(videoUrl, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
-    }
-
-    const duration = await new Promise((resolve) => {
-      exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${srcPath}"`, (err, stdout) => {
-        resolve(parseFloat(stdout?.trim()) || 60);
-      });
-    });
 
     // If a voiceover track was supplied, transcribe it for real word-synced captions
     // (TikTok-style auto captions) instead of relying on a manually-typed script.
@@ -1962,9 +1971,15 @@ app.post('/api/edit-video', async (req, res) => {
     const assPath = outputVideo.replace('.mp4', '.ass');
     const hasCaptions = buildAssFile(effectiveScript, duration, assPath, captionStyle, wordTimestamps, captionMeta);
     const subsFilter = hasCaptions ? assFilter(assPath) : null;
+    // Free tier only. Folded into the same filter chain as captions rather
+    // than a separate pass - efficient when both apply, and means a
+    // watermark-only export (no captions) still gets a real encode instead
+    // of the stream-copy fast path, since -c copy can't add a filter at all.
+    const watermark = allowed.watermark ? "drawtext=text='Tonefy AI':fontsize=18:fontcolor=white@0.5:x=(w-text_w)/2:y=h-th-20" : null;
+    const vf = [subsFilter, watermark].filter(Boolean).join(',') || null;
 
-    const ffmpegCmd = subsFilter
-      ? `ffmpeg -y -i "${srcPath}" -vf "${subsFilter}" -c:a copy -pix_fmt yuv420p "${outputVideo}"`
+    const ffmpegCmd = vf
+      ? `ffmpeg -y -i "${srcPath}" -vf "${vf}" -c:a copy -pix_fmt yuv420p "${outputVideo}"`
       : `ffmpeg -y -i "${srcPath}" -c copy "${outputVideo}"`;
 
     updateJob(jobId, { progress: 60, message: "Burning subtitles..." });
@@ -1979,6 +1994,7 @@ app.post('/api/edit-video', async (req, res) => {
 
     const filename = path.basename(outputVideo);
     const localUrl = `/videos/${filename}`;
+    const actualDurationSeconds = await probeDurationSeconds(outputVideo);
 
     if (userId) {
       await adminDb.collection('userVideos').add({
@@ -1987,7 +2003,10 @@ app.post('/api/edit-video', async (req, res) => {
         prompt: script.slice(0, 100), aspectRatio: 'original', captionStyle,
         createdAt: new Date().toISOString(),
         size: fs.statSync(outputVideo).size,
+        durationSeconds: actualDurationSeconds,
       });
+      try { await deductCredits(adminDb, userId, actualDurationSeconds); }
+      catch (e) { console.error('Credit deduction failed:', e.message); }
     }
 
     updateJob(jobId, { status: 'done', progress: 100, videoUrl: localUrl, message: "Done!" });
