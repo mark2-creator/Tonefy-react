@@ -18,7 +18,7 @@ import { initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
 import { getFirestore as getAdminFirestore } from "firebase-admin/firestore";
-import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData } from "./tiers.js";
+import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, FREE_RESET_MS } from "./tiers.js";
 
 // Firebase Storage + Firestore (Admin) — initialized after initializeApp()
 let bucket, adminDb;
@@ -688,10 +688,41 @@ function cleanupUploads() {
   });
 }
 
+// Monthly credit reset - resets creditsRemaining to the account's own tier
+// allocation once creditsResetAt has passed.
+//
+// Interim behaviour, applies to EVERY plan for now, not just free: there is
+// no other mechanism driving a paid account's reset yet. The original design
+// (proposed when Stripe was the assumed provider) was free-only-via-cron,
+// paid-driven-by-webhooks-on-the-real-renewal-date - correct once Play
+// Billing (Phase 2, not built) exists, since a generic sweep drifting out
+// of sync with an actual billing period is exactly the mismatch subscribers
+// notice. Until then, a paid-only-via-webhook design would mean paid
+// accounts (including hand-set test ones) never reset via ANY mechanism at
+// all. When Phase 2 lands, narrow this query to plan == 'free' and let Play's
+// RTDN/purchase-verification flow own paid resets - this sweep should stop
+// touching paid accounts at that point, not keep double-driving them.
+async function creditResetSweep() {
+  const nowIso = new Date().toISOString();
+  const snap = await adminDb.collection('users').where('creditsResetAt', '<=', nowIso).get();
+  for (const doc of snap.docs) {
+    const plan = doc.data().plan || 'free';
+    const creditsRemaining = tierConfig(plan).creditsPerCycle;
+    const creditsResetAt = new Date(Date.now() + FREE_RESET_MS).toISOString();
+    try {
+      await doc.ref.set({ creditsRemaining, creditsResetAt }, { merge: true });
+      console.log(`[CreditReset] ${doc.id} (${plan}) -> ${creditsRemaining} credits, next reset ${creditsResetAt}`);
+    } catch (e) {
+      console.error(`[CreditReset] Failed for ${doc.id}:`, e.message);
+    }
+  }
+}
+
 setInterval(() => {
   cleanupOldFiles(videosDir);
   cleanupOldFiles(audiosDir);
   cleanupUploads();
+  creditResetSweep();
 }, 10 * 60 * 1000);
 
 function buildCaptionFilter(script, audioDuration) {
