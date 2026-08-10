@@ -1850,7 +1850,10 @@ app.post('/api/edit-video', async (req, res) => {
   // captionMeta is the app's style spec - font, size, colour, cadence and the
   // stroke/glow/shadow/box parts. captionStyle stays for older clients that send
   // an id and nothing else.
-  const { videoUrl, script = "", captionStyle = "classic", captionMeta = null, userId, voiceoverUrl } = req.body || {};
+  const { videoUrl, script = "", captionStyle = "classic", captionMeta = null, voiceoverUrl } = req.body || {};
+  // Same fix as media-to-video: the uid a render is attributed to (and
+  // billed against) must come from the verified token, not a body field.
+  const userId = req.user?.uid;
   if (!videoUrl) return res.status(400).json({ error: "videoUrl required" });
 
   const jobId = createJob();
