@@ -552,6 +552,27 @@ function run(bin, args, opts = {}) {
   });
 }
 
+// N workers pulling from a shared index, rather than one item at a time - for
+// a highlight-style caption's one-still-per-word rendering, where a normal-
+// length voiceover means hundreds of items, each paying real `convert`
+// process-spawn overhead (several invocations per item) on top of whatever
+// actual image work each one does. Every item still runs to completion and
+// results land at their own index regardless of finishing order, so this
+// changes nothing about correctness or output - only how much of that spawn
+// overhead overlaps instead of stacking up sequentially.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 // ImageMagick colour arguments: hex or a plain colour name, nothing else.
 function safeColor(value, fallback = '#ffffff') {
   const v = String(value ?? '').trim();
@@ -2819,7 +2840,37 @@ app.post('/api/media-to-video', async (req, res) => {
       const renderedTextPngs = [];
 
       let overlaysRendered = 0;
+      // Grouped by phrase before anything runs, not just batched blindly -
+      // phraseLayerCache (below) only writes the shared shadow/glow/stroke
+      // layers back once a word finishes, so two words of the SAME phrase
+      // running at the same time would both miss the cache and both pay the
+      // dilate/blur cost that cache exists specifically to avoid (identical
+      // for every word of a phrase, per the comment on it) - real wasted CPU,
+      // not just a missed optimisation. A highlight style's per-word overlays
+      // all carry the identical text/font/size/spec of their shared phrase
+      // (only activeWord differs), so grouping on that tuple keeps every
+      // phrase's own words sequential - the cache still helps exactly as it
+      // did before - while different phrases (or ordinary non-highlight
+      // overlays, one to a group) run concurrently with each other.
+      const phraseGroups = new Map();
       for (const t of textOverlays) {
+        const groupKey = JSON.stringify([t.text, t.font, t.size, t.captionSpec || null]);
+        if (!phraseGroups.has(groupKey)) phraseGroups.set(groupKey, []);
+        phraseGroups.get(groupKey).push(t);
+      }
+      // Bounded concurrency, not one at a time: a highlight-style caption
+      // sends one overlay per spoken word, so a normal-length voiceover can
+      // mean hundreds of these, each several `convert` process-spawns on top
+      // of its own actual image work. Running 4 phrase-groups at once
+      // overlaps that spawn overhead instead of paying it fully sequentially
+      // - the per-overlay logic below is completely unchanged, only when
+      // each one starts is different. Kept modest (not e.g. 16) since this
+      // VPS also runs other pm2 processes; a mask/alpha/fill/composite chain
+      // is real CPU work, not just I/O wait, so more workers than cores
+      // would just contend.
+      const OVERLAY_CONCURRENCY = 4;
+      await mapWithConcurrency(Array.from(phraseGroups.values()), OVERLAY_CONCURRENCY, async (group) => {
+      for (const t of group) {
         const isGradient = Array.isArray(t.gradient) && t.gradient.length >= 2;
         const fontFileName = FONT_FILE_MAP[t.font];
         const fontPath = fontFileName ? path.join(FONTS_DIR, fontFileName) : null;
@@ -3198,6 +3249,7 @@ app.post('/api/media-to-video', async (req, res) => {
           message: `Adding text & overlays... (${overlaysRendered}/${textOverlays.length})`,
         });
       }
+      });
 
       renderedTextPngs.forEach(({ t, outPng, placeX, placeY }, idx) => {
         inputs.push(`-i "${outPng}"`);
