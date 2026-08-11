@@ -329,8 +329,19 @@ const EDIT_XFADE_MAP = {
 
 [videosDir, audiosDir, uploadsDir].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
-app.use("/videos", express.static(videosDir, { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); res.setHeader("Accept-Ranges", "bytes"); } }));
-app.use("/audios", express.static(audiosDir, { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
+// maxAge was missing here while stickers/filters/transitions below already had it -
+// every filename here is unique per render (uniqueName() bakes in a timestamp and a
+// UUID), so a URL's content can never change under the app - this is exactly the
+// "safe to cache forever" case those already covered. Without it, the device had no
+// reason to believe a repeat request for the SAME clip or voiceover - restoring a
+// draft, reopening the editor, even just re-selecting a track already played once
+// this session - could be served from its own cache, so every one of those was a
+// full re-download from zero. 30d matches the existing convention rather than
+// picking a new number; the files themselves are far more durably immutable than
+// that, but this is a client-side cache, not a data-integrity promise, so matching
+// what's already proven safe elsewhere in this file is enough.
+app.use("/videos", express.static(videosDir, { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); res.setHeader("Accept-Ranges", "bytes"); } }));
+app.use("/audios", express.static(audiosDir, { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 // Transition previews, one animated webp per catalogue entry, rendered by
 // scripts/gen-transition-previews.mjs in the app repo. Immutable once written -
 // a preview only changes when its recipe does, and then it gets a new render.
@@ -340,7 +351,7 @@ app.use("/audios", express.static(audiosDir, { setHeaders: (res) => { res.setHea
 app.use("/stickers", express.static(path.join(__dirname, "public", "stickers"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/filters", express.static(path.join(__dirname, "public", "filters"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/transitions", express.static(path.join(__dirname, "public", "transitions"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
-app.use("/music", express.static(path.join(__dirname, "public", "music"), { setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
+app.use("/music", express.static(path.join(__dirname, "public", "music"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 
 function trackIdToDisplayName(id) {
   return id
@@ -364,7 +375,7 @@ app.get("/api/music-tracks", (req, res) => {
     res.status(500).json({ error: "Failed to list tracks" });
   }
 });
-app.use("/uploads", express.static(uploadsDir));
+app.use("/uploads", express.static(uploadsDir, { maxAge: "30d" }));
 app.use("/auth", express.static(path.join(__dirname, "public", "auth")));
 
 exec("ffmpeg -version", (err, stdout) => {
