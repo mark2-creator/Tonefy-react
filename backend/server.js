@@ -749,7 +749,11 @@ function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestam
   if (words.length === 0) return false;
 
   // Use whisper word timestamps if available, otherwise estimate
-  let chunks, chunkTimings;
+  // chunkWordTimings mirrors chunks/chunkTimings one level deeper - the
+  // {word,start,end} of every word inside that chunk - so a highlight style
+  // (see below) knows when to switch which word is coloured without
+  // re-deriving timing from scratch.
+  let chunks, chunkTimings, chunkWordTimings;
   if (wordTimestamps && wordTimestamps.length > 0) {
     // Animated styles: one word per line with exact timing
     const ANIMATED = ['highlight','sticker','shadow3d','tiktok','neon','fire','bold','purple'];
@@ -759,15 +763,18 @@ function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestam
     if (perWord) {
       chunks = wordTimestamps.map(w => w.word);
       chunkTimings = wordTimestamps.map(w => ({ start: w.start, end: w.end }));
+      chunkWordTimings = wordTimestamps.map(w => [w]);
     } else {
       // Group into the style's own chunk size using whisper timing
       const per = Math.max(1, (captionMeta && captionMeta.words) || 3);
       chunks = [];
       chunkTimings = [];
+      chunkWordTimings = [];
       for (let i = 0; i < wordTimestamps.length; i += per) {
         const group = wordTimestamps.slice(i, i + per);
         chunks.push(group.map(w => w.word).join(' '));
         chunkTimings.push({ start: group[0].start, end: group[group.length-1].end });
+        chunkWordTimings.push(group);
       }
     }
   } else {
@@ -779,6 +786,15 @@ function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestam
     }
     const timePerChunk = audioDuration / chunks.length;
     chunkTimings = chunks.map((_, i) => ({ start: i * timePerChunk, end: Math.min((i+1) * timePerChunk, audioDuration) }));
+    // No real per-word timing to fall back on - split each chunk's own
+    // window evenly across its word count, the same estimate the chunk
+    // boundaries above already rely on.
+    chunkWordTimings = chunks.map((chunk, i) => {
+      const chunkWords = chunk.split(/\s+/).filter(Boolean);
+      const { start, end } = chunkTimings[i];
+      const per = (end - start) / Math.max(1, chunkWords.length);
+      return chunkWords.map((w, wi) => ({ word: w, start: start + wi * per, end: start + (wi + 1) * per }));
+    });
   }
 
   const toAssTime = (s) => {
@@ -913,6 +929,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return positions[i % positions.length];
   };
 
+  // Inline colour override (\1c&HBBGGRR&) rather than the Style-level
+  // &HAABBGGRR assColour() returns elsewhere - a run inside one Dialogue
+  // line's Text field takes no alpha component.
+  const toInlineColour = (hex, fallback) => '&H' + assColour(hex, fallback).slice(4) + '&';
+  // A highlight spec (the "chip follows the voice" styles) has no chip in
+  // this renderer - a chip's position needs the same glyph-offset
+  // measurement the ImageMagick path gets from ImageMagick's own `identify`,
+  // which this string-only ASS builder has no equivalent of. What it can do
+  // without measuring anything is recolour the word ASS is already about to
+  // lay out, using tags inline in the same Text field - no drawing, no
+  // position math, so it can't drift from where ASS itself places the word.
+  const hl = captionMeta && captionMeta.spec && captionMeta.spec.highlight;
+  const hlBaseColour = hl ? toInlineColour(captionMeta.color, '&HFFFFFF&') : null;
+  const hlActiveColour = hl ? toInlineColour(hl.textColor, hlBaseColour) : null;
+
   const makeLines = (chunk, i) => {
     const start = chunkTimings[i].start;
     const end = chunkTimings[i].end;
@@ -921,6 +952,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const text = (s.transform ? s.transform(chunk, i) : chunk).replace(/[}{]/g, '');
     const mv = getMarginV(i); // position variation
     const pos = ''; // position override tag (empty = use style default)
+
+    if (!isAnimated && hl && chunkWordTimings[i] && chunkWordTimings[i].length > 1) {
+      // One event per word in the chunk, each holding the full phrase but
+      // re-colouring a different word - the chip's absence aside, this is
+      // the "follow the voice" behaviour the style promises rather than a
+      // static phrase indistinguishable from a plain stroke style.
+      const chunkWords = chunk.split(/\s+/).filter(Boolean);
+      const transformedWords = chunkWords.map((w, wi) => (s.transform ? s.transform(w, wi) : w).replace(/[}{]/g, ''));
+      return chunkWordTimings[i].map((wt, wi) => {
+        const runs = transformedWords.map((w, ti) =>
+          ti === wi ? `{\\1c${hlActiveColour}}${w}{\\1c${hlBaseColour}}` : w
+        ).join(' ');
+        return `Dialogue: 0,${toAssTime(wt.start)},${toAssTime(wt.end)},Default,,0,0,${mv},,${pos}${runs}`;
+      });
+    }
 
     if (!isAnimated) {
       return [`Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,${mv},,${pos}${text}`];
