@@ -19,6 +19,7 @@ import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
 import { getFirestore as getAdminFirestore } from "firebase-admin/firestore";
 import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, FREE_RESET_MS } from "./tiers.js";
+import nodemailer from "nodemailer";
 
 // Firebase Storage + Firestore (Admin) — initialized after initializeApp()
 let bucket, adminDb;
@@ -59,6 +60,39 @@ try {
   console.log('✅ Firebase Storage initialized:', process.env.FIREBASE_STORAGE_BUCKET);
 } catch(e) {
   console.error('⚠️ Firebase Storage init failed:', e.message);
+}
+
+// Firebase's own verification/reset-password email templates turned out not to be
+// editable via the Identity Platform admin API once CUSTOM_SMTP is configured for
+// this project - PATCH calls against notification.sendEmail.verifyEmailTemplate.body
+// return 200 but the body field silently never changes, confirmed by re-reading the
+// config fresh after each attempt rather than trusting the write response. This sends
+// a fully custom branded email instead, through the same Gmail account already
+// configured as this project's SMTP sender.
+const emailTransporter = (process.env.EMAIL_USER && process.env.EMAIL_APP_PASSWORD)
+  ? nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_APP_PASSWORD },
+    })
+  : null;
+if (!emailTransporter) console.warn('[email] EMAIL_USER/EMAIL_APP_PASSWORD not set - verification emails will fail');
+
+function verifyEmailHtml(displayName, link) {
+  const greeting = displayName ? `Hi ${displayName},` : 'Hi,';
+  return `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px 24px; background-color: #ffffff;">
+  <div style="text-align: center; margin-bottom: 28px;">
+    <span style="font-size: 22px; font-weight: 700; color: #111111;">Tonefy <span style="color: #2ECC71;">AI</span></span>
+  </div>
+  <p style="font-size: 16px; color: #111111; line-height: 1.5; margin: 0 0 12px;">${greeting}</p>
+  <p style="font-size: 16px; color: #333333; line-height: 1.5; margin: 0 0 28px;">Please verify your email address to finish setting up your Tonefy AI account.</p>
+  <div style="text-align: center; margin: 0 0 28px;">
+    <a href="${link}" style="display: inline-block; background-color: #2ECC71; color: #04211f; font-weight: 700; font-size: 16px; text-decoration: none; padding: 14px 36px; border-radius: 8px;">Verify Email</a>
+  </div>
+  <p style="font-size: 13px; color: #888888; line-height: 1.5; margin: 0 0 8px;">If the button above doesn't work, copy and paste this link into your browser:</p>
+  <p style="font-size: 13px; color: #2ECC71; line-height: 1.5; word-break: break-all; margin: 0 0 28px;"><a href="${link}" style="color: #2ECC71;">${link}</a></p>
+  <p style="font-size: 13px; color: #888888; line-height: 1.5; margin: 0 0 24px;">If you didn't ask to verify this address, you can safely ignore this email.</p>
+  <p style="font-size: 14px; color: #333333; line-height: 1.5; margin: 0;">Thanks,<br>The Tonefy AI team</p>
+</div>`;
 }
 
 // Auth middleware
@@ -479,6 +513,30 @@ const pexelsLimiter = rateLimit({
 
 // Protect all /api/* routes — TikTok OAuth routes stay public
 app.use("/api", verifyToken);
+
+// Replaces the app's own sendEmailVerification() call - see verifyEmailHtml's
+// comment for why. uid/email come from the verified token, never the request
+// body, the same lesson the media-to-video/edit-video userId bug already
+// taught this file (1a1084de/975e73a3) - a client-supplied email here would
+// let anyone request a verification link for an address that isn't theirs.
+app.post("/api/send-verification-email", async (req, res) => {
+  if (!emailTransporter) return res.status(503).json({ error: "Email is not configured" });
+  try {
+    const userRecord = await getAuth().getUser(req.user.uid);
+    if (!userRecord.email) return res.status(400).json({ error: "Account has no email" });
+    const link = await getAuth().generateEmailVerificationLink(userRecord.email);
+    await emailTransporter.sendMail({
+      from: `"Tonefy AI" <${process.env.EMAIL_USER}>`,
+      to: userRecord.email,
+      subject: "Verify your email for Tonefy AI",
+      html: verifyEmailHtml(userRecord.displayName, link),
+    });
+    res.json({ success: true });
+  } catch (e) {
+    console.error("send-verification-email error:", e.message);
+    res.status(500).json({ error: "Failed to send verification email" });
+  }
+});
 
 function uniqueName(prefix, ext) { return `${prefix}-${Date.now()}-${uuidv4()}.${ext}`; }
 
