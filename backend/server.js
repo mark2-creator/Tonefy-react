@@ -744,7 +744,7 @@ function buildCaptionFilter(script, audioDuration) {
   });
   return filters.join(',');
 }
-function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestamps = null, captionMeta = null) {
+function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestamps = null, captionMeta = null, videoWidth = 720, videoHeight = 1280) {
   const words = script.replace(/[\n\r]+/g, ' ').trim().split(/\s+/).filter(Boolean);
   if (words.length === 0) return false;
 
@@ -900,10 +900,15 @@ function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestam
     ? assStyleFromSpec(captionMeta)
     : (STYLES[captionStyle] || STYLES["classic"]);
 
+  // Matching the real output frame, not a fixed 9:16 guess - libass maps this
+  // virtual canvas onto the actual encoded resolution, stretching it
+  // non-uniformly if the two disagree. A mismatch here is what let a caption
+  // sit closer to (or past) an edge than its MarginL/MarginR promised on any
+  // source that wasn't 720x1280 to begin with.
   const header = `[Script Info]
 ScriptType: v4.00+
-PlayResX: 720
-PlayResY: 1280
+PlayResX: ${Math.round(videoWidth) || 720}
+PlayResY: ${Math.round(videoHeight) || 1280}
 Collisions: Normal
 WrapStyle: 1
 
@@ -1330,13 +1335,13 @@ app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
     const hasBgMusic = fs.existsSync(musicPath);
     const watermark = "drawtext=text='Tonefy AI':fontsize=18:fontcolor=white@0.5:x=(w-text_w)/2:y=h-th-20";
 
-    let scaleFilter;
-    if (aspectRatio === "9:16") scaleFilter = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280";
-    else if (aspectRatio === "1:1") scaleFilter = "scale=720:720:force_original_aspect_ratio=increase,crop=720:720";
-    else scaleFilter = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720";
+    let scaleFilter, outW, outH;
+    if (aspectRatio === "9:16") { scaleFilter = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280"; outW = 720; outH = 1280; }
+    else if (aspectRatio === "1:1") { scaleFilter = "scale=720:720:force_original_aspect_ratio=increase,crop=720:720"; outW = 720; outH = 720; }
+    else { scaleFilter = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720"; outW = 1280; outH = 720; }
 
     const assPath = outputVideo.replace('.mp4', '.ass');
-    const hasCaptions = buildAssFile(voiceover || "", audioDuration, assPath, captionStyle, null, captionMeta);
+    const hasCaptions = buildAssFile(voiceover || "", audioDuration, assPath, captionStyle, null, captionMeta, outW, outH);
     // subtitles filter burns SRT into video — handles any length efficiently
     const subsFilter = hasCaptions ? ',' + assFilter(assPath) : '';
     const vf = `${scaleFilter},setsar=1${subsFilter},${watermark}`;
@@ -1746,7 +1751,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
       if (wordTimestamps) console.log(`Whisper: ${wordTimestamps.length} words aligned`);
     } catch(e) { console.warn('Whisper failed, using estimated timing'); }
     console.log("ASS path:", assPath, "voiceover len:", (voiceover||"").length);
-    const hasCaptions = buildAssFile(voiceover || "", totalAudioDuration, assPath, captionStyle, wordTimestamps, captionMeta);
+    const hasCaptions = buildAssFile(voiceover || "", totalAudioDuration, assPath, captionStyle, wordTimestamps, captionMeta, scaleW, scaleH);
     console.log("hasCaptions:", hasCaptions, "file exists:", fs.existsSync(assPath));
     const subsFilter = hasCaptions ? ',' + assFilter(assPath) : '';
     const speedPts = videoSpeed && videoSpeed !== 1.0 ? `setpts=${(1/videoSpeed).toFixed(4)}*PTS,` : '';
@@ -2006,6 +2011,7 @@ app.post('/api/edit-video', async (req, res) => {
     await downloadToFile(videoUrl, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
   }
   const duration = await probeDurationSeconds(srcPath);
+  const { width: srcWidth, height: srcHeight } = await probeVideoDimensions(srcPath);
 
   const allowed = await checkRenderAllowed(adminDb, userId, { requestedDurationSeconds: duration });
   if (!allowed.ok) return res.status(allowed.status).json({ error: allowed.error });
@@ -2053,7 +2059,7 @@ app.post('/api/edit-video', async (req, res) => {
 
     const outputVideo = path.join(videosDir, uniqueName("edit", "mp4"));
     const assPath = outputVideo.replace('.mp4', '.ass');
-    const hasCaptions = buildAssFile(effectiveScript, duration, assPath, captionStyle, wordTimestamps, captionMeta);
+    const hasCaptions = buildAssFile(effectiveScript, duration, assPath, captionStyle, wordTimestamps, captionMeta, srcWidth, srcHeight);
     const subsFilter = hasCaptions ? assFilter(assPath) : null;
     // Free tier only. Folded into the same filter chain as captions rather
     // than a separate pass - efficient when both apply, and means a
@@ -2167,6 +2173,21 @@ function probeDurationSeconds(filePath) {
   return new Promise((resolve) => {
     exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`, (err, stdout) => {
       resolve(parseFloat(stdout?.trim()) || 0);
+    });
+  });
+}
+
+// /api/edit-video burns captions onto the source clip's own resolution -
+// there's no scale step whose target dimensions buildAssFile could borrow,
+// unlike the two callers above that already know their output frame size
+// from frameSize()/scaleFilter. Falls back to the 720x1280 default (matches
+// buildAssFile's own default) if ffprobe can't read the stream - better to
+// assume the common case than to leave the caption canvas unset.
+function probeVideoDimensions(filePath) {
+  return new Promise((resolve) => {
+    exec(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${filePath}"`, (err, stdout) => {
+      const m = /^(\d+)x(\d+)$/.exec(String(stdout || '').trim());
+      resolve(m ? { width: parseInt(m[1], 10), height: parseInt(m[2], 10) } : { width: 720, height: 1280 });
     });
   });
 }
@@ -3026,14 +3047,38 @@ app.post('/api/media-to-video', async (req, res) => {
           try { fs.unlinkSync(coloredPng); } catch (e) {}
         }
 
+        // No overlay may be placed, or sized, such that any part of it lands
+        // outside the exported frame. A user can drag an overlay near a frame
+        // edge, pinch it up to 6x, or land on a caption whose wrapped lines
+        // run wide at this font/size - every one of those is invisible in
+        // the small in-app preview (which merely clips it via
+        // overflow:hidden) and only shows up as a cropped word in the file.
+        // EDGE_MARGIN mirrors CanvasOverlay's own EDGE_MARGIN=8 in the app,
+        // scaled to this export's resolution, so the safe zone agrees with
+        // the one the drag gesture already respects on-screen.
+        const EDGE_MARGIN = Math.round(8 * EXPORT_SCALE);
+        const maxW = Math.max(1, W - 2 * EDGE_MARGIN);
+        const maxH = Math.max(1, H - 2 * EDGE_MARGIN);
+        if (WR > maxW || HR > maxH) {
+          const fitScale = Math.min(maxW / WR, maxH / HR);
+          const newW = Math.max(1, Math.round(WR * fitScale));
+          const newH = Math.max(1, Math.round(HR * fitScale));
+          await run('convert', [outPng, '-resize', `${newW}x${newH}!`, outPng])
+            .catch(e => { console.error('Fit-to-frame resize error:', e.stderr?.slice(-500) || e.message); throw new Error('Fit-to-frame resize failed'); });
+          WR = newW; HR = newH;
+        }
+
         const centerX = centreAnchored
           ? ((t.x ?? 50) / 100) * W
           : (t.isAutoCaption ? (W / 2) : (((t.x ?? 50) / 100) * W + Wt / 2));
         const centerY = centreAnchored
           ? ((t.y ?? 80) / 100) * H
           : (((t.y ?? 80) / 100) * H + effHt / 2);
-        const placeX = Math.round(centerX - WR / 2);
-        const placeY = Math.round(centerY - HR / 2);
+        // The resize above guarantees WR <= maxW and HR <= maxH, so
+        // `W - EDGE_MARGIN - WR` is always >= EDGE_MARGIN - this clamp can
+        // never invert into an empty range.
+        const placeX = Math.min(Math.max(Math.round(centerX - WR / 2), EDGE_MARGIN), W - EDGE_MARGIN - WR);
+        const placeY = Math.min(Math.max(Math.round(centerY - HR / 2), EDGE_MARGIN), H - EDGE_MARGIN - HR);
 
         renderedTextPngs.push({ t, outPng, placeX, placeY });
 
