@@ -2861,14 +2861,17 @@ app.post('/api/media-to-video', async (req, res) => {
       // Bounded concurrency, not one at a time: a highlight-style caption
       // sends one overlay per spoken word, so a normal-length voiceover can
       // mean hundreds of these, each several `convert` process-spawns on top
-      // of its own actual image work. Running 4 phrase-groups at once
-      // overlaps that spawn overhead instead of paying it fully sequentially
-      // - the per-overlay logic below is completely unchanged, only when
-      // each one starts is different. Kept modest (not e.g. 16) since this
-      // VPS also runs other pm2 processes; a mask/alpha/fill/composite chain
-      // is real CPU work, not just I/O wait, so more workers than cores
-      // would just contend.
-      const OVERLAY_CONCURRENCY = 4;
+      // of its own actual image work. Overlapping that spawn overhead
+      // instead of paying it fully sequentially - the per-overlay logic
+      // below is completely unchanged, only when each one starts is
+      // different. Set to this VPS's real core count (`nproc` = 6), not
+      // guessed: benchmarked the actual mask/alpha/dilate/composite chain
+      // this loop runs, live, with the box's other pm2 processes already
+      // running - 1/4/6/8/12 gave 208/41/29/36/29 ms per overlay. 6 beat 4
+      // by ~30%; 8 was worse than 6 (contention past the real core count);
+      // 12 matched 6 with no further gain. Revisit if this VPS's core count
+      // or its other workload changes.
+      const OVERLAY_CONCURRENCY = 6;
       await mapWithConcurrency(Array.from(phraseGroups.values()), OVERLAY_CONCURRENCY, async (group) => {
       for (const t of group) {
         const isGradient = Array.isArray(t.gradient) && t.gradient.length >= 2;
