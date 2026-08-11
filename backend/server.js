@@ -2728,6 +2728,35 @@ app.post('/api/media-to-video', async (req, res) => {
         };
       };
 
+      // Real-width wrap, for the one kind of overlay that actually specifies a
+      // width: a manual text overlay resized with the app's side handles
+      // (boxWidthPercent). wrapTextLinesServer's fixed word count is a fine
+      // approximation for auto-captions, which never carry this field, but a
+      // dragged box has a real target width, and the app's own preview already
+      // reflows to it - this is what makes the export agree, using the same
+      // labelWidth() the highlight chip's word-boxing already measures with.
+      // A single word wider than targetWidthPx on its own still gets its own
+      // line rather than being split mid-word - the app's Text component does
+      // the same, so the two stay consistent at that edge too.
+      const wrapTextLinesByWidth = async (text, fontPath, pointsize, kerning, targetWidthPx) => {
+        const words = (text || '').split(/\s+/).filter(Boolean);
+        if (words.length === 0) return [''];
+        const lines = [];
+        let current = [];
+        for (const word of words) {
+          const candidate = current.concat(word).join(' ');
+          const w = await labelWidth(fontPath, pointsize, kerning, candidate);
+          if (current.length > 0 && w > targetWidthPx) {
+            lines.push(current.join(' '));
+            current = [word];
+          } else {
+            current.push(word);
+          }
+        }
+        if (current.length > 0) lines.push(current.join(' '));
+        return lines.length > 0 ? lines : [''];
+      };
+
       const EXPORT_SCALE = W / (previewWidth || 360);
       const renderedTextPngs = [];
 
@@ -2745,7 +2774,16 @@ app.post('/api/media-to-video', async (req, res) => {
         const spec = (t.captionSpec && typeof t.captionSpec === 'object') ? t.captionSpec : null;
         // Every length in a spec is points at the app's 18pt caption base.
         const sscale = fontSizePx / 18;
-        const lines = wrapTextLinesServer(t.text, 4);
+        // boxWidthPercent is only ever present on a manual overlay the app's
+        // side handles resized - everything else (every auto-caption, every
+        // overlay nobody has dragged) keeps the word-count wrap unchanged.
+        const wrapKerning = spec && spec.spacing ? (num(spec.spacing) * sscale).toFixed(2) : null;
+        const lines = Number.isFinite(Number(t.boxWidthPercent))
+          ? await wrapTextLinesByWidth(
+              t.text, fontPath, Math.max(1, Math.round(fontSizePx)), wrapKerning,
+              (Number(t.boxWidthPercent) / 100) * W,
+            )
+          : wrapTextLinesServer(t.text, 4);
         const multilineText = lines.join('\n');
         // Only the backslash needs removing (ImageMagick escape syntax). Quotes
         // used to be rewritten to apostrophes to survive the shell; with execFile
