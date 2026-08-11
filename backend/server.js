@@ -1312,7 +1312,7 @@ app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
     // credit/duration check - just which voices this plan can pick from.
     const { plan } = await getUserPlanData(adminDb, req.user?.uid);
     if (!voiceAllowed(plan, voiceId)) {
-      return res.status(403).json({ error: `The "${voiceId}" voice needs a Pro or Creator plan.` });
+      return res.status(403).json({ error: `The "${voiceId}" voice is available on the Pro and Creator plans.` });
     }
     const voice = VOICES[voiceId] || VOICES["gtts-us"];
     const audioFilename = uniqueName("gtts", "mp3");
@@ -1536,7 +1536,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
   const allowed = await checkRenderAllowed(adminDb, userId, { requestedDurationSeconds: roughEstimateSeconds });
   if (!allowed.ok) return res.status(allowed.status).json({ error: allowed.error });
   if (!captionStyleAllowed(allowed.plan, captionStyle)) {
-    return res.status(403).json({ error: `The "${captionStyle}" caption style needs a Pro or Creator plan.` });
+    return res.status(403).json({ error: `The "${captionStyle}" caption style is available on the Pro and Creator plans.` });
   }
 
   const jobId = createJob();
@@ -1586,7 +1586,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
     // out clearly, just via the job status instead of the initial response.
     if (totalAudioDuration > allowed.tier.maxExportSeconds) {
       const maxMin = Math.round(allowed.tier.maxExportSeconds / 60);
-      updateJob(jobId, { status: "failed", message: `Your plan's export limit is ${maxMin} minute${maxMin === 1 ? '' : 's'}. This script runs longer - trim it or upgrade.` });
+      updateJob(jobId, { status: "failed", message: `This script runs a little longer than your plan's ${maxMin} minute${maxMin === 1 ? '' : 's'} export limit. Try shortening it, or upgrade for longer exports.` });
       return;
     }
 
@@ -2095,7 +2095,7 @@ app.post('/api/edit-video', async (req, res) => {
   const allowed = await checkRenderAllowed(adminDb, userId, { requestedDurationSeconds: duration });
   if (!allowed.ok) return res.status(allowed.status).json({ error: allowed.error });
   if (!captionStyleAllowed(allowed.plan, captionStyle)) {
-    return res.status(403).json({ error: `The "${captionStyle}" caption style needs a Pro or Creator plan.` });
+    return res.status(403).json({ error: `The "${captionStyle}" caption style is available on the Pro and Creator plans.` });
   }
 
   const jobId = createJob();

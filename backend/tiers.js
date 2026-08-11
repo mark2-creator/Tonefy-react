@@ -139,11 +139,11 @@ export async function checkRenderAllowed(db, uid, { requestedDurationSeconds = 0
   const tier = tierConfig(plan);
 
   if (creditsRemaining <= 0) {
-    return { ok: false, status: 402, error: 'No credits remaining this cycle. Upgrade or wait for your next reset.' };
+    return { ok: false, status: 402, error: "You've used all your credits for this cycle. Upgrade for more, or they'll refresh automatically at your next reset." };
   }
   if (requestedDurationSeconds > tier.maxExportSeconds) {
     const maxMin = Math.round(tier.maxExportSeconds / 60);
-    return { ok: false, status: 403, error: `Your plan's export limit is ${maxMin} minute${maxMin === 1 ? '' : 's'}. Trim your project or upgrade.` };
+    return { ok: false, status: 403, error: `This export is a little longer than your plan allows (up to ${maxMin} minute${maxMin === 1 ? '' : 's'}). Try trimming it down, or upgrade for longer exports.` };
   }
 
   return {
