@@ -2818,6 +2818,7 @@ app.post('/api/media-to-video', async (req, res) => {
       const EXPORT_SCALE = W / (previewWidth || 360);
       const renderedTextPngs = [];
 
+      let overlaysRendered = 0;
       for (const t of textOverlays) {
         const isGradient = Array.isArray(t.gradient) && t.gradient.length >= 2;
         const fontFileName = FONT_FILE_MAP[t.font];
@@ -3181,6 +3182,21 @@ app.post('/api/media-to-video', async (req, res) => {
         try { fs.unlinkSync(maskPng); } catch (e) {}
         try { fs.unlinkSync(alphaPng); } catch (e) {}
         try { fs.unlinkSync(fillPng); } catch (e) {}
+
+        // This loop is the one span between 60% and 80% with no progress
+        // reporting at all, regardless of how many overlays there are or how
+        // long each one takes - a project with several overlays (this file's
+        // own mask/alpha/fill/composite chain per overlay, several `convert`
+        // shell-outs each) could sit on "60% Adding text & overlays..." for
+        // minutes with the bar never moving, reading as hung even when the
+        // job is actively working. Reported here rather than only at the
+        // end, so the number the client polls actually reflects progress
+        // through this specific loop, not just the stage before and after it.
+        overlaysRendered += 1;
+        updateJob(jobId, {
+          progress: 60 + Math.round(20 * (overlaysRendered / textOverlays.length)),
+          message: `Adding text & overlays... (${overlaysRendered}/${textOverlays.length})`,
+        });
       }
 
       renderedTextPngs.forEach(({ t, outPng, placeX, placeY }, idx) => {
