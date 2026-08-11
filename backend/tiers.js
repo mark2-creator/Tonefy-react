@@ -135,11 +135,23 @@ function clampResolution(requested, ceiling) {
  * balance is allowed to run past zero afterward instead.
  */
 export async function checkRenderAllowed(db, uid, { requestedDurationSeconds = 0, requestedResolution = null } = {}) {
-  const { plan, creditsRemaining } = await getUserPlanData(db, uid);
+  const { plan, creditsRemaining, creditsResetAt } = await getUserPlanData(db, uid);
   const tier = tierConfig(plan);
 
   if (creditsRemaining <= 0) {
-    return { ok: false, status: 402, error: "You've used all your credits for this cycle. Upgrade for more, or they'll refresh automatically at your next reset." };
+    // "this cycle" said nothing about how long a cycle actually is - credits
+    // reset on a rolling 30 days from whenever they were last set
+    // (FREE_RESET_MS), not a calendar month, so "monthly" would have been a
+    // real claim, not just a friendlier word. The exact date is already
+    // computed and sitting on this same account record, so hand it over
+    // directly instead of making someone open Profile to find out when
+    // "later" actually is.
+    const resetDate = creditsResetAt
+      ? new Date(creditsResetAt).toLocaleDateString('en-US', { month: 'long', day: 'numeric' })
+      : null;
+    return { ok: false, status: 402, error: resetDate
+      ? `You've used all your credits. They refresh every 30 days - yours reset on ${resetDate} - or upgrade for more right away.`
+      : "You've used all your credits. They refresh every 30 days, or upgrade for more right away." };
   }
   if (requestedDurationSeconds > tier.maxExportSeconds) {
     const maxMin = Math.round(tier.maxExportSeconds / 60);
