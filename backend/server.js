@@ -14,6 +14,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { v4 as uuidv4 } from "uuid";
 import Groq from "groq-sdk";
+import { google } from "googleapis";
 import { initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
@@ -76,6 +77,30 @@ const emailTransporter = (process.env.EMAIL_USER && process.env.EMAIL_APP_PASSWO
     })
   : null;
 if (!emailTransporter) console.warn('[email] EMAIL_USER/EMAIL_APP_PASSWORD not set - verification emails will fail');
+
+// Reuses the same service account as Firebase Admin above - Android
+// Publisher API access is a separate grant from Firebase project
+// membership (made in Play Console -> Setup -> API access, against this
+// same service account's email), not a separate credential to manage.
+const PACKAGE_NAME = "com.ahumuza21213.TonefyApp";
+const androidPublisherAuth = new google.auth.GoogleAuth({
+  credentials: serviceAccount,
+  scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+});
+const androidpublisher = google.androidpublisher({ version: "v3", auth: androidPublisherAuth });
+
+// Maps a base plan id (e.g. "pro-yearly") to the internal plan key. Base
+// plan ids are prefixed by tier on purpose (see SubscriptionScreen.js) so
+// this stays a prefix check rather than an exhaustive list that drifts
+// every time a new billing period or offer is added in Play Console.
+function planFromBasePlanId(basePlanId) {
+  if (!basePlanId) return null;
+  if (basePlanId.startsWith("pro-")) return "pro";
+  if (basePlanId.startsWith("creator-")) return "creator";
+  return null;
+}
+
+const PLAN_CREDITS = { pro: 60, creator: 300 };
 
 function verifyEmailHtml(displayName, link) {
   const greeting = displayName ? `Hi ${displayName},` : 'Hi,';
@@ -546,6 +571,69 @@ app.post("/api/send-verification-email", async (req, res) => {
   } catch (e) {
     console.error("send-verification-email error:", e.message);
     res.status(500).json({ error: "Failed to send verification email" });
+  }
+});
+
+// Verifies a Play Billing subscription purchase server-side before trusting
+// it - a client-reported "I paid" is exactly what a client shouldn't be
+// trusted to self-report, the same lesson item 13's userId bug already
+// taught this file. uid comes from the verified token, never the request
+// body. subscriptionsv2.get is the current (non-deprecated) status API;
+// acknowledge is still a v3-only call, kept separate below.
+app.post("/api/verify-purchase", async (req, res) => {
+  const { purchaseToken, productId } = req.body || {};
+  const uid = req.user.uid;
+  if (!purchaseToken || !productId) {
+    return res.status(400).json({ ok: false, error: "Missing purchaseToken or productId" });
+  }
+
+  try {
+    const { data: sub } = await androidpublisher.purchases.subscriptionsv2.get({
+      packageName: PACKAGE_NAME,
+      token: purchaseToken,
+    });
+
+    const state = sub.subscriptionState;
+    if (state !== "SUBSCRIPTION_STATE_ACTIVE" && state !== "SUBSCRIPTION_STATE_IN_GRACE_PERIOD") {
+      return res.status(400).json({ ok: false, error: `Subscription is not active (${state}).` });
+    }
+
+    const basePlanId = sub.lineItems?.[0]?.offerDetails?.basePlanId || sub.lineItems?.[0]?.autoRenewingPlan?.basePlanId;
+    const plan = planFromBasePlanId(basePlanId);
+    if (!plan) {
+      return res.status(400).json({ ok: false, error: "Could not determine plan from this purchase." });
+    }
+
+    const creditsResetAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    await adminDb.collection("users").doc(uid).set({
+      plan,
+      creditsRemaining: PLAN_CREDITS[plan],
+      creditsResetAt,
+      subscriptionProductId: productId,
+      subscriptionPurchaseToken: purchaseToken,
+      subscriptionBasePlanId: basePlanId,
+    }, { merge: true });
+
+    // Google auto-refunds an unacknowledged purchase after 3 days - the
+    // client also calls finishTransaction, this is belt-and-suspenders in
+    // case that call never lands (app killed, network drop mid-purchase).
+    try {
+      await androidpublisher.purchases.subscriptions.acknowledge({
+        packageName: PACKAGE_NAME,
+        subscriptionId: productId,
+        token: purchaseToken,
+        requestBody: {},
+      });
+    } catch (ackErr) {
+      // Already acknowledged is the expected case on the client's own
+      // finishTransaction beating this call - not a real failure.
+      console.log("[verify-purchase] acknowledge:", ackErr.message);
+    }
+
+    res.json({ ok: true, plan });
+  } catch (e) {
+    console.error("[verify-purchase] error:", e.message);
+    res.status(500).json({ ok: false, error: "Could not verify this purchase." });
   }
 });
 
