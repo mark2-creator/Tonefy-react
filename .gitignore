@@ -8,3 +8,7 @@ backend/public/audios/*.mp3
 backend/videos/*.mp4
 public/videos/*.ass
 backend/jobs.json
+
+# Recovery snapshots kept on disk, not in history
+*.bak_*
+backend/public/auth/
