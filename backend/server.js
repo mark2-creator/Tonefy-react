@@ -512,7 +512,16 @@ app.post("/api/transcribe-voiceover", verifyToken, async (req, res) => {
 });
 
 app.use(express.urlencoded({ extended: true }));
-app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
+// The mobile app never sends an Origin header at all (CORS is a browser
+// mechanism; native fetch doesn't set one), so this only ever matters for
+// tonefy-ai.fitlifesolutions.site, the one real browser-based caller -
+// confirmed by grepping the live site's own JS for its API base URL and
+// checking for a www/bare-domain variant, neither of which exist. Bearer-
+// token auth (no cookies) already meant a wildcard origin couldn't be used
+// to ride a victim's session, but restricting it is still real hardening
+// for anything unauthenticated a malicious page could otherwise read
+// cross-origin via a visitor's browser.
+app.use(cors({ origin: "https://tonefy-ai.fitlifesolutions.site", methods: ["GET", "POST", "OPTIONS"] }));
 app.use((req, res, next) => { console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`); next(); });
 // Global rate limit
 app.use(rateLimit({
