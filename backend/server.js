@@ -246,9 +246,9 @@ function loadJobsFromDisk() {
 }
 loadJobsFromDisk();
 
-function createJob() {
+function createJob(userId) {
   const jobId = uuidv4();
-  jobs.set(jobId, { status: 'pending', progress: 0, message: 'Starting...' });
+  jobs.set(jobId, { status: 'pending', progress: 0, message: 'Starting...', userId });
   saveJobsToDisk();
   return jobId;
 }
@@ -602,6 +602,26 @@ app.post("/api/verify-purchase", async (req, res) => {
     const plan = planFromBasePlanId(basePlanId);
     if (!plan) {
       return res.status(400).json({ ok: false, error: "Could not determine plan from this purchase." });
+    }
+
+    // subscriptionsv2.get keeps returning ACTIVE for the entire billing
+    // period, not just once - without this, replaying the same still-valid
+    // purchaseToken (the client's own retry logic, or a direct API call)
+    // would reset creditsRemaining back to full every time, indefinitely,
+    // from a single real payment. .create() on a doc keyed by a hash of the
+    // token is an atomic claim: it fails if this exact token was already
+    // processed for this user, so a genuine double-call (e.g. a network
+    // retry before the first response landed) is a safe no-op rather than
+    // a second free grant.
+    const purchaseId = crypto.createHash('sha256').update(purchaseToken).digest('hex');
+    const purchaseRef = adminDb.collection("users").doc(uid).collection("processedPurchases").doc(purchaseId);
+    try {
+      await purchaseRef.create({ processedAt: new Date().toISOString(), productId, basePlanId, plan });
+    } catch (claimErr) {
+      if (claimErr.code === 6 /* ALREADY_EXISTS */) {
+        return res.json({ ok: true, plan });
+      }
+      throw claimErr;
     }
 
     const creditsResetAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -1450,13 +1470,19 @@ app.post("/api/tts", scriptLimiter, async (req, res) => {
 
 app.get("/api/job/:jobId", (req, res) => {
   const job = jobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: "Job not found" });
+  // Same 404 for "doesn't exist" and "exists but isn't yours" - a distinct
+  // 403 would let a caller confirm which UUIDs are real jobs belonging to
+  // someone else. Jobs created before this ownership check shipped have no
+  // userId and so 404 for everyone, including their original creator - an
+  // acceptable one-time gap for whatever was still in flight at deploy,
+  // not an ongoing one.
+  if (!job || job.userId !== req.user.uid) return res.status(404).json({ error: "Job not found" });
   res.json(job);
 });
 
 app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
   const { voiceover = "", selectedVideo, selectedVideos, audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0, transition = "fade" } = req.body || {};
-  const jobId = createJob();
+  const jobId = createJob(req.user.uid);
   res.json({ jobId }); // Return immediately
   try {
     const videoList = selectedVideos || (selectedVideo ? [selectedVideo] : []);
@@ -1638,7 +1664,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
     return res.status(403).json({ error: `The "${captionStyle}" caption style is available on the Pro and Creator plans.` });
   }
 
-  const jobId = createJob();
+  const jobId = createJob(req.user.uid);
   res.json({ jobId });
 
   await acquireVideoSlot(allowed.tier.queuePriority > 0);
@@ -2197,7 +2223,7 @@ app.post('/api/edit-video', async (req, res) => {
     return res.status(403).json({ error: `The "${captionStyle}" caption style is available on the Pro and Creator plans.` });
   }
 
-  const jobId = createJob();
+  const jobId = createJob(req.user.uid);
   res.json({ jobId });
 
   try {
@@ -2286,7 +2312,19 @@ app.post('/api/edit-video', async (req, res) => {
 
 
 
-const upload = multer({ dest: uploadsDir });
+// No limits/fileFilter previously - any client could upload files of
+// unbounded size (disk-exhaustion DoS) or of any type at all (the app only
+// ever sends image/video/audio, so anything else has no legitimate use
+// here). 500MB is generous for real phone-recorded footage while still
+// being a real ceiling, not a nominal one.
+const upload = multer({
+  dest: uploadsDir,
+  limits: { fileSize: 500 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = /^(image|video|audio)\//.test(file.mimetype);
+    cb(ok ? null : new Error('Unsupported file type'), ok);
+  },
+});
 
 // 60, not 20. A project accumulates clips over a whole editing session - split,
 // replace, add again - and easily passes what one picker selection (selectionLimit:
@@ -2570,7 +2608,7 @@ app.post('/api/media-to-video', async (req, res) => {
   });
   if (!allowed.ok) return res.status(allowed.status).json({ error: allowed.error });
 
-  const jobId = createJob();
+  const jobId = createJob(req.user.uid);
   res.json({ jobId });
 
   try {
