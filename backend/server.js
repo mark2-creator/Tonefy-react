@@ -2835,7 +2835,13 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // would crop the FRAME - taking a corner out of the finished video rather than
       // choosing which part of the shot is used.
       const srcCrop = sourceCropFilter(item.crop);
-      const vf = `${srcCrop ? srcCrop + ',' : ''}${frameFitFilter(W, H, background)},setsar=1${look}`;
+      // Kept as head and tail rather than one string so stabilisation can be spliced
+      // between them. It has to run on source-resolution frames, before the fit into
+      // the output frame - vidstabtransform shifts and rotates the picture, and doing
+      // that after the pad would move the padding around with it.
+      const vfHead = srcCrop ? srcCrop + ',' : '';
+      const vfTail = `${frameFitFilter(W, H, background)},setsar=1${look}`;
+      const vf = `${vfHead}${vfTail}`;
 
       // Every prepared clip carries an audio stream, even when that stream is
       // silence. Clips used to be prepped with -an, so the original sound was thrown
@@ -2867,6 +2873,7 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       const wantsReverse = isVideo && item.reverse === true;
       const wantsDenoise = isVideo && item.denoise === true;
       const wantsMotionBlur = isVideo && item.motionBlur === true;
+      const wantsStabilize = isVideo && item.stabilize === true;
 
       // reverse is the one that cannot simply be switched on: it holds every
       // decoded frame of the clip in memory at once, because the last frame has to
@@ -2896,7 +2903,14 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
 
       // reverse decodes the whole clip and tmix blends every frame, so both are far
       // slower than the plain copy this timeout was sized for.
-      const clipTimeoutMs = (wantsReverse || wantsMotionBlur) ? 180000 : 60000;
+      // Stabilisation is two full decodes of the clip, so it gets the most room.
+      const clipTimeoutMs = wantsStabilize ? 300000
+        : (wantsReverse || wantsMotionBlur) ? 180000
+        : 60000;
+
+      // Declared out here so the finally below removes it whether the transform
+      // succeeded, threw, or was never reached.
+      let stabTrf = null;
 
       let cmd;
       if (item.type === "image") {
@@ -2921,23 +2935,53 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
         // mp4 - would leave the map unsatisfied, so ask first rather than let the
         // whole clip prep fail on it.
         const srcHasAudio = wantsSound ? await hasAudioStream(srcPath) : false;
+
+        // Stabilisation is two passes. The first measures the camera's motion and
+        // writes it to a .trf; the second applies the correction. The measurements
+        // are indexed by frame number, so the detect pass MUST read exactly the same
+        // frames the transform pass will - same inSpec, so the same -ss/-t window,
+        // and the same crop ahead of it. Give it a different window and the
+        // corrections land on the wrong frames, which does not fail, it just shakes
+        // the clip differently.
+        let vfForClip = vf;
+        if (wantsStabilize) {
+          stabTrf = path.join(videosDir, uniqueName("vidstab", "trf"));
+          const detectCmd = `ffmpeg -y ${inSpec} -vf "${vfHead}vidstabdetect=shakiness=5:accuracy=15:result=${stabTrf}" -f null -`;
+          await new Promise((resolve, reject) => {
+            exec(detectCmd, { timeout: clipTimeoutMs }, (err, stdout, stderr) => {
+              if (err) { console.error("Stabilise detect error:", stderr?.slice(-300)); return reject(new Error("Stabilise failed")); }
+              resolve();
+            });
+          });
+          // unsharp after the transform is ffmpeg's own recommendation for this
+          // filter: correcting shake resamples every frame, which softens it, and a
+          // light sharpen puts back roughly what the interpolation took out.
+          vfForClip = `${vfHead}vidstabtransform=input=${stabTrf}:smoothing=30:crop=black,unsharp=5:5:0.8:3:3:0.4,${vfTail}`;
+        }
         if (srcHasAudio) {
           // atempo changes tempo and leaves pitch alone, so a sped-up voice stays the
           // same voice. The preview is told to correct pitch too (shouldCorrectPitch),
           // because the two have to agree - expo-av left to its default shifts pitch
           // with rate, and the export would then not sound like what was auditioned.
           const af = ['volume=' + clipVol].concat(extraAfPre).concat(spd !== 1 ? atempoChain(spd) : []).join(',');
-          cmd = `ffmpeg -y ${inSpec} -vf "${vf}${extraVf}${speedVf}" -af "${af}" -pix_fmt yuv420p -r 30 -c:a aac "${clipOut}"`;
+          cmd = `ffmpeg -y ${inSpec} -vf "${vfForClip}${extraVf}${speedVf}" -af "${af}" -pix_fmt yuv420p -r 30 -c:a aac "${clipOut}"`;
         } else {
-          cmd = `ffmpeg -y ${inSpec} ${SILENCE_IN} -vf "${vf}${extraVf}${speedVf}" -pix_fmt yuv420p -r 30 -map 0:v:0 -map 1:a:0 -c:a aac -shortest "${clipOut}"`;
+          cmd = `ffmpeg -y ${inSpec} ${SILENCE_IN} -vf "${vfForClip}${extraVf}${speedVf}" -pix_fmt yuv420p -r 30 -map 0:v:0 -map 1:a:0 -c:a aac -shortest "${clipOut}"`;
         }
       }
-      await new Promise((resolve, reject) => {
-        exec(cmd, { timeout: clipTimeoutMs }, (err, stdout, stderr) => {
-          if (err) { console.error("Clip prep error:", stderr?.slice(-300)); return reject(new Error("Clip prep failed")); }
-          resolve();
+      try {
+        await new Promise((resolve, reject) => {
+          exec(cmd, { timeout: clipTimeoutMs }, (err, stdout, stderr) => {
+            if (err) { console.error("Clip prep error:", stderr?.slice(-300)); return reject(new Error("Clip prep failed")); }
+            resolve();
+          });
         });
-      });
+      } finally {
+        // One per stabilised clip, and they are pure scratch - nothing reads a .trf
+        // after its transform pass. Left behind they would accumulate exactly like
+        // the txtrender-*.png leak did (aaa0f043).
+        if (stabTrf) { try { fs.unlinkSync(stabTrf); } catch (e) {} }
+      }
       tempClips.push(clipOut);
       updateJob(jobId, { progress: 5 + Math.round((i + 1) / mediaItems.length * 40), message: `Processing clip ${i + 1}/${mediaItems.length}...` });
     }
