@@ -223,6 +223,30 @@ const mediaProcLimiter = rateLimit({
   validate: { xForwardedForHeader: false }
 });
 
+// Job polling runs every ~2-3s for the whole length of a render, so a single
+// legitimate export is already hundreds of requests - which is why this was
+// exempted from the global limit entirely. Exempt is not the same as
+// unlimited though, so it gets a ceiling far above any real session instead of
+// none at all.
+const jobPollLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 1200,
+  message: { error: 'Too many status checks. Please wait a moment.' },
+  keyGenerator: limitKey,
+  validate: { xForwardedForHeader: false }
+});
+
+// TikTok's routes are outside /api, so app.use("/api", verifyToken) does not
+// reach them and they are unauthenticated. Rate limiting is not a substitute
+// for that - see the note on /tiktok/post-video - but it does bound the damage.
+const tiktokLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 60,
+  message: { error: 'Too many TikTok requests. Please wait a few minutes.' },
+  keyGenerator: limitKey,
+  validate: { xForwardedForHeader: false }
+});
+
 // Sends real mail through a Gmail account with its own daily cap. Burning that
 // cap does not degrade one feature, it stops every new signup from being able
 // to verify at all, so this is the tightest limit here.
@@ -624,7 +648,6 @@ app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 500,
   message: { error: 'Too many requests, please try again later.' },
-  skip: (req) => req.path.startsWith('/api/job/'),
   keyGenerator: limitKey,
   validate: { xForwardedForHeader: false }
 }));
@@ -662,7 +685,7 @@ app.post("/api/send-verification-email", emailLimiter, async (req, res) => {
 // taught this file. uid comes from the verified token, never the request
 // body. subscriptionsv2.get is the current (non-deprecated) status API;
 // acknowledge is still a v3-only call, kept separate below.
-app.post("/api/verify-purchase", async (req, res) => {
+app.post("/api/verify-purchase", mediaProcLimiter, async (req, res) => {
   const { purchaseToken, productId } = req.body || {};
   const uid = req.user.uid;
   if (!purchaseToken || !productId) {
@@ -1432,7 +1455,7 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
   }
 });
 
-app.post("/api/extract-keywords", async (req, res) => {
+app.post("/api/extract-keywords", scriptLimiter, async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: "Text required" });
   try {
@@ -1550,7 +1573,7 @@ app.post("/api/tts", scriptLimiter, async (req, res) => {
   }
 });
 
-app.get("/api/job/:jobId", (req, res) => {
+app.get("/api/job/:jobId", jobPollLimiter, (req, res) => {
   const job = jobs.get(req.params.jobId);
   // Same 404 for "doesn't exist" and "exists but isn't yours" - a distinct
   // 403 would let a caller confirm which UUIDs are real jobs belonging to
@@ -1668,7 +1691,7 @@ app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
 
 // ===== Segment-based Idea-to-Video (improved visual matching) =====
 
-app.post("/api/extract-segments", async (req, res) => {
+app.post("/api/extract-segments", scriptLimiter, async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: "Text required" });
   try {
@@ -2097,7 +2120,7 @@ const TIKTOK_REDIRECT_URI = process.env.TIKTOK_REDIRECT_URI;
 const tiktokTokens = {};
 
 // Step 1: Generate TikTok OAuth URL
-app.get('/tiktok/auth', (req, res) => {
+app.get('/tiktok/auth', tiktokLimiter, (req, res) => {
   const csrfState = crypto.randomBytes(16).toString('hex');
   const codeVerifier = crypto.randomBytes(32).toString('hex');
   const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
@@ -2118,7 +2141,7 @@ app.get('/tiktok/auth', (req, res) => {
 });
 
 // Step 2: Handle TikTok OAuth callback
-app.get('/tiktok/callback', async (req, res) => {
+app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
   const { code, state, error } = req.query;
 
   if (error) {
@@ -2171,14 +2194,14 @@ app.get('/tiktok/callback', async (req, res) => {
 });
 
 // Step 3: Get stored TikTok user info
-app.get('/tiktok/user/:openId', (req, res) => {
+app.get('/tiktok/user/:openId', tiktokLimiter, (req, res) => {
   const token = tiktokTokens[req.params.openId];
   if (!token) return res.status(404).json({ error: 'Not connected' });
   res.json({ open_id: token.open_id, connected: true });
 });
 
 // Step 4: Post video to TikTok
-app.post('/tiktok/post-video', async (req, res) => {
+app.post('/tiktok/post-video', tiktokLimiter, async (req, res) => {
   const { openId, videoUrl, title, privacyLevel = 'SELF_ONLY' } = req.body;
 
   const token = tiktokTokens[openId];
@@ -2246,7 +2269,7 @@ app.post('/tiktok/post-video', async (req, res) => {
 });
 
 // Step 5: Check post status
-app.get('/tiktok/post-status/:openId/:publishId', async (req, res) => {
+app.get('/tiktok/post-status/:openId/:publishId', tiktokLimiter, async (req, res) => {
   const { openId, publishId } = req.params;
   const token = tiktokTokens[openId];
   if (!token) return res.status(401).json({ error: 'Not connected' });
