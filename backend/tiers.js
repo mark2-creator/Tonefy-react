@@ -39,7 +39,14 @@ export const FREE_CAPTION_STYLES = [
   'classic', 'tiktok', 'bold', 'neon', 'fire', 'purple',
   'sticker', 'outline', 'cinematic', 'minimal', 'shadow3d', 'highlight',
 ];
-export const FREE_VOICES = ['gtts-us', 'gtts-uk', 'gtts-au'];
+// Five of 325. The three gTTS voices plus two edge ones, so a free account has a male
+// option and something that is not gTTS's flat delivery - enough to make a video with,
+// little enough that the catalogue is a real reason to upgrade. Must match the `free`
+// flag in voices.json, which scripts/generate-voices.py writes from this same list.
+export const FREE_VOICES = [
+  'gtts-us', 'gtts-uk', 'gtts-au',
+  'edge-en-US-AvaNeural', 'edge-en-US-AndrewNeural',
+];
 
 export const TIERS = {
   free: {

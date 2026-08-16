@@ -1,0 +1,1952 @@
+{
+ "gtts-us": {
+  "engine": "gtts",
+  "tld": "com",
+  "label": "Sarah",
+  "free": true
+ },
+ "gtts-uk": {
+  "engine": "gtts",
+  "tld": "co.uk",
+  "label": "Emma",
+  "free": true
+ },
+ "gtts-au": {
+  "engine": "gtts",
+  "tld": "com.au",
+  "label": "Olivia",
+  "free": true
+ },
+ "edge-af-ZA-AdriNeural": {
+  "engine": "edge",
+  "name": "af-ZA-AdriNeural",
+  "label": "Adri",
+  "free": false
+ },
+ "edge-af-ZA-WillemNeural": {
+  "engine": "edge",
+  "name": "af-ZA-WillemNeural",
+  "label": "Willem",
+  "free": false
+ },
+ "edge-am-ET-AmehaNeural": {
+  "engine": "edge",
+  "name": "am-ET-AmehaNeural",
+  "label": "Ameha",
+  "free": false
+ },
+ "edge-am-ET-MekdesNeural": {
+  "engine": "edge",
+  "name": "am-ET-MekdesNeural",
+  "label": "Mekdes",
+  "free": false
+ },
+ "edge-ar-AE-FatimaNeural": {
+  "engine": "edge",
+  "name": "ar-AE-FatimaNeural",
+  "label": "Fatima",
+  "free": false
+ },
+ "edge-ar-AE-HamdanNeural": {
+  "engine": "edge",
+  "name": "ar-AE-HamdanNeural",
+  "label": "Hamdan",
+  "free": false
+ },
+ "edge-ar-BH-AliNeural": {
+  "engine": "edge",
+  "name": "ar-BH-AliNeural",
+  "label": "Ali",
+  "free": false
+ },
+ "edge-ar-BH-LailaNeural": {
+  "engine": "edge",
+  "name": "ar-BH-LailaNeural",
+  "label": "Laila",
+  "free": false
+ },
+ "edge-ar-DZ-AminaNeural": {
+  "engine": "edge",
+  "name": "ar-DZ-AminaNeural",
+  "label": "Amina",
+  "free": false
+ },
+ "edge-ar-DZ-IsmaelNeural": {
+  "engine": "edge",
+  "name": "ar-DZ-IsmaelNeural",
+  "label": "Ismael",
+  "free": false
+ },
+ "edge-ar-EG-SalmaNeural": {
+  "engine": "edge",
+  "name": "ar-EG-SalmaNeural",
+  "label": "Salma",
+  "free": false
+ },
+ "edge-ar-EG-ShakirNeural": {
+  "engine": "edge",
+  "name": "ar-EG-ShakirNeural",
+  "label": "Shakir",
+  "free": false
+ },
+ "edge-ar-IQ-BasselNeural": {
+  "engine": "edge",
+  "name": "ar-IQ-BasselNeural",
+  "label": "Bassel",
+  "free": false
+ },
+ "edge-ar-IQ-RanaNeural": {
+  "engine": "edge",
+  "name": "ar-IQ-RanaNeural",
+  "label": "Rana",
+  "free": false
+ },
+ "edge-ar-JO-SanaNeural": {
+  "engine": "edge",
+  "name": "ar-JO-SanaNeural",
+  "label": "Sana",
+  "free": false
+ },
+ "edge-ar-JO-TaimNeural": {
+  "engine": "edge",
+  "name": "ar-JO-TaimNeural",
+  "label": "Taim",
+  "free": false
+ },
+ "edge-ar-KW-FahedNeural": {
+  "engine": "edge",
+  "name": "ar-KW-FahedNeural",
+  "label": "Fahed",
+  "free": false
+ },
+ "edge-ar-KW-NouraNeural": {
+  "engine": "edge",
+  "name": "ar-KW-NouraNeural",
+  "label": "Noura",
+  "free": false
+ },
+ "edge-ar-LB-LaylaNeural": {
+  "engine": "edge",
+  "name": "ar-LB-LaylaNeural",
+  "label": "Layla",
+  "free": false
+ },
+ "edge-ar-LB-RamiNeural": {
+  "engine": "edge",
+  "name": "ar-LB-RamiNeural",
+  "label": "Rami",
+  "free": false
+ },
+ "edge-ar-LY-ImanNeural": {
+  "engine": "edge",
+  "name": "ar-LY-ImanNeural",
+  "label": "Iman",
+  "free": false
+ },
+ "edge-ar-LY-OmarNeural": {
+  "engine": "edge",
+  "name": "ar-LY-OmarNeural",
+  "label": "Omar",
+  "free": false
+ },
+ "edge-ar-MA-JamalNeural": {
+  "engine": "edge",
+  "name": "ar-MA-JamalNeural",
+  "label": "Jamal",
+  "free": false
+ },
+ "edge-ar-MA-MounaNeural": {
+  "engine": "edge",
+  "name": "ar-MA-MounaNeural",
+  "label": "Mouna",
+  "free": false
+ },
+ "edge-ar-OM-AbdullahNeural": {
+  "engine": "edge",
+  "name": "ar-OM-AbdullahNeural",
+  "label": "Abdullah",
+  "free": false
+ },
+ "edge-ar-OM-AyshaNeural": {
+  "engine": "edge",
+  "name": "ar-OM-AyshaNeural",
+  "label": "Aysha",
+  "free": false
+ },
+ "edge-ar-QA-AmalNeural": {
+  "engine": "edge",
+  "name": "ar-QA-AmalNeural",
+  "label": "Amal",
+  "free": false
+ },
+ "edge-ar-QA-MoazNeural": {
+  "engine": "edge",
+  "name": "ar-QA-MoazNeural",
+  "label": "Moaz",
+  "free": false
+ },
+ "edge-ar-SA-HamedNeural": {
+  "engine": "edge",
+  "name": "ar-SA-HamedNeural",
+  "label": "Hamed",
+  "free": false
+ },
+ "edge-ar-SA-ZariyahNeural": {
+  "engine": "edge",
+  "name": "ar-SA-ZariyahNeural",
+  "label": "Zariyah",
+  "free": false
+ },
+ "edge-ar-SY-AmanyNeural": {
+  "engine": "edge",
+  "name": "ar-SY-AmanyNeural",
+  "label": "Amany",
+  "free": false
+ },
+ "edge-ar-SY-LaithNeural": {
+  "engine": "edge",
+  "name": "ar-SY-LaithNeural",
+  "label": "Laith",
+  "free": false
+ },
+ "edge-ar-TN-HediNeural": {
+  "engine": "edge",
+  "name": "ar-TN-HediNeural",
+  "label": "Hedi",
+  "free": false
+ },
+ "edge-ar-TN-ReemNeural": {
+  "engine": "edge",
+  "name": "ar-TN-ReemNeural",
+  "label": "Reem",
+  "free": false
+ },
+ "edge-ar-YE-MaryamNeural": {
+  "engine": "edge",
+  "name": "ar-YE-MaryamNeural",
+  "label": "Maryam",
+  "free": false
+ },
+ "edge-ar-YE-SalehNeural": {
+  "engine": "edge",
+  "name": "ar-YE-SalehNeural",
+  "label": "Saleh",
+  "free": false
+ },
+ "edge-az-AZ-BabekNeural": {
+  "engine": "edge",
+  "name": "az-AZ-BabekNeural",
+  "label": "Babek",
+  "free": false
+ },
+ "edge-az-AZ-BanuNeural": {
+  "engine": "edge",
+  "name": "az-AZ-BanuNeural",
+  "label": "Banu",
+  "free": false
+ },
+ "edge-bg-BG-BorislavNeural": {
+  "engine": "edge",
+  "name": "bg-BG-BorislavNeural",
+  "label": "Borislav",
+  "free": false
+ },
+ "edge-bg-BG-KalinaNeural": {
+  "engine": "edge",
+  "name": "bg-BG-KalinaNeural",
+  "label": "Kalina",
+  "free": false
+ },
+ "edge-bn-BD-NabanitaNeural": {
+  "engine": "edge",
+  "name": "bn-BD-NabanitaNeural",
+  "label": "Nabanita",
+  "free": false
+ },
+ "edge-bn-BD-PradeepNeural": {
+  "engine": "edge",
+  "name": "bn-BD-PradeepNeural",
+  "label": "Pradeep",
+  "free": false
+ },
+ "edge-bn-IN-BashkarNeural": {
+  "engine": "edge",
+  "name": "bn-IN-BashkarNeural",
+  "label": "Bashkar",
+  "free": false
+ },
+ "edge-bn-IN-TanishaaNeural": {
+  "engine": "edge",
+  "name": "bn-IN-TanishaaNeural",
+  "label": "Tanishaa",
+  "free": false
+ },
+ "edge-bs-BA-GoranNeural": {
+  "engine": "edge",
+  "name": "bs-BA-GoranNeural",
+  "label": "Goran",
+  "free": false
+ },
+ "edge-bs-BA-VesnaNeural": {
+  "engine": "edge",
+  "name": "bs-BA-VesnaNeural",
+  "label": "Vesna",
+  "free": false
+ },
+ "edge-ca-ES-EnricNeural": {
+  "engine": "edge",
+  "name": "ca-ES-EnricNeural",
+  "label": "Enric",
+  "free": false
+ },
+ "edge-ca-ES-JoanaNeural": {
+  "engine": "edge",
+  "name": "ca-ES-JoanaNeural",
+  "label": "Joana",
+  "free": false
+ },
+ "edge-cs-CZ-AntoninNeural": {
+  "engine": "edge",
+  "name": "cs-CZ-AntoninNeural",
+  "label": "Antonin",
+  "free": false
+ },
+ "edge-cs-CZ-VlastaNeural": {
+  "engine": "edge",
+  "name": "cs-CZ-VlastaNeural",
+  "label": "Vlasta",
+  "free": false
+ },
+ "edge-cy-GB-AledNeural": {
+  "engine": "edge",
+  "name": "cy-GB-AledNeural",
+  "label": "Aled",
+  "free": false
+ },
+ "edge-cy-GB-NiaNeural": {
+  "engine": "edge",
+  "name": "cy-GB-NiaNeural",
+  "label": "Nia",
+  "free": false
+ },
+ "edge-da-DK-ChristelNeural": {
+  "engine": "edge",
+  "name": "da-DK-ChristelNeural",
+  "label": "Christel",
+  "free": false
+ },
+ "edge-da-DK-JeppeNeural": {
+  "engine": "edge",
+  "name": "da-DK-JeppeNeural",
+  "label": "Jeppe",
+  "free": false
+ },
+ "edge-de-AT-IngridNeural": {
+  "engine": "edge",
+  "name": "de-AT-IngridNeural",
+  "label": "Ingrid",
+  "free": false
+ },
+ "edge-de-AT-JonasNeural": {
+  "engine": "edge",
+  "name": "de-AT-JonasNeural",
+  "label": "Jonas",
+  "free": false
+ },
+ "edge-de-CH-JanNeural": {
+  "engine": "edge",
+  "name": "de-CH-JanNeural",
+  "label": "Jan",
+  "free": false
+ },
+ "edge-de-CH-LeniNeural": {
+  "engine": "edge",
+  "name": "de-CH-LeniNeural",
+  "label": "Leni",
+  "free": false
+ },
+ "edge-de-DE-AmalaNeural": {
+  "engine": "edge",
+  "name": "de-DE-AmalaNeural",
+  "label": "Amala",
+  "free": false
+ },
+ "edge-de-DE-ConradNeural": {
+  "engine": "edge",
+  "name": "de-DE-ConradNeural",
+  "label": "Conrad",
+  "free": false
+ },
+ "edge-de-DE-FlorianMultilingualNeural": {
+  "engine": "edge",
+  "name": "de-DE-FlorianMultilingualNeural",
+  "label": "Florian",
+  "free": false
+ },
+ "edge-de-DE-KatjaNeural": {
+  "engine": "edge",
+  "name": "de-DE-KatjaNeural",
+  "label": "Katja",
+  "free": false
+ },
+ "edge-de-DE-KillianNeural": {
+  "engine": "edge",
+  "name": "de-DE-KillianNeural",
+  "label": "Killian",
+  "free": false
+ },
+ "edge-de-DE-SeraphinaMultilingualNeural": {
+  "engine": "edge",
+  "name": "de-DE-SeraphinaMultilingualNeural",
+  "label": "Seraphina",
+  "free": false
+ },
+ "edge-el-GR-AthinaNeural": {
+  "engine": "edge",
+  "name": "el-GR-AthinaNeural",
+  "label": "Athina",
+  "free": false
+ },
+ "edge-el-GR-NestorasNeural": {
+  "engine": "edge",
+  "name": "el-GR-NestorasNeural",
+  "label": "Nestoras",
+  "free": false
+ },
+ "edge-en-AU-NatashaNeural": {
+  "engine": "edge",
+  "name": "en-AU-NatashaNeural",
+  "label": "Natasha",
+  "free": false
+ },
+ "edge-en-AU-WilliamMultilingualNeural": {
+  "engine": "edge",
+  "name": "en-AU-WilliamMultilingualNeural",
+  "label": "William",
+  "free": false
+ },
+ "edge-en-CA-ClaraNeural": {
+  "engine": "edge",
+  "name": "en-CA-ClaraNeural",
+  "label": "Clara",
+  "free": false
+ },
+ "edge-en-CA-LiamNeural": {
+  "engine": "edge",
+  "name": "en-CA-LiamNeural",
+  "label": "Liam",
+  "free": false
+ },
+ "edge-en-GB-LibbyNeural": {
+  "engine": "edge",
+  "name": "en-GB-LibbyNeural",
+  "label": "Libby",
+  "free": false
+ },
+ "edge-en-GB-MaisieNeural": {
+  "engine": "edge",
+  "name": "en-GB-MaisieNeural",
+  "label": "Maisie",
+  "free": false
+ },
+ "edge-en-GB-RyanNeural": {
+  "engine": "edge",
+  "name": "en-GB-RyanNeural",
+  "label": "Ryan",
+  "free": false
+ },
+ "edge-en-GB-SoniaNeural": {
+  "engine": "edge",
+  "name": "en-GB-SoniaNeural",
+  "label": "Sonia",
+  "free": false
+ },
+ "edge-en-GB-ThomasNeural": {
+  "engine": "edge",
+  "name": "en-GB-ThomasNeural",
+  "label": "Thomas",
+  "free": false
+ },
+ "edge-en-HK-SamNeural": {
+  "engine": "edge",
+  "name": "en-HK-SamNeural",
+  "label": "Sam",
+  "free": false
+ },
+ "edge-en-HK-YanNeural": {
+  "engine": "edge",
+  "name": "en-HK-YanNeural",
+  "label": "Yan",
+  "free": false
+ },
+ "edge-en-IE-ConnorNeural": {
+  "engine": "edge",
+  "name": "en-IE-ConnorNeural",
+  "label": "Connor",
+  "free": false
+ },
+ "edge-en-IE-EmilyNeural": {
+  "engine": "edge",
+  "name": "en-IE-EmilyNeural",
+  "label": "Emily",
+  "free": false
+ },
+ "edge-en-IN-NeerjaExpressiveNeural": {
+  "engine": "edge",
+  "name": "en-IN-NeerjaExpressiveNeural",
+  "label": "NeerjaExpressive",
+  "free": false
+ },
+ "edge-en-IN-NeerjaNeural": {
+  "engine": "edge",
+  "name": "en-IN-NeerjaNeural",
+  "label": "Neerja",
+  "free": false
+ },
+ "edge-en-IN-PrabhatNeural": {
+  "engine": "edge",
+  "name": "en-IN-PrabhatNeural",
+  "label": "Prabhat",
+  "free": false
+ },
+ "edge-en-KE-AsiliaNeural": {
+  "engine": "edge",
+  "name": "en-KE-AsiliaNeural",
+  "label": "Asilia",
+  "free": false
+ },
+ "edge-en-KE-ChilembaNeural": {
+  "engine": "edge",
+  "name": "en-KE-ChilembaNeural",
+  "label": "Chilemba",
+  "free": false
+ },
+ "edge-en-NG-AbeoNeural": {
+  "engine": "edge",
+  "name": "en-NG-AbeoNeural",
+  "label": "Abeo",
+  "free": false
+ },
+ "edge-en-NG-EzinneNeural": {
+  "engine": "edge",
+  "name": "en-NG-EzinneNeural",
+  "label": "Ezinne",
+  "free": false
+ },
+ "edge-en-NZ-MitchellNeural": {
+  "engine": "edge",
+  "name": "en-NZ-MitchellNeural",
+  "label": "Mitchell",
+  "free": false
+ },
+ "edge-en-NZ-MollyNeural": {
+  "engine": "edge",
+  "name": "en-NZ-MollyNeural",
+  "label": "Molly",
+  "free": false
+ },
+ "edge-en-PH-JamesNeural": {
+  "engine": "edge",
+  "name": "en-PH-JamesNeural",
+  "label": "James",
+  "free": false
+ },
+ "edge-en-PH-RosaNeural": {
+  "engine": "edge",
+  "name": "en-PH-RosaNeural",
+  "label": "Rosa",
+  "free": false
+ },
+ "edge-en-SG-LunaNeural": {
+  "engine": "edge",
+  "name": "en-SG-LunaNeural",
+  "label": "Luna",
+  "free": false
+ },
+ "edge-en-SG-WayneNeural": {
+  "engine": "edge",
+  "name": "en-SG-WayneNeural",
+  "label": "Wayne",
+  "free": false
+ },
+ "edge-en-TZ-ElimuNeural": {
+  "engine": "edge",
+  "name": "en-TZ-ElimuNeural",
+  "label": "Elimu",
+  "free": false
+ },
+ "edge-en-TZ-ImaniNeural": {
+  "engine": "edge",
+  "name": "en-TZ-ImaniNeural",
+  "label": "Imani",
+  "free": false
+ },
+ "edge-en-US-AnaNeural": {
+  "engine": "edge",
+  "name": "en-US-AnaNeural",
+  "label": "Ana",
+  "free": false
+ },
+ "edge-en-US-AndrewMultilingualNeural": {
+  "engine": "edge",
+  "name": "en-US-AndrewMultilingualNeural",
+  "label": "Andrew",
+  "free": false
+ },
+ "edge-en-US-AndrewNeural": {
+  "engine": "edge",
+  "name": "en-US-AndrewNeural",
+  "label": "Andrew",
+  "free": true
+ },
+ "edge-en-US-AriaNeural": {
+  "engine": "edge",
+  "name": "en-US-AriaNeural",
+  "label": "Aria",
+  "free": false
+ },
+ "edge-en-US-AvaMultilingualNeural": {
+  "engine": "edge",
+  "name": "en-US-AvaMultilingualNeural",
+  "label": "Ava",
+  "free": false
+ },
+ "edge-en-US-AvaNeural": {
+  "engine": "edge",
+  "name": "en-US-AvaNeural",
+  "label": "Ava",
+  "free": true
+ },
+ "edge-en-US-BrianMultilingualNeural": {
+  "engine": "edge",
+  "name": "en-US-BrianMultilingualNeural",
+  "label": "Brian",
+  "free": false
+ },
+ "edge-en-US-BrianNeural": {
+  "engine": "edge",
+  "name": "en-US-BrianNeural",
+  "label": "Brian",
+  "free": false
+ },
+ "edge-en-US-ChristopherNeural": {
+  "engine": "edge",
+  "name": "en-US-ChristopherNeural",
+  "label": "Christopher",
+  "free": false
+ },
+ "edge-en-US-EmmaMultilingualNeural": {
+  "engine": "edge",
+  "name": "en-US-EmmaMultilingualNeural",
+  "label": "Emma",
+  "free": false
+ },
+ "edge-en-US-EmmaNeural": {
+  "engine": "edge",
+  "name": "en-US-EmmaNeural",
+  "label": "Emma",
+  "free": false
+ },
+ "edge-en-US-EricNeural": {
+  "engine": "edge",
+  "name": "en-US-EricNeural",
+  "label": "Eric",
+  "free": false
+ },
+ "edge-en-US-GuyNeural": {
+  "engine": "edge",
+  "name": "en-US-GuyNeural",
+  "label": "Guy",
+  "free": false
+ },
+ "edge-en-US-JennyNeural": {
+  "engine": "edge",
+  "name": "en-US-JennyNeural",
+  "label": "Jenny",
+  "free": false
+ },
+ "edge-en-US-MichelleNeural": {
+  "engine": "edge",
+  "name": "en-US-MichelleNeural",
+  "label": "Michelle",
+  "free": false
+ },
+ "edge-en-US-RogerNeural": {
+  "engine": "edge",
+  "name": "en-US-RogerNeural",
+  "label": "Roger",
+  "free": false
+ },
+ "edge-en-US-SteffanNeural": {
+  "engine": "edge",
+  "name": "en-US-SteffanNeural",
+  "label": "Steffan",
+  "free": false
+ },
+ "edge-en-ZA-LeahNeural": {
+  "engine": "edge",
+  "name": "en-ZA-LeahNeural",
+  "label": "Leah",
+  "free": false
+ },
+ "edge-en-ZA-LukeNeural": {
+  "engine": "edge",
+  "name": "en-ZA-LukeNeural",
+  "label": "Luke",
+  "free": false
+ },
+ "edge-es-AR-ElenaNeural": {
+  "engine": "edge",
+  "name": "es-AR-ElenaNeural",
+  "label": "Elena",
+  "free": false
+ },
+ "edge-es-AR-TomasNeural": {
+  "engine": "edge",
+  "name": "es-AR-TomasNeural",
+  "label": "Tomas",
+  "free": false
+ },
+ "edge-es-BO-MarceloNeural": {
+  "engine": "edge",
+  "name": "es-BO-MarceloNeural",
+  "label": "Marcelo",
+  "free": false
+ },
+ "edge-es-BO-SofiaNeural": {
+  "engine": "edge",
+  "name": "es-BO-SofiaNeural",
+  "label": "Sofia",
+  "free": false
+ },
+ "edge-es-CL-CatalinaNeural": {
+  "engine": "edge",
+  "name": "es-CL-CatalinaNeural",
+  "label": "Catalina",
+  "free": false
+ },
+ "edge-es-CL-LorenzoNeural": {
+  "engine": "edge",
+  "name": "es-CL-LorenzoNeural",
+  "label": "Lorenzo",
+  "free": false
+ },
+ "edge-es-CO-GonzaloNeural": {
+  "engine": "edge",
+  "name": "es-CO-GonzaloNeural",
+  "label": "Gonzalo",
+  "free": false
+ },
+ "edge-es-CO-SalomeNeural": {
+  "engine": "edge",
+  "name": "es-CO-SalomeNeural",
+  "label": "Salome",
+  "free": false
+ },
+ "edge-es-CR-JuanNeural": {
+  "engine": "edge",
+  "name": "es-CR-JuanNeural",
+  "label": "Juan",
+  "free": false
+ },
+ "edge-es-CR-MariaNeural": {
+  "engine": "edge",
+  "name": "es-CR-MariaNeural",
+  "label": "Maria",
+  "free": false
+ },
+ "edge-es-CU-BelkysNeural": {
+  "engine": "edge",
+  "name": "es-CU-BelkysNeural",
+  "label": "Belkys",
+  "free": false
+ },
+ "edge-es-CU-ManuelNeural": {
+  "engine": "edge",
+  "name": "es-CU-ManuelNeural",
+  "label": "Manuel",
+  "free": false
+ },
+ "edge-es-DO-EmilioNeural": {
+  "engine": "edge",
+  "name": "es-DO-EmilioNeural",
+  "label": "Emilio",
+  "free": false
+ },
+ "edge-es-DO-RamonaNeural": {
+  "engine": "edge",
+  "name": "es-DO-RamonaNeural",
+  "label": "Ramona",
+  "free": false
+ },
+ "edge-es-EC-AndreaNeural": {
+  "engine": "edge",
+  "name": "es-EC-AndreaNeural",
+  "label": "Andrea",
+  "free": false
+ },
+ "edge-es-EC-LuisNeural": {
+  "engine": "edge",
+  "name": "es-EC-LuisNeural",
+  "label": "Luis",
+  "free": false
+ },
+ "edge-es-ES-AlvaroNeural": {
+  "engine": "edge",
+  "name": "es-ES-AlvaroNeural",
+  "label": "Alvaro",
+  "free": false
+ },
+ "edge-es-ES-ElviraNeural": {
+  "engine": "edge",
+  "name": "es-ES-ElviraNeural",
+  "label": "Elvira",
+  "free": false
+ },
+ "edge-es-ES-XimenaNeural": {
+  "engine": "edge",
+  "name": "es-ES-XimenaNeural",
+  "label": "Ximena",
+  "free": false
+ },
+ "edge-es-GQ-JavierNeural": {
+  "engine": "edge",
+  "name": "es-GQ-JavierNeural",
+  "label": "Javier",
+  "free": false
+ },
+ "edge-es-GQ-TeresaNeural": {
+  "engine": "edge",
+  "name": "es-GQ-TeresaNeural",
+  "label": "Teresa",
+  "free": false
+ },
+ "edge-es-GT-AndresNeural": {
+  "engine": "edge",
+  "name": "es-GT-AndresNeural",
+  "label": "Andres",
+  "free": false
+ },
+ "edge-es-GT-MartaNeural": {
+  "engine": "edge",
+  "name": "es-GT-MartaNeural",
+  "label": "Marta",
+  "free": false
+ },
+ "edge-es-HN-CarlosNeural": {
+  "engine": "edge",
+  "name": "es-HN-CarlosNeural",
+  "label": "Carlos",
+  "free": false
+ },
+ "edge-es-HN-KarlaNeural": {
+  "engine": "edge",
+  "name": "es-HN-KarlaNeural",
+  "label": "Karla",
+  "free": false
+ },
+ "edge-es-MX-DaliaNeural": {
+  "engine": "edge",
+  "name": "es-MX-DaliaNeural",
+  "label": "Dalia",
+  "free": false
+ },
+ "edge-es-MX-JorgeNeural": {
+  "engine": "edge",
+  "name": "es-MX-JorgeNeural",
+  "label": "Jorge",
+  "free": false
+ },
+ "edge-es-NI-FedericoNeural": {
+  "engine": "edge",
+  "name": "es-NI-FedericoNeural",
+  "label": "Federico",
+  "free": false
+ },
+ "edge-es-NI-YolandaNeural": {
+  "engine": "edge",
+  "name": "es-NI-YolandaNeural",
+  "label": "Yolanda",
+  "free": false
+ },
+ "edge-es-PA-MargaritaNeural": {
+  "engine": "edge",
+  "name": "es-PA-MargaritaNeural",
+  "label": "Margarita",
+  "free": false
+ },
+ "edge-es-PA-RobertoNeural": {
+  "engine": "edge",
+  "name": "es-PA-RobertoNeural",
+  "label": "Roberto",
+  "free": false
+ },
+ "edge-es-PE-AlexNeural": {
+  "engine": "edge",
+  "name": "es-PE-AlexNeural",
+  "label": "Alex",
+  "free": false
+ },
+ "edge-es-PE-CamilaNeural": {
+  "engine": "edge",
+  "name": "es-PE-CamilaNeural",
+  "label": "Camila",
+  "free": false
+ },
+ "edge-es-PR-KarinaNeural": {
+  "engine": "edge",
+  "name": "es-PR-KarinaNeural",
+  "label": "Karina",
+  "free": false
+ },
+ "edge-es-PR-VictorNeural": {
+  "engine": "edge",
+  "name": "es-PR-VictorNeural",
+  "label": "Victor",
+  "free": false
+ },
+ "edge-es-PY-MarioNeural": {
+  "engine": "edge",
+  "name": "es-PY-MarioNeural",
+  "label": "Mario",
+  "free": false
+ },
+ "edge-es-PY-TaniaNeural": {
+  "engine": "edge",
+  "name": "es-PY-TaniaNeural",
+  "label": "Tania",
+  "free": false
+ },
+ "edge-es-SV-LorenaNeural": {
+  "engine": "edge",
+  "name": "es-SV-LorenaNeural",
+  "label": "Lorena",
+  "free": false
+ },
+ "edge-es-SV-RodrigoNeural": {
+  "engine": "edge",
+  "name": "es-SV-RodrigoNeural",
+  "label": "Rodrigo",
+  "free": false
+ },
+ "edge-es-US-AlonsoNeural": {
+  "engine": "edge",
+  "name": "es-US-AlonsoNeural",
+  "label": "Alonso",
+  "free": false
+ },
+ "edge-es-US-PalomaNeural": {
+  "engine": "edge",
+  "name": "es-US-PalomaNeural",
+  "label": "Paloma",
+  "free": false
+ },
+ "edge-es-UY-MateoNeural": {
+  "engine": "edge",
+  "name": "es-UY-MateoNeural",
+  "label": "Mateo",
+  "free": false
+ },
+ "edge-es-UY-ValentinaNeural": {
+  "engine": "edge",
+  "name": "es-UY-ValentinaNeural",
+  "label": "Valentina",
+  "free": false
+ },
+ "edge-es-VE-PaolaNeural": {
+  "engine": "edge",
+  "name": "es-VE-PaolaNeural",
+  "label": "Paola",
+  "free": false
+ },
+ "edge-es-VE-SebastianNeural": {
+  "engine": "edge",
+  "name": "es-VE-SebastianNeural",
+  "label": "Sebastian",
+  "free": false
+ },
+ "edge-et-EE-AnuNeural": {
+  "engine": "edge",
+  "name": "et-EE-AnuNeural",
+  "label": "Anu",
+  "free": false
+ },
+ "edge-et-EE-KertNeural": {
+  "engine": "edge",
+  "name": "et-EE-KertNeural",
+  "label": "Kert",
+  "free": false
+ },
+ "edge-fa-IR-DilaraNeural": {
+  "engine": "edge",
+  "name": "fa-IR-DilaraNeural",
+  "label": "Dilara",
+  "free": false
+ },
+ "edge-fa-IR-FaridNeural": {
+  "engine": "edge",
+  "name": "fa-IR-FaridNeural",
+  "label": "Farid",
+  "free": false
+ },
+ "edge-fi-FI-HarriNeural": {
+  "engine": "edge",
+  "name": "fi-FI-HarriNeural",
+  "label": "Harri",
+  "free": false
+ },
+ "edge-fi-FI-NooraNeural": {
+  "engine": "edge",
+  "name": "fi-FI-NooraNeural",
+  "label": "Noora",
+  "free": false
+ },
+ "edge-fil-PH-AngeloNeural": {
+  "engine": "edge",
+  "name": "fil-PH-AngeloNeural",
+  "label": "Angelo",
+  "free": false
+ },
+ "edge-fil-PH-BlessicaNeural": {
+  "engine": "edge",
+  "name": "fil-PH-BlessicaNeural",
+  "label": "Blessica",
+  "free": false
+ },
+ "edge-fr-BE-CharlineNeural": {
+  "engine": "edge",
+  "name": "fr-BE-CharlineNeural",
+  "label": "Charline",
+  "free": false
+ },
+ "edge-fr-BE-GerardNeural": {
+  "engine": "edge",
+  "name": "fr-BE-GerardNeural",
+  "label": "Gerard",
+  "free": false
+ },
+ "edge-fr-CA-AntoineNeural": {
+  "engine": "edge",
+  "name": "fr-CA-AntoineNeural",
+  "label": "Antoine",
+  "free": false
+ },
+ "edge-fr-CA-JeanNeural": {
+  "engine": "edge",
+  "name": "fr-CA-JeanNeural",
+  "label": "Jean",
+  "free": false
+ },
+ "edge-fr-CA-SylvieNeural": {
+  "engine": "edge",
+  "name": "fr-CA-SylvieNeural",
+  "label": "Sylvie",
+  "free": false
+ },
+ "edge-fr-CA-ThierryNeural": {
+  "engine": "edge",
+  "name": "fr-CA-ThierryNeural",
+  "label": "Thierry",
+  "free": false
+ },
+ "edge-fr-CH-ArianeNeural": {
+  "engine": "edge",
+  "name": "fr-CH-ArianeNeural",
+  "label": "Ariane",
+  "free": false
+ },
+ "edge-fr-CH-FabriceNeural": {
+  "engine": "edge",
+  "name": "fr-CH-FabriceNeural",
+  "label": "Fabrice",
+  "free": false
+ },
+ "edge-fr-FR-DeniseNeural": {
+  "engine": "edge",
+  "name": "fr-FR-DeniseNeural",
+  "label": "Denise",
+  "free": false
+ },
+ "edge-fr-FR-EloiseNeural": {
+  "engine": "edge",
+  "name": "fr-FR-EloiseNeural",
+  "label": "Eloise",
+  "free": false
+ },
+ "edge-fr-FR-HenriNeural": {
+  "engine": "edge",
+  "name": "fr-FR-HenriNeural",
+  "label": "Henri",
+  "free": false
+ },
+ "edge-fr-FR-RemyMultilingualNeural": {
+  "engine": "edge",
+  "name": "fr-FR-RemyMultilingualNeural",
+  "label": "Remy",
+  "free": false
+ },
+ "edge-fr-FR-VivienneMultilingualNeural": {
+  "engine": "edge",
+  "name": "fr-FR-VivienneMultilingualNeural",
+  "label": "Vivienne",
+  "free": false
+ },
+ "edge-ga-IE-ColmNeural": {
+  "engine": "edge",
+  "name": "ga-IE-ColmNeural",
+  "label": "Colm",
+  "free": false
+ },
+ "edge-ga-IE-OrlaNeural": {
+  "engine": "edge",
+  "name": "ga-IE-OrlaNeural",
+  "label": "Orla",
+  "free": false
+ },
+ "edge-gl-ES-RoiNeural": {
+  "engine": "edge",
+  "name": "gl-ES-RoiNeural",
+  "label": "Roi",
+  "free": false
+ },
+ "edge-gl-ES-SabelaNeural": {
+  "engine": "edge",
+  "name": "gl-ES-SabelaNeural",
+  "label": "Sabela",
+  "free": false
+ },
+ "edge-gu-IN-DhwaniNeural": {
+  "engine": "edge",
+  "name": "gu-IN-DhwaniNeural",
+  "label": "Dhwani",
+  "free": false
+ },
+ "edge-gu-IN-NiranjanNeural": {
+  "engine": "edge",
+  "name": "gu-IN-NiranjanNeural",
+  "label": "Niranjan",
+  "free": false
+ },
+ "edge-he-IL-AvriNeural": {
+  "engine": "edge",
+  "name": "he-IL-AvriNeural",
+  "label": "Avri",
+  "free": false
+ },
+ "edge-he-IL-HilaNeural": {
+  "engine": "edge",
+  "name": "he-IL-HilaNeural",
+  "label": "Hila",
+  "free": false
+ },
+ "edge-hi-IN-MadhurNeural": {
+  "engine": "edge",
+  "name": "hi-IN-MadhurNeural",
+  "label": "Madhur",
+  "free": false
+ },
+ "edge-hi-IN-SwaraNeural": {
+  "engine": "edge",
+  "name": "hi-IN-SwaraNeural",
+  "label": "Swara",
+  "free": false
+ },
+ "edge-hr-HR-GabrijelaNeural": {
+  "engine": "edge",
+  "name": "hr-HR-GabrijelaNeural",
+  "label": "Gabrijela",
+  "free": false
+ },
+ "edge-hr-HR-SreckoNeural": {
+  "engine": "edge",
+  "name": "hr-HR-SreckoNeural",
+  "label": "Srecko",
+  "free": false
+ },
+ "edge-hu-HU-NoemiNeural": {
+  "engine": "edge",
+  "name": "hu-HU-NoemiNeural",
+  "label": "Noemi",
+  "free": false
+ },
+ "edge-hu-HU-TamasNeural": {
+  "engine": "edge",
+  "name": "hu-HU-TamasNeural",
+  "label": "Tamas",
+  "free": false
+ },
+ "edge-id-ID-ArdiNeural": {
+  "engine": "edge",
+  "name": "id-ID-ArdiNeural",
+  "label": "Ardi",
+  "free": false
+ },
+ "edge-id-ID-GadisNeural": {
+  "engine": "edge",
+  "name": "id-ID-GadisNeural",
+  "label": "Gadis",
+  "free": false
+ },
+ "edge-is-IS-GudrunNeural": {
+  "engine": "edge",
+  "name": "is-IS-GudrunNeural",
+  "label": "Gudrun",
+  "free": false
+ },
+ "edge-is-IS-GunnarNeural": {
+  "engine": "edge",
+  "name": "is-IS-GunnarNeural",
+  "label": "Gunnar",
+  "free": false
+ },
+ "edge-it-IT-DiegoNeural": {
+  "engine": "edge",
+  "name": "it-IT-DiegoNeural",
+  "label": "Diego",
+  "free": false
+ },
+ "edge-it-IT-ElsaNeural": {
+  "engine": "edge",
+  "name": "it-IT-ElsaNeural",
+  "label": "Elsa",
+  "free": false
+ },
+ "edge-it-IT-GiuseppeMultilingualNeural": {
+  "engine": "edge",
+  "name": "it-IT-GiuseppeMultilingualNeural",
+  "label": "Giuseppe",
+  "free": false
+ },
+ "edge-it-IT-IsabellaNeural": {
+  "engine": "edge",
+  "name": "it-IT-IsabellaNeural",
+  "label": "Isabella",
+  "free": false
+ },
+ "edge-iu-Cans-CA-SiqiniqNeural": {
+  "engine": "edge",
+  "name": "iu-Cans-CA-SiqiniqNeural",
+  "label": "CA-Siqiniq",
+  "free": false
+ },
+ "edge-iu-Cans-CA-TaqqiqNeural": {
+  "engine": "edge",
+  "name": "iu-Cans-CA-TaqqiqNeural",
+  "label": "CA-Taqqiq",
+  "free": false
+ },
+ "edge-iu-Latn-CA-SiqiniqNeural": {
+  "engine": "edge",
+  "name": "iu-Latn-CA-SiqiniqNeural",
+  "label": "CA-Siqiniq",
+  "free": false
+ },
+ "edge-iu-Latn-CA-TaqqiqNeural": {
+  "engine": "edge",
+  "name": "iu-Latn-CA-TaqqiqNeural",
+  "label": "CA-Taqqiq",
+  "free": false
+ },
+ "edge-ja-JP-KeitaNeural": {
+  "engine": "edge",
+  "name": "ja-JP-KeitaNeural",
+  "label": "Keita",
+  "free": false
+ },
+ "edge-ja-JP-NanamiNeural": {
+  "engine": "edge",
+  "name": "ja-JP-NanamiNeural",
+  "label": "Nanami",
+  "free": false
+ },
+ "edge-jv-ID-DimasNeural": {
+  "engine": "edge",
+  "name": "jv-ID-DimasNeural",
+  "label": "Dimas",
+  "free": false
+ },
+ "edge-jv-ID-SitiNeural": {
+  "engine": "edge",
+  "name": "jv-ID-SitiNeural",
+  "label": "Siti",
+  "free": false
+ },
+ "edge-ka-GE-EkaNeural": {
+  "engine": "edge",
+  "name": "ka-GE-EkaNeural",
+  "label": "Eka",
+  "free": false
+ },
+ "edge-ka-GE-GiorgiNeural": {
+  "engine": "edge",
+  "name": "ka-GE-GiorgiNeural",
+  "label": "Giorgi",
+  "free": false
+ },
+ "edge-kk-KZ-AigulNeural": {
+  "engine": "edge",
+  "name": "kk-KZ-AigulNeural",
+  "label": "Aigul",
+  "free": false
+ },
+ "edge-kk-KZ-DauletNeural": {
+  "engine": "edge",
+  "name": "kk-KZ-DauletNeural",
+  "label": "Daulet",
+  "free": false
+ },
+ "edge-km-KH-PisethNeural": {
+  "engine": "edge",
+  "name": "km-KH-PisethNeural",
+  "label": "Piseth",
+  "free": false
+ },
+ "edge-km-KH-SreymomNeural": {
+  "engine": "edge",
+  "name": "km-KH-SreymomNeural",
+  "label": "Sreymom",
+  "free": false
+ },
+ "edge-kn-IN-GaganNeural": {
+  "engine": "edge",
+  "name": "kn-IN-GaganNeural",
+  "label": "Gagan",
+  "free": false
+ },
+ "edge-kn-IN-SapnaNeural": {
+  "engine": "edge",
+  "name": "kn-IN-SapnaNeural",
+  "label": "Sapna",
+  "free": false
+ },
+ "edge-ko-KR-HyunsuMultilingualNeural": {
+  "engine": "edge",
+  "name": "ko-KR-HyunsuMultilingualNeural",
+  "label": "Hyunsu",
+  "free": false
+ },
+ "edge-ko-KR-InJoonNeural": {
+  "engine": "edge",
+  "name": "ko-KR-InJoonNeural",
+  "label": "InJoon",
+  "free": false
+ },
+ "edge-ko-KR-SunHiNeural": {
+  "engine": "edge",
+  "name": "ko-KR-SunHiNeural",
+  "label": "SunHi",
+  "free": false
+ },
+ "edge-lo-LA-ChanthavongNeural": {
+  "engine": "edge",
+  "name": "lo-LA-ChanthavongNeural",
+  "label": "Chanthavong",
+  "free": false
+ },
+ "edge-lo-LA-KeomanyNeural": {
+  "engine": "edge",
+  "name": "lo-LA-KeomanyNeural",
+  "label": "Keomany",
+  "free": false
+ },
+ "edge-lt-LT-LeonasNeural": {
+  "engine": "edge",
+  "name": "lt-LT-LeonasNeural",
+  "label": "Leonas",
+  "free": false
+ },
+ "edge-lt-LT-OnaNeural": {
+  "engine": "edge",
+  "name": "lt-LT-OnaNeural",
+  "label": "Ona",
+  "free": false
+ },
+ "edge-lv-LV-EveritaNeural": {
+  "engine": "edge",
+  "name": "lv-LV-EveritaNeural",
+  "label": "Everita",
+  "free": false
+ },
+ "edge-lv-LV-NilsNeural": {
+  "engine": "edge",
+  "name": "lv-LV-NilsNeural",
+  "label": "Nils",
+  "free": false
+ },
+ "edge-mk-MK-AleksandarNeural": {
+  "engine": "edge",
+  "name": "mk-MK-AleksandarNeural",
+  "label": "Aleksandar",
+  "free": false
+ },
+ "edge-mk-MK-MarijaNeural": {
+  "engine": "edge",
+  "name": "mk-MK-MarijaNeural",
+  "label": "Marija",
+  "free": false
+ },
+ "edge-ml-IN-MidhunNeural": {
+  "engine": "edge",
+  "name": "ml-IN-MidhunNeural",
+  "label": "Midhun",
+  "free": false
+ },
+ "edge-ml-IN-SobhanaNeural": {
+  "engine": "edge",
+  "name": "ml-IN-SobhanaNeural",
+  "label": "Sobhana",
+  "free": false
+ },
+ "edge-mn-MN-BataaNeural": {
+  "engine": "edge",
+  "name": "mn-MN-BataaNeural",
+  "label": "Bataa",
+  "free": false
+ },
+ "edge-mn-MN-YesuiNeural": {
+  "engine": "edge",
+  "name": "mn-MN-YesuiNeural",
+  "label": "Yesui",
+  "free": false
+ },
+ "edge-mr-IN-AarohiNeural": {
+  "engine": "edge",
+  "name": "mr-IN-AarohiNeural",
+  "label": "Aarohi",
+  "free": false
+ },
+ "edge-mr-IN-ManoharNeural": {
+  "engine": "edge",
+  "name": "mr-IN-ManoharNeural",
+  "label": "Manohar",
+  "free": false
+ },
+ "edge-ms-MY-OsmanNeural": {
+  "engine": "edge",
+  "name": "ms-MY-OsmanNeural",
+  "label": "Osman",
+  "free": false
+ },
+ "edge-ms-MY-YasminNeural": {
+  "engine": "edge",
+  "name": "ms-MY-YasminNeural",
+  "label": "Yasmin",
+  "free": false
+ },
+ "edge-mt-MT-GraceNeural": {
+  "engine": "edge",
+  "name": "mt-MT-GraceNeural",
+  "label": "Grace",
+  "free": false
+ },
+ "edge-mt-MT-JosephNeural": {
+  "engine": "edge",
+  "name": "mt-MT-JosephNeural",
+  "label": "Joseph",
+  "free": false
+ },
+ "edge-my-MM-NilarNeural": {
+  "engine": "edge",
+  "name": "my-MM-NilarNeural",
+  "label": "Nilar",
+  "free": false
+ },
+ "edge-my-MM-ThihaNeural": {
+  "engine": "edge",
+  "name": "my-MM-ThihaNeural",
+  "label": "Thiha",
+  "free": false
+ },
+ "edge-nb-NO-FinnNeural": {
+  "engine": "edge",
+  "name": "nb-NO-FinnNeural",
+  "label": "Finn",
+  "free": false
+ },
+ "edge-nb-NO-PernilleNeural": {
+  "engine": "edge",
+  "name": "nb-NO-PernilleNeural",
+  "label": "Pernille",
+  "free": false
+ },
+ "edge-ne-NP-HemkalaNeural": {
+  "engine": "edge",
+  "name": "ne-NP-HemkalaNeural",
+  "label": "Hemkala",
+  "free": false
+ },
+ "edge-ne-NP-SagarNeural": {
+  "engine": "edge",
+  "name": "ne-NP-SagarNeural",
+  "label": "Sagar",
+  "free": false
+ },
+ "edge-nl-BE-ArnaudNeural": {
+  "engine": "edge",
+  "name": "nl-BE-ArnaudNeural",
+  "label": "Arnaud",
+  "free": false
+ },
+ "edge-nl-BE-DenaNeural": {
+  "engine": "edge",
+  "name": "nl-BE-DenaNeural",
+  "label": "Dena",
+  "free": false
+ },
+ "edge-nl-NL-ColetteNeural": {
+  "engine": "edge",
+  "name": "nl-NL-ColetteNeural",
+  "label": "Colette",
+  "free": false
+ },
+ "edge-nl-NL-FennaNeural": {
+  "engine": "edge",
+  "name": "nl-NL-FennaNeural",
+  "label": "Fenna",
+  "free": false
+ },
+ "edge-nl-NL-MaartenNeural": {
+  "engine": "edge",
+  "name": "nl-NL-MaartenNeural",
+  "label": "Maarten",
+  "free": false
+ },
+ "edge-pl-PL-MarekNeural": {
+  "engine": "edge",
+  "name": "pl-PL-MarekNeural",
+  "label": "Marek",
+  "free": false
+ },
+ "edge-pl-PL-ZofiaNeural": {
+  "engine": "edge",
+  "name": "pl-PL-ZofiaNeural",
+  "label": "Zofia",
+  "free": false
+ },
+ "edge-ps-AF-GulNawazNeural": {
+  "engine": "edge",
+  "name": "ps-AF-GulNawazNeural",
+  "label": "GulNawaz",
+  "free": false
+ },
+ "edge-ps-AF-LatifaNeural": {
+  "engine": "edge",
+  "name": "ps-AF-LatifaNeural",
+  "label": "Latifa",
+  "free": false
+ },
+ "edge-pt-BR-AntonioNeural": {
+  "engine": "edge",
+  "name": "pt-BR-AntonioNeural",
+  "label": "Antonio",
+  "free": false
+ },
+ "edge-pt-BR-FranciscaNeural": {
+  "engine": "edge",
+  "name": "pt-BR-FranciscaNeural",
+  "label": "Francisca",
+  "free": false
+ },
+ "edge-pt-BR-ThalitaMultilingualNeural": {
+  "engine": "edge",
+  "name": "pt-BR-ThalitaMultilingualNeural",
+  "label": "Thalita",
+  "free": false
+ },
+ "edge-pt-PT-DuarteNeural": {
+  "engine": "edge",
+  "name": "pt-PT-DuarteNeural",
+  "label": "Duarte",
+  "free": false
+ },
+ "edge-pt-PT-RaquelNeural": {
+  "engine": "edge",
+  "name": "pt-PT-RaquelNeural",
+  "label": "Raquel",
+  "free": false
+ },
+ "edge-ro-RO-AlinaNeural": {
+  "engine": "edge",
+  "name": "ro-RO-AlinaNeural",
+  "label": "Alina",
+  "free": false
+ },
+ "edge-ro-RO-EmilNeural": {
+  "engine": "edge",
+  "name": "ro-RO-EmilNeural",
+  "label": "Emil",
+  "free": false
+ },
+ "edge-ru-RU-DmitryNeural": {
+  "engine": "edge",
+  "name": "ru-RU-DmitryNeural",
+  "label": "Dmitry",
+  "free": false
+ },
+ "edge-ru-RU-SvetlanaNeural": {
+  "engine": "edge",
+  "name": "ru-RU-SvetlanaNeural",
+  "label": "Svetlana",
+  "free": false
+ },
+ "edge-si-LK-SameeraNeural": {
+  "engine": "edge",
+  "name": "si-LK-SameeraNeural",
+  "label": "Sameera",
+  "free": false
+ },
+ "edge-si-LK-ThiliniNeural": {
+  "engine": "edge",
+  "name": "si-LK-ThiliniNeural",
+  "label": "Thilini",
+  "free": false
+ },
+ "edge-sk-SK-LukasNeural": {
+  "engine": "edge",
+  "name": "sk-SK-LukasNeural",
+  "label": "Lukas",
+  "free": false
+ },
+ "edge-sk-SK-ViktoriaNeural": {
+  "engine": "edge",
+  "name": "sk-SK-ViktoriaNeural",
+  "label": "Viktoria",
+  "free": false
+ },
+ "edge-sl-SI-PetraNeural": {
+  "engine": "edge",
+  "name": "sl-SI-PetraNeural",
+  "label": "Petra",
+  "free": false
+ },
+ "edge-sl-SI-RokNeural": {
+  "engine": "edge",
+  "name": "sl-SI-RokNeural",
+  "label": "Rok",
+  "free": false
+ },
+ "edge-so-SO-MuuseNeural": {
+  "engine": "edge",
+  "name": "so-SO-MuuseNeural",
+  "label": "Muuse",
+  "free": false
+ },
+ "edge-so-SO-UbaxNeural": {
+  "engine": "edge",
+  "name": "so-SO-UbaxNeural",
+  "label": "Ubax",
+  "free": false
+ },
+ "edge-sq-AL-AnilaNeural": {
+  "engine": "edge",
+  "name": "sq-AL-AnilaNeural",
+  "label": "Anila",
+  "free": false
+ },
+ "edge-sq-AL-IlirNeural": {
+  "engine": "edge",
+  "name": "sq-AL-IlirNeural",
+  "label": "Ilir",
+  "free": false
+ },
+ "edge-sr-RS-NicholasNeural": {
+  "engine": "edge",
+  "name": "sr-RS-NicholasNeural",
+  "label": "Nicholas",
+  "free": false
+ },
+ "edge-sr-RS-SophieNeural": {
+  "engine": "edge",
+  "name": "sr-RS-SophieNeural",
+  "label": "Sophie",
+  "free": false
+ },
+ "edge-su-ID-JajangNeural": {
+  "engine": "edge",
+  "name": "su-ID-JajangNeural",
+  "label": "Jajang",
+  "free": false
+ },
+ "edge-su-ID-TutiNeural": {
+  "engine": "edge",
+  "name": "su-ID-TutiNeural",
+  "label": "Tuti",
+  "free": false
+ },
+ "edge-sv-SE-MattiasNeural": {
+  "engine": "edge",
+  "name": "sv-SE-MattiasNeural",
+  "label": "Mattias",
+  "free": false
+ },
+ "edge-sv-SE-SofieNeural": {
+  "engine": "edge",
+  "name": "sv-SE-SofieNeural",
+  "label": "Sofie",
+  "free": false
+ },
+ "edge-sw-KE-RafikiNeural": {
+  "engine": "edge",
+  "name": "sw-KE-RafikiNeural",
+  "label": "Rafiki",
+  "free": false
+ },
+ "edge-sw-KE-ZuriNeural": {
+  "engine": "edge",
+  "name": "sw-KE-ZuriNeural",
+  "label": "Zuri",
+  "free": false
+ },
+ "edge-sw-TZ-DaudiNeural": {
+  "engine": "edge",
+  "name": "sw-TZ-DaudiNeural",
+  "label": "Daudi",
+  "free": false
+ },
+ "edge-sw-TZ-RehemaNeural": {
+  "engine": "edge",
+  "name": "sw-TZ-RehemaNeural",
+  "label": "Rehema",
+  "free": false
+ },
+ "edge-ta-IN-PallaviNeural": {
+  "engine": "edge",
+  "name": "ta-IN-PallaviNeural",
+  "label": "Pallavi",
+  "free": false
+ },
+ "edge-ta-IN-ValluvarNeural": {
+  "engine": "edge",
+  "name": "ta-IN-ValluvarNeural",
+  "label": "Valluvar",
+  "free": false
+ },
+ "edge-ta-LK-KumarNeural": {
+  "engine": "edge",
+  "name": "ta-LK-KumarNeural",
+  "label": "Kumar",
+  "free": false
+ },
+ "edge-ta-LK-SaranyaNeural": {
+  "engine": "edge",
+  "name": "ta-LK-SaranyaNeural",
+  "label": "Saranya",
+  "free": false
+ },
+ "edge-ta-MY-KaniNeural": {
+  "engine": "edge",
+  "name": "ta-MY-KaniNeural",
+  "label": "Kani",
+  "free": false
+ },
+ "edge-ta-MY-SuryaNeural": {
+  "engine": "edge",
+  "name": "ta-MY-SuryaNeural",
+  "label": "Surya",
+  "free": false
+ },
+ "edge-ta-SG-AnbuNeural": {
+  "engine": "edge",
+  "name": "ta-SG-AnbuNeural",
+  "label": "Anbu",
+  "free": false
+ },
+ "edge-ta-SG-VenbaNeural": {
+  "engine": "edge",
+  "name": "ta-SG-VenbaNeural",
+  "label": "Venba",
+  "free": false
+ },
+ "edge-te-IN-MohanNeural": {
+  "engine": "edge",
+  "name": "te-IN-MohanNeural",
+  "label": "Mohan",
+  "free": false
+ },
+ "edge-te-IN-ShrutiNeural": {
+  "engine": "edge",
+  "name": "te-IN-ShrutiNeural",
+  "label": "Shruti",
+  "free": false
+ },
+ "edge-th-TH-NiwatNeural": {
+  "engine": "edge",
+  "name": "th-TH-NiwatNeural",
+  "label": "Niwat",
+  "free": false
+ },
+ "edge-th-TH-PremwadeeNeural": {
+  "engine": "edge",
+  "name": "th-TH-PremwadeeNeural",
+  "label": "Premwadee",
+  "free": false
+ },
+ "edge-tr-TR-AhmetNeural": {
+  "engine": "edge",
+  "name": "tr-TR-AhmetNeural",
+  "label": "Ahmet",
+  "free": false
+ },
+ "edge-tr-TR-EmelNeural": {
+  "engine": "edge",
+  "name": "tr-TR-EmelNeural",
+  "label": "Emel",
+  "free": false
+ },
+ "edge-uk-UA-OstapNeural": {
+  "engine": "edge",
+  "name": "uk-UA-OstapNeural",
+  "label": "Ostap",
+  "free": false
+ },
+ "edge-uk-UA-PolinaNeural": {
+  "engine": "edge",
+  "name": "uk-UA-PolinaNeural",
+  "label": "Polina",
+  "free": false
+ },
+ "edge-ur-IN-GulNeural": {
+  "engine": "edge",
+  "name": "ur-IN-GulNeural",
+  "label": "Gul",
+  "free": false
+ },
+ "edge-ur-IN-SalmanNeural": {
+  "engine": "edge",
+  "name": "ur-IN-SalmanNeural",
+  "label": "Salman",
+  "free": false
+ },
+ "edge-ur-PK-AsadNeural": {
+  "engine": "edge",
+  "name": "ur-PK-AsadNeural",
+  "label": "Asad",
+  "free": false
+ },
+ "edge-ur-PK-UzmaNeural": {
+  "engine": "edge",
+  "name": "ur-PK-UzmaNeural",
+  "label": "Uzma",
+  "free": false
+ },
+ "edge-uz-UZ-MadinaNeural": {
+  "engine": "edge",
+  "name": "uz-UZ-MadinaNeural",
+  "label": "Madina",
+  "free": false
+ },
+ "edge-uz-UZ-SardorNeural": {
+  "engine": "edge",
+  "name": "uz-UZ-SardorNeural",
+  "label": "Sardor",
+  "free": false
+ },
+ "edge-vi-VN-HoaiMyNeural": {
+  "engine": "edge",
+  "name": "vi-VN-HoaiMyNeural",
+  "label": "HoaiMy",
+  "free": false
+ },
+ "edge-vi-VN-NamMinhNeural": {
+  "engine": "edge",
+  "name": "vi-VN-NamMinhNeural",
+  "label": "NamMinh",
+  "free": false
+ },
+ "edge-zh-CN-XiaoxiaoNeural": {
+  "engine": "edge",
+  "name": "zh-CN-XiaoxiaoNeural",
+  "label": "Xiaoxiao",
+  "free": false
+ },
+ "edge-zh-CN-XiaoyiNeural": {
+  "engine": "edge",
+  "name": "zh-CN-XiaoyiNeural",
+  "label": "Xiaoyi",
+  "free": false
+ },
+ "edge-zh-CN-YunjianNeural": {
+  "engine": "edge",
+  "name": "zh-CN-YunjianNeural",
+  "label": "Yunjian",
+  "free": false
+ },
+ "edge-zh-CN-YunxiNeural": {
+  "engine": "edge",
+  "name": "zh-CN-YunxiNeural",
+  "label": "Yunxi",
+  "free": false
+ },
+ "edge-zh-CN-YunxiaNeural": {
+  "engine": "edge",
+  "name": "zh-CN-YunxiaNeural",
+  "label": "Yunxia",
+  "free": false
+ },
+ "edge-zh-CN-YunyangNeural": {
+  "engine": "edge",
+  "name": "zh-CN-YunyangNeural",
+  "label": "Yunyang",
+  "free": false
+ },
+ "edge-zh-CN-liaoning-XiaobeiNeural": {
+  "engine": "edge",
+  "name": "zh-CN-liaoning-XiaobeiNeural",
+  "label": "liaoning-Xiaobei",
+  "free": false
+ },
+ "edge-zh-CN-shaanxi-XiaoniNeural": {
+  "engine": "edge",
+  "name": "zh-CN-shaanxi-XiaoniNeural",
+  "label": "shaanxi-Xiaoni",
+  "free": false
+ },
+ "edge-zh-HK-HiuGaaiNeural": {
+  "engine": "edge",
+  "name": "zh-HK-HiuGaaiNeural",
+  "label": "HiuGaai",
+  "free": false
+ },
+ "edge-zh-HK-HiuMaanNeural": {
+  "engine": "edge",
+  "name": "zh-HK-HiuMaanNeural",
+  "label": "HiuMaan",
+  "free": false
+ },
+ "edge-zh-HK-WanLungNeural": {
+  "engine": "edge",
+  "name": "zh-HK-WanLungNeural",
+  "label": "WanLung",
+  "free": false
+ },
+ "edge-zh-TW-HsiaoChenNeural": {
+  "engine": "edge",
+  "name": "zh-TW-HsiaoChenNeural",
+  "label": "HsiaoChen",
+  "free": false
+ },
+ "edge-zh-TW-HsiaoYuNeural": {
+  "engine": "edge",
+  "name": "zh-TW-HsiaoYuNeural",
+  "label": "HsiaoYu",
+  "free": false
+ },
+ "edge-zh-TW-YunJheNeural": {
+  "engine": "edge",
+  "name": "zh-TW-YunJheNeural",
+  "label": "YunJhe",
+  "free": false
+ },
+ "edge-zu-ZA-ThandoNeural": {
+  "engine": "edge",
+  "name": "zu-ZA-ThandoNeural",
+  "label": "Thando",
+  "free": false
+ },
+ "edge-zu-ZA-ThembaNeural": {
+  "engine": "edge",
+  "name": "zu-ZA-ThembaNeural",
+  "label": "Themba",
+  "free": false
+ }
+}
