@@ -1223,30 +1223,6 @@
   "label": "Isabella",
   "free": false
  },
- "edge-iu-Cans-CA-SiqiniqNeural": {
-  "engine": "edge",
-  "name": "iu-Cans-CA-SiqiniqNeural",
-  "label": "CA-Siqiniq",
-  "free": false
- },
- "edge-iu-Cans-CA-TaqqiqNeural": {
-  "engine": "edge",
-  "name": "iu-Cans-CA-TaqqiqNeural",
-  "label": "CA-Taqqiq",
-  "free": false
- },
- "edge-iu-Latn-CA-SiqiniqNeural": {
-  "engine": "edge",
-  "name": "iu-Latn-CA-SiqiniqNeural",
-  "label": "CA-Siqiniq",
-  "free": false
- },
- "edge-iu-Latn-CA-TaqqiqNeural": {
-  "engine": "edge",
-  "name": "iu-Latn-CA-TaqqiqNeural",
-  "label": "CA-Taqqiq",
-  "free": false
- },
  "edge-ja-JP-KeitaNeural": {
   "engine": "edge",
   "name": "ja-JP-KeitaNeural",
