@@ -2858,6 +2858,46 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       const spd = Number.isFinite(rawSpeed) && rawSpeed > 0 ? Math.max(0.1, Math.min(10, rawSpeed)) : 1;
       const speedVf = spd !== 1 ? `,setpts=${(1 / spd).toFixed(6)}*PTS` : '';
 
+      // --- Free, ffmpeg-native clip tools -------------------------------------
+      // Each is a plain filter this build already ships (verified with
+      // `ffmpeg -filters`), so they cost CPU and nothing else - no model, no API,
+      // no per-use fee. Stills are excluded: there is nothing in a single frame to
+      // reverse, denoise or blur across time.
+      const isVideo = item.type !== "image";
+      const wantsReverse = isVideo && item.reverse === true;
+      const wantsDenoise = isVideo && item.denoise === true;
+      const wantsMotionBlur = isVideo && item.motionBlur === true;
+
+      // reverse is the one that cannot simply be switched on: it holds every
+      // decoded frame of the clip in memory at once, because the last frame has to
+      // be written first. At the 720x1280 this chain has already scaled to, that is
+      // ~1.4MB a frame, so 15s at 30fps is roughly 620MB - for one clip, and up to
+      // four renders now run concurrently. Refused past the cap rather than left to
+      // find the OOM killer, and the message says the number so it is actionable.
+      const REVERSE_MAX_SECONDS = 15;
+      if (wantsReverse) {
+        const ss0 = Number(item.trimStart) > 0 ? Number(item.trimStart) : 0;
+        const te0 = Number(item.trimEnd) > ss0 ? Number(item.trimEnd) : null;
+        const span0 = te0 !== null ? te0 - ss0 : Number(item.duration) || 0;
+        if (span0 > REVERSE_MAX_SECONDS) {
+          throw new Error(`Reverse works on clips up to ${REVERSE_MAX_SECONDS} seconds. Trim this clip shorter and try again.`);
+        }
+      }
+
+      // Order matters. reverse before setpts, so speed applies to the reversed clip
+      // rather than the other way round; motion blur last, so it blends the frames
+      // that will actually be shown.
+      const extraVf =
+        (wantsReverse ? ',reverse' : '') +
+        (wantsMotionBlur ? ',tmix=frames=3' : '');
+      // afftdn is a spectral denoiser - it lifts hiss and room tone off a phone
+      // voiceover, which is the case this exists for. areverse mirrors the video.
+      const extraAfPre = (wantsReverse ? ['areverse'] : []).concat(wantsDenoise ? ['afftdn'] : []);
+
+      // reverse decodes the whole clip and tmix blends every frame, so both are far
+      // slower than the plain copy this timeout was sized for.
+      const clipTimeoutMs = (wantsReverse || wantsMotionBlur) ? 180000 : 60000;
+
       let cmd;
       if (item.type === "image") {
         // A still is held for as long as the timeline holds it. Three seconds was
@@ -2886,14 +2926,14 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
           // same voice. The preview is told to correct pitch too (shouldCorrectPitch),
           // because the two have to agree - expo-av left to its default shifts pitch
           // with rate, and the export would then not sound like what was auditioned.
-          const af = ['volume=' + clipVol].concat(spd !== 1 ? atempoChain(spd) : []).join(',');
-          cmd = `ffmpeg -y ${inSpec} -vf "${vf}${speedVf}" -af "${af}" -pix_fmt yuv420p -r 30 -c:a aac "${clipOut}"`;
+          const af = ['volume=' + clipVol].concat(extraAfPre).concat(spd !== 1 ? atempoChain(spd) : []).join(',');
+          cmd = `ffmpeg -y ${inSpec} -vf "${vf}${extraVf}${speedVf}" -af "${af}" -pix_fmt yuv420p -r 30 -c:a aac "${clipOut}"`;
         } else {
-          cmd = `ffmpeg -y ${inSpec} ${SILENCE_IN} -vf "${vf}${speedVf}" -pix_fmt yuv420p -r 30 -map 0:v:0 -map 1:a:0 -c:a aac -shortest "${clipOut}"`;
+          cmd = `ffmpeg -y ${inSpec} ${SILENCE_IN} -vf "${vf}${extraVf}${speedVf}" -pix_fmt yuv420p -r 30 -map 0:v:0 -map 1:a:0 -c:a aac -shortest "${clipOut}"`;
         }
       }
       await new Promise((resolve, reject) => {
-        exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+        exec(cmd, { timeout: clipTimeoutMs }, (err, stdout, stderr) => {
           if (err) { console.error("Clip prep error:", stderr?.slice(-300)); return reject(new Error("Clip prep failed")); }
           resolve();
         });
