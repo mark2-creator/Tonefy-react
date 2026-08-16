@@ -334,13 +334,54 @@ async function callLLM({ system, user, max_tokens = 400, temperature = 0.8 }) {
 const jobs = new Map();
 const JOBS_FILE = path.join(__dirname, "jobs.json");
 
-function saveJobsToDisk() {
+// This used to be a synchronous whole-file write on *every* updateJob call,
+// and updateJob is called once per overlay now that the export reports
+// per-overlay progress - so a 391-overlay render performed 391 blocking
+// rewrites of the entire job store, on the single thread that serves every
+// HTTP request for every user. The cost is (number of jobs stored) x (progress
+// ticks per render), which is fine at 37 jobs and is exactly the shape that
+// stops being fine as the store grows.
+//
+// Coalesced instead: a write is scheduled rather than performed, at most one
+// per SAVE_INTERVAL_MS however many updates arrive, and anything that must not
+// be lost asks for a flush. Also written via a temp file and renamed, which
+// the old version did not do - a crash partway through writeFileSync leaves a
+// truncated jobs.json, and truncated JSON fails to parse, which loses every
+// job rather than the one being written.
+const SAVE_INTERVAL_MS = 1000;
+let saveTimer = null;
+let savePending = false;
+
+function writeJobsNow() {
   try {
-    const obj = Object.fromEntries(jobs);
-    fs.writeFileSync(JOBS_FILE, JSON.stringify(obj));
+    const tmp = `${JOBS_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(jobs)));
+    fs.renameSync(tmp, JOBS_FILE);
   } catch (e) {
     console.error("Failed to save jobs.json:", e.message);
   }
+}
+
+// flush: for job creation and terminal states, where losing the write to a
+// crash in the next second would strand a caller polling for a result that
+// the store no longer admits exists.
+function saveJobsToDisk({ flush = false } = {}) {
+  if (flush) {
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    savePending = false;
+    return writeJobsNow();
+  }
+  savePending = true;
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    if (savePending) { savePending = false; writeJobsNow(); }
+  }, SAVE_INTERVAL_MS);
+}
+
+// A coalesced write can still be in flight when the process is asked to stop.
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => { if (savePending) writeJobsNow(); process.exit(0); });
 }
 
 function loadJobsFromDisk() {
@@ -369,13 +410,16 @@ loadJobsFromDisk();
 function createJob(userId) {
   const jobId = uuidv4();
   jobs.set(jobId, { status: 'pending', progress: 0, message: 'Starting...', userId });
-  saveJobsToDisk();
+  saveJobsToDisk({ flush: true });
   return jobId;
 }
 function updateJob(jobId, data) {
   if (jobs.has(jobId)) {
     jobs.set(jobId, { ...jobs.get(jobId), ...data });
-    saveJobsToDisk();
+    // Progress ticks are coalesced; a finished or failed job is written at
+    // once, since that is the state a caller is waiting on.
+    const terminal = data.status === 'done' || data.status === 'failed' || data.status === 'error';
+    saveJobsToDisk({ flush: terminal });
   }
 }
 
@@ -2331,6 +2375,21 @@ app.post('/api/edit-video', renderLimiter, async (req, res) => {
   const jobId = createJob(req.user.uid);
   res.json({ jobId });
 
+  // Queue behind the same 4-slot limiter idea-to-video-v2 has always used. Until
+  // now this path had none: ten simultaneous exports all started at once, each
+  // spawning ffmpeg plus up to 6 parallel ImageMagick processes on a 6-core box,
+  // so every one of them ran roughly ten times slower. That is a worse failure
+  // than queuing - a single slow export has already been mistaken for a hang here
+  // and triggered an Android ANR - and it degrades every user at once rather than
+  // making the last arrival wait.
+  //
+  // Acquired after res.json so the caller already holds its jobId and polls
+  // normally while queued, and released in a finally: an early return or a throw
+  // that skipped it would leak a slot permanently, and four leaked slots stop
+  // every render on the server for good.
+  updateJob(jobId, { message: 'Waiting for a free render slot...' });
+  await acquireVideoSlot(allowed.tier.queuePriority > 0);
+
   try {
     updateJob(jobId, { progress: 5, message: "Loading video..." });
 
@@ -2412,6 +2471,8 @@ app.post('/api/edit-video', renderLimiter, async (req, res) => {
   } catch (e) {
     console.error("Edit video error:", e.message);
     updateJob(jobId, { status: 'error', error: e.message });
+  } finally {
+    releaseVideoSlot();
   }
 });
 
@@ -2737,6 +2798,21 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
 
   const jobId = createJob(req.user.uid);
   res.json({ jobId });
+
+  // Queue behind the same 4-slot limiter idea-to-video-v2 has always used. Until
+  // now this path had none: ten simultaneous exports all started at once, each
+  // spawning ffmpeg plus up to 6 parallel ImageMagick processes on a 6-core box,
+  // so every one of them ran roughly ten times slower. That is a worse failure
+  // than queuing - a single slow export has already been mistaken for a hang here
+  // and triggered an Android ANR - and it degrades every user at once rather than
+  // making the last arrival wait.
+  //
+  // Acquired after res.json so the caller already holds its jobId and polls
+  // normally while queued, and released in a finally: an early return or a throw
+  // that skipped it would leak a slot permanently, and four leaked slots stop
+  // every render on the server for good.
+  updateJob(jobId, { message: 'Waiting for a free render slot...' });
+  await acquireVideoSlot(allowed.tier.queuePriority > 0);
 
   try {
     updateJob(jobId, { progress: 5, message: "Preparing clips..." });
@@ -3679,6 +3755,8 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
   } catch (e) {
     console.error("Media-to-video error:", e.message);
     updateJob(jobId, { status: 'error', error: e.message });
+  } finally {
+    releaseVideoSlot();
   }
 });
 
