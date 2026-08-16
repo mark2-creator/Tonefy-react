@@ -541,6 +541,17 @@ app.use("/stickers", express.static(path.join(__dirname, "public", "stickers"), 
 app.use("/filters", express.static(path.join(__dirname, "public", "filters"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/transitions", express.static(path.join(__dirname, "public", "transitions"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/music", express.static(path.join(__dirname, "public", "music"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
+// Voice previews, generated once by scripts/generate-voice-previews.py and then never
+// again. Each is a fixed line in a fixed voice, so the file for a given voice can never
+// change - a year is safe, and the point is that tapping play is instant instead of
+// waiting on a TTS round trip.
+//
+// Static and outside /api on purpose, so it needs no token and no plan check: hearing a
+// locked voice is how someone decides an upgrade is worth it, and a static mp3 is not a
+// generation to be metered. It also keeps 325 previews off the render slots entirely.
+//
+// Not swept: cleanupOldFiles only walks videosDir and audiosDir. These are assets.
+app.use("/previews", express.static(path.join(__dirname, "public", "previews"), { maxAge: "365d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 
 function trackIdToDisplayName(id) {
   return id
