@@ -43,7 +43,14 @@ export const FREE_VOICES = ['gtts-us', 'gtts-uk', 'gtts-au'];
 
 export const TIERS = {
   free: {
-    creditsPerCycle: 5,
+    // 10, so that five 2-minute videos fit exactly. A credit is one *started
+    // minute*, not one video, so "5 credits" bought two videos at the 2-minute
+    // cap - which is not what a free tier promising five videos should do, and
+    // not what the Profile screen's "0 of 5 this month" reads as either.
+    // Deliberately expressed as the credits the per-minute model needs rather
+    // than by making free a special case that counts videos: one accounting
+    // model across all three tiers is worth more than a tidier number here.
+    creditsPerCycle: 10,
     // 2 minutes, not 1. At 1 minute a free user could not export anything at all
     // from Idea-to-Video, the app's own headline flow: the script generator is
     // asked for "30-60 second" scripts, and 30-60 seconds of written narration
