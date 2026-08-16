@@ -675,6 +675,144 @@ app.post("/api/transcribe-voiceover", verifyToken, mediaProcLimiter, async (req,
   }
 });
 
+// Video Translator. Every stage of this already runs on this box and costs
+// nothing: faster_whisper transcribes, Groq translates, edge-tts speaks. The
+// only new thing is the wiring.
+//
+// Voice names are not guessed - each was taken from edge_tts.list_voices() on
+// this machine, so none of them can fail at runtime as an unknown voice. Female
+// voices throughout only because picking one per language keeps this a language
+// choice rather than a language-and-voice choice; a voice picker is a later
+// question.
+const TRANSLATE_LANGS = {
+  en: { label: "English",    voice: "en-US-AvaNeural" },
+  es: { label: "Spanish",    voice: "es-ES-XimenaNeural" },
+  fr: { label: "French",     voice: "fr-FR-VivienneMultilingualNeural" },
+  de: { label: "German",     voice: "de-DE-SeraphinaMultilingualNeural" },
+  pt: { label: "Portuguese", voice: "pt-BR-ThalitaMultilingualNeural" },
+  it: { label: "Italian",    voice: "it-IT-ElsaNeural" },
+  hi: { label: "Hindi",      voice: "hi-IN-SwaraNeural" },
+  ar: { label: "Arabic",     voice: "ar-EG-SalmaNeural" },
+  sw: { label: "Swahili",    voice: "sw-KE-ZuriNeural" },
+  zh: { label: "Chinese",    voice: "zh-CN-XiaoxiaoNeural" },
+  ja: { label: "Japanese",   voice: "ja-JP-NanamiNeural" },
+  ko: { label: "Korean",     voice: "ko-KR-SunHiNeural" },
+  ru: { label: "Russian",    voice: "ru-RU-SvetlanaNeural" },
+  tr: { label: "Turkish",    voice: "tr-TR-EmelNeural" },
+};
+
+// Whisper is the slow stage and scales with length, and this endpoint answers
+// synchronously rather than handing back a jobId, so the input has to be bounded
+// or a long clip holds the request open until something upstream gives up.
+const TRANSLATE_MAX_SECONDS = 300;
+
+app.get("/api/translate-languages", mediaProcLimiter, (req, res) => {
+  res.json({ languages: Object.entries(TRANSLATE_LANGS).map(([code, v]) => ({ code, label: v.label })) });
+});
+
+// Answers with a jobId rather than the result. Whisper is slower than realtime on
+// this box - 74s of audio did not finish inside two minutes - so a five-minute clip
+// is ten-plus minutes of work, which would sit past nginx's 600s proxy_read_timeout
+// and past any patience the caller has. The app already polls /api/job/:jobId for
+// renders, so this reuses that rather than inventing a second waiting mechanism.
+app.post("/api/translate-video", verifyToken, mediaProcLimiter, async (req, res) => {
+  const { url, targetLang } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url required" });
+  const lang = TRANSLATE_LANGS[targetLang];
+  if (!lang) return res.status(400).json({ error: "Unsupported language." });
+
+  // A paid feature, checked here and not only in the app - the toolbar entry is
+  // premium: true, and the app's gate is a convenience, not the enforcement.
+  const { plan } = await getUserPlanData(adminDb, req.user?.uid);
+  if (plan === "free") {
+    return res.status(403).json({ error: "Translating a video is available on the Pro and Creator plans." });
+  }
+
+  const jobId = createJob(req.user.uid);
+  res.json({ jobId });
+
+  // Whisper is as CPU-hungry as a render and would otherwise compete with them
+  // unbounded, so it queues in the same 4 slots. Released in a finally for the same
+  // reason the render paths are - a leaked slot never comes back.
+  updateJob(jobId, { message: "Waiting for a free slot..." });
+  await acquireVideoSlot(tierConfig(plan).queuePriority > 0);
+
+  const scratch = [];
+  try {
+    updateJob(jobId, { progress: 5, message: "Loading clip..." });
+    let srcPath;
+    if (url.startsWith("http")) {
+      srcPath = path.join(uploadsDir, uniqueName("translatesrc", "mp4"));
+      await downloadToFile(url, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+      scratch.push(srcPath);
+    } else {
+      srcPath = resolveMediaPath(url);
+    }
+    if (!fs.existsSync(srcPath)) throw new Error("That clip could not be found on the server.");
+
+    const durationSeconds = await probeDurationSeconds(srcPath).catch(() => 0);
+    if (durationSeconds > TRANSLATE_MAX_SECONDS) {
+      throw new Error(`Translation works on clips up to ${Math.round(TRANSLATE_MAX_SECONDS / 60)} minutes. This one is about ${Math.max(1, Math.round(durationSeconds / 60))}.`);
+    }
+
+    // 16kHz mono is what whisper resamples to anyway, so handing it that directly is
+    // less work for it and a far smaller file than the source.
+    updateJob(jobId, { progress: 15, message: "Extracting audio..." });
+    const audioPath = path.join(uploadsDir, uniqueName("translateaud", "mp3"));
+    scratch.push(audioPath);
+    await run("ffmpeg", ["-y", "-i", srcPath, "-vn", "-ac", "1", "-ar", "16000", audioPath], { timeout: 120000 });
+
+    updateJob(jobId, { progress: 30, message: "Listening to the speech..." });
+    const words = await new Promise((resolve) => {
+      execFile("python3", ["/home/ahumuza/Tonefy-react/backend/whisper_align.py", audioPath],
+        { timeout: 900000 }, (err, stdout) => {
+          if (err || !stdout.trim()) return resolve(null);
+          try { resolve(JSON.parse(stdout.trim())); } catch (e) { resolve(null); }
+        });
+    });
+    if (!words || !words.length) throw new Error("No speech was found in this clip.");
+
+    const sourceText = words.map(w => w.word ?? w.text ?? "").join(" ").replace(/\s+/g, " ").trim();
+    if (!sourceText) throw new Error("No speech was found in this clip.");
+
+    updateJob(jobId, { progress: 60, message: `Translating to ${lang.label}...` });
+    const translated = (await callLLM({
+      system: `You are a translator. Translate the user's text into ${lang.label}. Reply with ONLY the translation - no preamble, no notes, no quotation marks, no explanation. Preserve the tone and keep it natural to speak aloud.`,
+      user: sourceText,
+      // Translations run longer than the 400-token default this helper assumes, and a
+      // truncated one would be read aloud as though it were the whole script. Some
+      // languages also tokenize far less efficiently than English.
+      max_tokens: 2000,
+      // Near-zero: this is a translation, not a piece of writing. The helper's 0.8
+      // default is tuned for generating scripts.
+      temperature: 0.2,
+    }) || "").trim();
+    if (!translated) throw new Error("The translation service did not respond. Please try again.");
+
+    updateJob(jobId, { progress: 80, message: `Speaking ${lang.label}...` });
+    const outName = uniqueName("translated", "mp3");
+    const outPath = path.join(audiosDir, outName);
+    await run("python3", ["/home/ahumuza/Tonefy-react/backend/edge_tts_generate.py", translated, outPath, lang.voice], { timeout: 300000 });
+
+    const spokenSeconds = await probeDurationSeconds(outPath).catch(() => 0);
+    updateJob(jobId, {
+      status: "done", progress: 100, message: "Translation ready!",
+      audioUrl: `/audios/${outName}`,
+      language: targetLang,
+      languageLabel: lang.label,
+      sourceText,
+      translatedText: translated,
+      durationSeconds: spokenSeconds,
+    });
+  } catch (e) {
+    console.error("translate-video error:", e.message);
+    updateJob(jobId, { status: "error", error: e.message });
+  } finally {
+    for (const f of scratch) { try { fs.unlinkSync(f); } catch (er) {} }
+    releaseVideoSlot();
+  }
+});
+
 app.use(express.urlencoded({ extended: true }));
 // The mobile app never sends an Origin header at all (CORS is a browser
 // mechanism; native fetch doesn't set one), so this only ever matters for
