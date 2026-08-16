@@ -11,7 +11,7 @@ import dotenv from "dotenv";
 dotenv.config();
 import cors from "cors";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { v4 as uuidv4 } from "uuid";
 import Groq from "groq-sdk";
 import { google } from "googleapis";
@@ -138,6 +138,102 @@ const verifyToken = async (req, res, next) => {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
+
+// Every limiter below shares this key. Two reasons it is not the default.
+//
+// 1. nginx in front of this app sets X-Real-IP but NOT X-Forwarded-For (see
+//    /etc/nginx/sites-available/api.fitlifesolutions.site - it sets headers
+//    inline and never includes proxy_params, unlike the other sites on this
+//    box). Express derives req.ip from X-Forwarded-For, so with that header
+//    absent req.ip is the socket address - 127.0.0.1 - for every request that
+//    has ever hit this server. Every limit here was therefore one shared
+//    bucket across all users at once: 500 requests per 15 minutes for the
+//    entire world, and any one caller able to lock out everybody else. That is
+//    also what `validate: { xForwardedForHeader: false }` was silencing.
+// 2. This is an authenticated API. Keying by the account is strictly better
+//    than keying by address anyway - it survives a phone moving between wifi
+//    and mobile data, and it does not lump a whole NAT or campus behind one
+//    counter.
+//
+// Falls back to X-Real-IP for the routes that run before verifyToken.
+// ipKeyGenerator is required rather than optional: it collapses IPv6 to a /56,
+// without which a single client can walk its own address space for a fresh
+// bucket per request.
+const limitKey = (req) => {
+  if (req.user?.uid) return `u:${req.user.uid}`;
+  const real = req.headers["x-real-ip"];
+  return ipKeyGenerator(typeof real === "string" && real ? real : req.ip);
+};
+
+// Strict limit for video generation (expensive: Groq + ElevenLabs + FFmpeg)
+const videoGenLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: { error: 'Video generation limit reached. Max 20 per hour.' },
+  keyGenerator: limitKey,
+  validate: { xForwardedForHeader: false }
+});
+
+// Script/audio generation limit
+const scriptLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: { error: 'Too many requests. Max 20 per hour.' },
+  keyGenerator: limitKey,
+  validate: { xForwardedForHeader: false }
+});
+
+// Pexels search limit
+const pexelsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { error: 'Too many search requests. Max 30 per 15 minutes.' },
+  keyGenerator: limitKey,
+  validate: { xForwardedForHeader: false }
+});
+
+// The editor's own export path. Credits are the real limit on how much anyone
+// can render - this is abuse protection sitting above that, for the case where
+// something retries in a loop, so it is deliberately far looser than a
+// plausible session of real work.
+const renderLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 40,
+  message: { error: 'Too many exports in a short time. Please wait a few minutes.' },
+  keyGenerator: limitKey,
+  validate: { xForwardedForHeader: false }
+});
+
+// Uploads are not credit-gated at all, so this is the only ceiling on them.
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 100,
+  message: { error: 'Too many uploads in a short time. Please wait a few minutes.' },
+  keyGenerator: limitKey,
+  validate: { xForwardedForHeader: false }
+});
+
+// ffmpeg and faster_whisper both shell out and are CPU-bound on a box that is
+// also serving the website and other pm2 processes.
+const mediaProcLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 60,
+  message: { error: 'Too many media processing requests. Please wait a few minutes.' },
+  keyGenerator: limitKey,
+  validate: { xForwardedForHeader: false }
+});
+
+// Sends real mail through a Gmail account with its own daily cap. Burning that
+// cap does not degrade one feature, it stops every new signup from being able
+// to verify at all, so this is the tightest limit here.
+const emailLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many verification emails requested. Please wait before trying again.' },
+  keyGenerator: limitKey,
+  validate: { xForwardedForHeader: false }
+});
+
 
 const PEXELS_API_KEY = process.env.PEXELS_API_KEY;
 if (!process.env.GROQ_API_KEY) throw new Error("GROQ_API_KEY not set in .env");
@@ -386,7 +482,7 @@ function trackIdToDisplayName(id) {
     .replace(/\b\w/g, c => c.toUpperCase());
 }
 
-app.get("/api/music-tracks", (req, res) => {
+app.get("/api/music-tracks", mediaProcLimiter, (req, res) => {
   try {
     const musicDir = path.join(__dirname, "public", "music");
     const files = fs.readdirSync(musicDir).filter(f => f.endsWith(".mp3"));
@@ -412,7 +508,7 @@ app.set("trust proxy", 1);
 app.use(helmet());
 app.use(express.json({ limit: "10mb" }));
 
-app.post("/api/audio-waveform", verifyToken, async (req, res) => {
+app.post("/api/audio-waveform", verifyToken, mediaProcLimiter, async (req, res) => {
   const { url, samples = 80 } = req.body || {};
   if (!url) return res.status(400).json({ error: "url required" });
   // Declared outside the try so the finally block below can clean them up
@@ -475,7 +571,7 @@ app.post("/api/audio-waveform", verifyToken, async (req, res) => {
   }
 });
 
-app.post("/api/transcribe-voiceover", verifyToken, async (req, res) => {
+app.post("/api/transcribe-voiceover", verifyToken, mediaProcLimiter, async (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ error: "url required" });
   try {
@@ -529,32 +625,9 @@ app.use(rateLimit({
   max: 500,
   message: { error: 'Too many requests, please try again later.' },
   skip: (req) => req.path.startsWith('/api/job/'),
+  keyGenerator: limitKey,
   validate: { xForwardedForHeader: false }
 }));
-
-// Strict limit for video generation (expensive: Groq + ElevenLabs + FFmpeg)
-const videoGenLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 20,
-  message: { error: 'Video generation limit reached. Max 20 per hour.' },
-  validate: { xForwardedForHeader: false }
-});
-
-// Script/audio generation limit
-const scriptLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 20,
-  message: { error: 'Too many requests. Max 20 per hour.' },
-  validate: { xForwardedForHeader: false }
-});
-
-// Pexels search limit
-const pexelsLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 30,
-  message: { error: 'Too many search requests. Max 30 per 15 minutes.' },
-  validate: { xForwardedForHeader: false }
-});
 
 // Protect all /api/* routes — TikTok OAuth routes stay public
 app.use("/api", verifyToken);
@@ -564,7 +637,7 @@ app.use("/api", verifyToken);
 // body, the same lesson the media-to-video/edit-video userId bug already
 // taught this file (1a1084de/975e73a3) - a client-supplied email here would
 // let anyone request a verification link for an address that isn't theirs.
-app.post("/api/send-verification-email", async (req, res) => {
+app.post("/api/send-verification-email", emailLimiter, async (req, res) => {
   if (!emailTransporter) return res.status(503).json({ error: "Email is not configured" });
   try {
     const userRecord = await getAuth().getUser(req.user.uid);
@@ -2198,7 +2271,7 @@ app.get('/tiktok/post-status/:openId/:publishId', async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-app.post('/api/edit-video', async (req, res) => {
+app.post('/api/edit-video', renderLimiter, async (req, res) => {
   // captionMeta is the app's style spec - font, size, colour, cadence and the
   // stroke/glow/shadow/box parts. captionStyle stays for older clients that send
   // an id and nothing else.
@@ -2341,7 +2414,7 @@ const upload = multer({
 // LIMIT_UNEXPECTED_FILE for the 21st file, whose default .message is literally
 // "Unexpected field" - so a real project's export failed with an error that read
 // like a client bug rather than a limit being hit.
-app.post('/api/upload-media', upload.array('files', 60), async (req, res) => {
+app.post('/api/upload-media', uploadLimiter, upload.array('files', 60), async (req, res) => {
   try {
     const urls = (req.files || []).map(f => {
       const ext = (path.extname(f.originalname) || '').toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12);
@@ -2598,7 +2671,7 @@ function estimateMediaItemsDurationSeconds(mediaItems) {
   }, 0);
 }
 
-app.post('/api/media-to-video', async (req, res) => {
+app.post('/api/media-to-video', renderLimiter, async (req, res) => {
   const { mediaItems = [], resolution = '1080p', aspectRatio = '9:16', background = null, textOverlays = [], overlays = [], audioTracks = [], previewWidth } = req.body || {};
   // The uid this render (and, once credits exist, its cost) is attributed to
   // must come from the verified token, never the request body - a body field
