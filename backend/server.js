@@ -2414,7 +2414,29 @@ const upload = multer({
 // LIMIT_UNEXPECTED_FILE for the 21st file, whose default .message is literally
 // "Unexpected field" - so a real project's export failed with an error that read
 // like a client bug rather than a limit being hit.
-app.post('/api/upload-media', uploadLimiter, upload.array('files', 60), async (req, res) => {
+// multer signals every one of its limits by calling next(err) *before* the
+// handler runs, so the route's own try/catch below never sees them and they
+// fall through to Express's default error handler - an HTML 500 for what is
+// really a 413 or a 400. apiFetch/readJson on the app side read .error off a
+// JSON body, so the user got no explanation at all, just a failed export.
+// Each case is named here instead, with the size stated rather than implied.
+const uploadFiles = (req, res, next) => {
+  upload.array('files', 60)(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ error: 'That file is too large. Each file has to be under 500MB.' });
+    }
+    if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({ error: 'Too many files in one upload. Add them in smaller batches.' });
+    }
+    if (err.message === 'Unsupported file type') {
+      return res.status(400).json({ error: 'Only image, video and audio files can be uploaded.' });
+    }
+    return res.status(400).json({ error: err.message || 'Upload failed.' });
+  });
+};
+
+app.post('/api/upload-media', uploadLimiter, uploadFiles, async (req, res) => {
   try {
     const urls = (req.files || []).map(f => {
       const ext = (path.extname(f.originalname) || '').toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12);
