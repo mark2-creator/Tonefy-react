@@ -44,7 +44,17 @@ export const FREE_VOICES = ['gtts-us', 'gtts-uk', 'gtts-au'];
 export const TIERS = {
   free: {
     creditsPerCycle: 5,
-    maxExportSeconds: 1 * 60,
+    // 2 minutes, not 1. At 1 minute a free user could not export anything at all
+    // from Idea-to-Video, the app's own headline flow: the script generator is
+    // asked for "30-60 second" scripts, and 30-60 seconds of written narration
+    // read aloud routinely runs past a minute. The app was generating content its
+    // own free tier then refused to export.
+    //
+    // This gives away less than it looks. Credits are the real ceiling - one
+    // credit per started minute, five a cycle - so this changes the shape of what
+    // a free user can make, not how much. Two 2-minute videos instead of five
+    // 1-minute ones, out of the same budget.
+    maxExportSeconds: 2 * 60,
     maxResolution: '720p',
     watermark: true,
     queuePriority: 0,

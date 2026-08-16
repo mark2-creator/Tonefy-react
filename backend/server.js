@@ -1617,14 +1617,29 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
   const { prompt } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
   try {
-    const cacheKey = `script:${prompt.toLowerCase().trim()}`;
+    // Ask for a script that will actually fit the plan's export limit. Raising the
+    // free cap alone is not enough: a script written to no particular length can
+    // always overshoot, and the failure lands at the very end of the flow, after
+    // the voiceover has been generated and the user has spent the wait.
+    //
+    // 60% of the cap, capped at 90 seconds. The margin is because spoken length is
+    // an estimate at ~150 wpm and delivery varies; 90 seconds because past that a
+    // social-media script stops being a short-form script whatever the plan allows.
+    const { plan: scriptPlan } = await getUserPlanData(adminDb, req.user?.uid);
+    const capSeconds = tierConfig(scriptPlan).maxExportSeconds;
+    const targetSeconds = Math.min(90, Math.round(capSeconds * 0.6));
+
+    // The target belongs in the cache key. Without it the first caller's plan
+    // decides the length everyone else gets - a Pro-length script served from
+    // cache to a free user is exactly the failure this change exists to remove.
+    const cacheKey = `script:${targetSeconds}:${prompt.toLowerCase().trim()}`;
     const cached = getCached(cacheKey);
     if (cached) {
       console.log('[CACHE HIT] generate-script:', prompt.substring(0, 40));
       return res.json({ script: cached, cached: true });
     }
     const script = await callLLM({
-      system: "You are a professional video script writer. Create engaging 30-60 second video scripts for social media. Write ONLY spoken narration - no stage directions, no Narrator:, no timestamps, no scene descriptions. Just pure spoken words.",
+      system: `You are a professional video script writer. Write an engaging social media video script that takes about ${targetSeconds} seconds to read aloud at a natural pace - roughly ${Math.round(targetSeconds * 2.5)} words. Do not exceed that length. Write ONLY spoken narration - no stage directions, no Narrator:, no timestamps, no scene descriptions. Just pure spoken words.`,
       user: `Create a short video script about: ${prompt}`,
       max_tokens: 400,
       temperature: 0.8,
