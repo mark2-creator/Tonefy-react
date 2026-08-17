@@ -283,6 +283,45 @@ function setCache(key, value) {
 }
 
 // Fallback LLM — tries Groq first, falls back to Together AI free tier
+// Groq retires models without warning and the app finds out as a 404 in front of a
+// user. On Aug 17 2026 BOTH models this file used disappeared on the same day -
+// llama-3.1-8b-instant and llama-3.3-70b-versatile - taking script generation, keyword
+// extraction and segment extraction with them, which is the whole Idea-to-Video flow.
+//
+// A list rather than a constant, tried in order. A retirement now costs the first
+// candidate rather than the feature. Verified against the live API on the day:
+//   openai/gpt-oss-120b  clean prose, valid JSON, ~950ms   <- first choice
+//   groq/compound-mini   clean prose, valid JSON, ~1500ms  <- slower, same quality
+// Two that were rejected, and why, so they are not tried again:
+//   openai/gpt-oss-20b   returns EMPTY content for these prompts
+//   qwen/qwen3.6-27b     emits <think> reasoning tags into the output
+const GROQ_MODELS = ['openai/gpt-oss-120b', 'groq/compound-mini'];
+
+// Only a missing/withdrawn model is worth trying the next candidate for. A bad request
+// or an auth failure will fail identically on every model, and retrying it just makes
+// the user wait longer for the same error.
+function isModelGone(e) {
+  const m = String(e?.message || '');
+  return e?.status === 404 || m.includes('model_not_found') || m.includes('does not exist');
+}
+
+async function groqChat({ messages, max_tokens = 400, temperature = 0.8 }) {
+  let lastError;
+  for (const model of GROQ_MODELS) {
+    try {
+      const completion = await groq.chat.completions.create({ model, messages, max_tokens, temperature });
+      const text = completion.choices?.[0]?.message?.content?.trim();
+      if (text) return text;
+      lastError = new Error(`${model} returned empty content`);
+    } catch (e) {
+      lastError = e;
+      if (!isModelGone(e)) throw e;
+      console.warn(`[groq] ${model} unavailable, trying next:`, e.message?.slice(0, 120));
+    }
+  }
+  throw lastError || new Error('No Groq model available');
+}
+
 async function callLLM({ system, user, max_tokens = 400, temperature = 0.8 }) {
   const messages = [];
   if (system) messages.push({ role: 'system', content: system });
@@ -290,13 +329,7 @@ async function callLLM({ system, user, max_tokens = 400, temperature = 0.8 }) {
 
   // Try Groq first
   try {
-    const completion = await groq.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
-      messages,
-      max_tokens,
-      temperature,
-    });
-    return completion.choices[0].message.content.trim();
+    return await groqChat({ messages, max_tokens, temperature });
   } catch (e) {
     console.warn('Groq failed, trying fallback:', e.message);
   }
@@ -1598,8 +1631,7 @@ app.post("/api/extract-url", scriptLimiter, verifyToken, async (req, res) => {
     const title = $('title').text().trim() || $('h1').first().text().trim() || 'Article';
 
     // Use Groq to summarize into a video script
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const script = await groqChat({
       messages: [{
         role: "user",
         content: `Convert this article/webpage content into a short, engaging video script (60-90 seconds when spoken). Write it as natural spoken narration, no headers or bullet points. Keep it informative and engaging.
@@ -1614,7 +1646,6 @@ Video script:`
       temperature: 0.7,
     });
 
-    const script = completion.choices[0]?.message?.content?.trim();
     if (!script) return res.status(500).json({ error: "Failed to generate script from URL" });
 
     res.json({ script, title, url });
@@ -1930,7 +1961,7 @@ app.post("/api/extract-segments", scriptLimiter, async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: "Text required" });
   try {
-    const completion = await groq.chat.completions.create({
+    const raw = await groqChat({
       messages: [
         { role: "system", content: `Split this video script into 3-5 short segments (each 1-2 sentences, in original order, covering ALL the text).
 
@@ -1942,11 +1973,14 @@ Example output: [{"text":"Are you ready for a challenge? Take our quiz now.","ke
 Return ONLY a JSON array, no other text: [{"text":"...","keywords":"..."}]` },
         { role: "user", content: text }
       ],
-      model: "llama-3.1-8b-instant", max_tokens: 500, temperature: 0.4,
+      max_tokens: 500, temperature: 0.4,
     });
     let segments;
     try {
-      segments = JSON.parse(completion.choices[0].message.content.trim());
+      // Models sometimes wrap JSON in a ```json fence despite being told not to;
+      // stripping it is cheaper than losing the whole response to the sentence-split
+      // fallback below, which produces far worse stock-footage keywords.
+      segments = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim());
     } catch (e) {
       // Fallback: split by sentences into chunks
       const sentences = text.split(/(?<=[.!?])\s+/).filter(Boolean);
