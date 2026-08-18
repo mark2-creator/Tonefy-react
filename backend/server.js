@@ -19,7 +19,7 @@ import { initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
 import { getFirestore as getAdminFirestore } from "firebase-admin/firestore";
-import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, FREE_RESET_MS } from "./tiers.js";
+import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, isAdminUid, FREE_RESET_MS } from "./tiers.js";
 import nodemailer from "nodemailer";
 
 // Firebase Storage + Firestore (Admin) — initialized after initializeApp()
@@ -1448,6 +1448,12 @@ async function subscriptionSweep() {
     // No token means nobody bought it - a comp account, or one set by hand in the
     // console. Those are deliberate and are not Play's to expire.
     if (!v.subscriptionPurchaseToken) continue;
+
+    // An admin's Creator comes from being an admin, not from a purchase. The owner
+    // does hold a real expired token, so without this the sweep would keep taking the
+    // plan back every six hours and testing any gated feature would mean re-granting
+    // it by hand first.
+    if (isAdminUid(doc.id)) continue;
 
     let sub;
     try {

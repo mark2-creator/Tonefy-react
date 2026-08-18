@@ -119,11 +119,48 @@ export function tierConfig(plan) {
  * already writes (createdAt on userVideos, jobs, etc.) rather than Firestore
  * Timestamp objects - one convention for "when" throughout this file.
  */
+// Read lazily inside the call rather than at module load: this module is imported by
+// server.js and ES imports evaluate before the importing module's body, so a top-level
+// read could run before dotenv had populated process.env and would silently see none.
+function adminUids() {
+  return String(process.env.ADMIN_UIDS || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+/**
+ * An admin is permanently entitled to Creator.
+ *
+ * The owner has to be able to exercise every gated feature to test it, and the
+ * alternative - editing Firestore by hand - does not hold: they also carry a real
+ * expired purchase token, so the subscription sweep would find it ended and put them
+ * back on free within six hours. Entitlement has to come from who they are, not from
+ * a row someone remembered to set.
+ *
+ * Same list as the admin stats endpoint (ADMIN_UIDS in .env, gitignored). Deliberately
+ * not a second list: two lists of who counts as staff drift, and the one that drifts is
+ * always the one nobody is looking at.
+ */
+export function isAdminUid(uid) {
+  return !!uid && adminUids().includes(uid);
+}
+
 export async function getUserPlanData(db, uid) {
   const ref = db.collection('users').doc(uid);
   const snap = await ref.get();
   const data = snap.exists ? snap.data() : {};
-  const plan = data.plan || 'free';
+  const admin = isAdminUid(uid);
+  const plan = admin ? 'creator' : (data.plan || 'free');
+
+  // Written through rather than only returned. The app's usePlan() reads this document
+  // straight from Firestore, so a server-only override would enforce Creator on every
+  // endpoint while the UI still said Free Plan and greyed out the tools it was letting
+  // through. Runs once - the next lookup sees creator and skips.
+  if (admin && data.plan !== 'creator') {
+    const patch = { plan: 'creator' };
+    const owed = tierConfig('creator').creditsPerCycle;
+    if ((Number(data.creditsRemaining) || 0) < owed) patch.creditsRemaining = owed;
+    await ref.set(patch, { merge: true });
+    return { plan, creditsRemaining: patch.creditsRemaining ?? data.creditsRemaining, creditsResetAt: data.creditsResetAt };
+  }
 
   if (data.creditsRemaining === undefined || data.creditsResetAt === undefined) {
     const creditsRemaining = tierConfig(plan).creditsPerCycle;
