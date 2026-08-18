@@ -2070,8 +2070,28 @@ const CAPTION_STYLES = {
   "purple":     "Arial,28,&H00FF00FF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,3,2,2,20,20,80,1",
 };
 
+// Pace and pitch, applied AFTER synthesis with one ffmpeg pass rather than through
+// each engine's own knobs.
+//
+// edge-tts has rate/pitch options and gTTS has none at all, so doing it per-engine
+// would mean the three gTTS voices silently ignored both sliders - and those are the
+// free voices, so the people most likely to meet a dead control would be the ones who
+// have not paid yet. One post-process gives every voice on both engines the same
+// behaviour and one code path to be correct.
+//
+// rubberband rather than asetrate/atempo arithmetic: it takes tempo and pitch as
+// independent factors, so changing the speed does not also raise the voice, and there
+// is no source-sample-rate term to get wrong (gTTS and edge do not agree on it).
+function shapeFilter(rate, semitones) {
+  const r = Math.min(2, Math.max(0.5, Number(rate) || 1));
+  const st = Math.min(12, Math.max(-12, Math.round(Number(semitones) || 0)));
+  if (r === 1 && st === 0) return null;   // nothing asked for: skip the pass entirely
+  const pitchFactor = Math.pow(2, st / 12);
+  return `rubberband=tempo=${r.toFixed(3)}:pitch=${pitchFactor.toFixed(4)}`;
+}
+
 app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
-  const { text, voiceId = "gtts-us" } = req.body;
+  const { text, voiceId = "gtts-us", rate = 1, pitch = 0 } = req.body;
   if (!text?.trim()) return res.status(400).json({ error: "Text is required" });
   try {
     // Voice restriction lives here, not on idea-to-video-v2: that endpoint
@@ -2094,6 +2114,30 @@ app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
       }
       exec(cmd, (err) => err ? reject(err) : resolve());
     });
+
+    const filter = shapeFilter(rate, pitch);
+    if (filter) {
+      // Into a sibling file then renamed over the original: ffmpeg cannot read and
+      // write the same path, and a caller that already has the URL must never find a
+      // half-written file there.
+      const shapedPath = audioPath.replace(/\.mp3$/, "-shaped.mp3");
+      try {
+        await new Promise((resolve, reject) => {
+          execFile("ffmpeg", ["-y", "-i", audioPath, "-filter:a", filter, "-c:a", "libmp3lame", "-q:a", "4", shapedPath],
+            { timeout: 120000 }, (err, stdout, stderr) => {
+              if (err) { console.error("Audio shaping failed:", stderr?.slice(-300)); return reject(err); }
+              resolve();
+            });
+        });
+        fs.renameSync(shapedPath, audioPath);
+      } catch (e) {
+        // The unshaped audio is still correct audio. Losing the whole request over a
+        // pace adjustment would be a worse outcome than the voice being at 1.0x.
+        try { fs.unlinkSync(shapedPath); } catch (e2) {}
+        console.warn("Serving unshaped audio for", audioFilename);
+      }
+    }
+
     res.json({ audioUrl: `/audios/${audioFilename}` });
   } catch (err) {
     console.error("Audio error:", err.message);
