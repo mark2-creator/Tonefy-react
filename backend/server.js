@@ -820,7 +820,49 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
       if (v.userId) creators.add(v.userId);
     });
 
+    // --- Revenue --------------------------------------------------------------
+    //
+    // Deliberately built to be able to report ZERO. Counting anyone on a paid plan as
+    // revenue would have shown "$21.98/mo" today, when in fact one subscription is a
+    // licence TEST purchase - no money changed hands - and the other was set by hand in
+    // the Firestore console with no purchase behind it at all. A dashboard that flatters
+    // is worse than no dashboard.
+    //
+    // Each subscriber's stored purchaseToken is checked against Play, which is the only
+    // thing that knows whether a payment was real, still active, or a test. Capped,
+    // because this is one API call per subscriber on every load.
+    const MONTHLY_USD = { 'pro-monthly': 6.99, 'pro-yearly': 69.99 / 12, 'creator-monthly': 14.99, 'creator-yearly': 149.99 / 12 };
+    const paidDocs = usersSnap.docs.filter(d => ['pro', 'creator'].includes(d.data().plan));
+    let paying = 0, testing = 0, manual = 0, lapsed = 0, mrr = 0;
+    for (const d of paidDocs.slice(0, 100)) {
+      const x = d.data();
+      if (!x.subscriptionPurchaseToken) { manual += 1; continue; }
+      try {
+        const { data: sub } = await androidpublisher.purchases.subscriptionsv2.get({
+          packageName: PACKAGE_NAME, token: x.subscriptionPurchaseToken,
+        });
+        const active = sub.subscriptionState === 'SUBSCRIPTION_STATE_ACTIVE'
+          || sub.subscriptionState === 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD';
+        if (!active) { lapsed += 1; continue; }
+        if (sub.testPurchase) { testing += 1; continue; }
+        paying += 1;
+        mrr += MONTHLY_USD[x.subscriptionBasePlanId] || 0;
+      } catch (e) {
+        // A token Play will not answer for is not evidence of revenue.
+        manual += 1;
+      }
+    }
+
     res.json({
+      revenue: {
+        paying,
+        mrrUsd: Math.round(mrr * 100) / 100,
+        testing,
+        manual,
+        // Still marked paid in Firestore but no longer active at Play - nothing revokes
+        // these today, so they are worth seeing rather than quietly counting as paid.
+        lapsed,
+      },
       users: {
         total: authUsers.length,
         verified,
