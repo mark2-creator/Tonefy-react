@@ -1386,12 +1386,116 @@ async function creditResetSweep() {
   }
 }
 
+// Take a paid plan away once Play says it has ended.
+//
+// Nothing did this. A subscription that expired stayed `plan: pro` in Firestore for
+// ever, with Pro credits, Pro export length and no watermark - because the plan field
+// was only ever WRITTEN at purchase and never checked again. Found in real data: the
+// owner's own Pro subscription expired on 15 Aug 2026 and the account was still Pro
+// three days later. Harmless while the only subscriber is the owner on a test purchase;
+// the moment someone pays and cancels, they keep everything for nothing, and nobody
+// finds out.
+//
+// Entitlement, per Play's own model rather than by feel:
+//   ACTIVE, IN_GRACE_PERIOD              -> entitled
+//   CANCELED with an expiry still ahead  -> entitled. Cancelling turns auto-renew off;
+//                                           the subscription runs to the date paid for,
+//                                           and taking it away early is theft.
+//   EXPIRED, ON_HOLD, PAUSED, PENDING    -> ended, downgrade
+//   anything else, including a state Play
+//   has not invented yet                 -> left alone
+//
+// Fail-safe direction is deliberate and matches checkRenderAllowed: if the Play lookup
+// THROWS, nothing is revoked. A transient API error or an expired credential must never
+// strip a paying customer of what they bought. The cost of being wrong in that
+// direction is a few days of free service; the other direction is a refund and a review.
+const SUBSCRIPTION_SWEEP_MS = 6 * 60 * 60 * 1000;
+
+// States that positively mean "this has ended". Anything NOT on this list is left
+// alone, including a state Play has not invented yet - the opposite default would let a
+// future addition to their enum silently strip every paying subscriber, which is the one
+// failure here that cannot be undone by waiting.
+const ENDED_STATES = new Set([
+  'SUBSCRIPTION_STATE_EXPIRED',
+  'SUBSCRIPTION_STATE_ON_HOLD',            // payment failed and the retries ran out
+  'SUBSCRIPTION_STATE_PAUSED',             // user-initiated pause
+  'SUBSCRIPTION_STATE_PENDING',            // never completed - was never entitlement
+  'SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED',
+]);
+
+function playSaysEnded(sub) {
+  const state = sub?.subscriptionState;
+  // Cancelled is not ended. Cancelling turns auto-renew off; the subscription runs to
+  // the date already paid for, and taking it away early is theft.
+  if (state === 'SUBSCRIPTION_STATE_CANCELED') {
+    const expiry = Date.parse(sub?.lineItems?.[0]?.expiryTime || '');
+    return Number.isFinite(expiry) && expiry <= Date.now();
+  }
+  return ENDED_STATES.has(state);
+}
+
+async function subscriptionSweep() {
+  let snap;
+  try {
+    snap = await adminDb.collection('users').where('plan', 'in', ['pro', 'creator']).get();
+  } catch (e) {
+    console.error('[SubSweep] could not read paid accounts:', e.message);
+    return;
+  }
+
+  for (const doc of snap.docs) {
+    const v = doc.data();
+    // No token means nobody bought it - a comp account, or one set by hand in the
+    // console. Those are deliberate and are not Play's to expire.
+    if (!v.subscriptionPurchaseToken) continue;
+
+    let sub;
+    try {
+      const { data } = await androidpublisher.purchases.subscriptionsv2.get({
+        packageName: PACKAGE_NAME, token: v.subscriptionPurchaseToken,
+      });
+      sub = data;
+    } catch (e) {
+      console.warn(`[SubSweep] ${doc.id}: Play lookup failed, leaving plan alone -`, e.message?.slice(0, 90));
+      continue;
+    }
+
+    if (!playSaysEnded(sub)) continue;
+
+    // Credits are clamped rather than zeroed. Someone who paid for this cycle may have
+    // credits left from it, and taking those away as well would be punishing them for
+    // the subscription ending rather than simply ending it.
+    const freeCredits = tierConfig('free').creditsPerCycle;
+    const kept = Math.min(Number(v.creditsRemaining) || 0, freeCredits);
+    try {
+      await doc.ref.set({
+        plan: 'free',
+        creditsRemaining: kept,
+        subscriptionStatus: 'expired',
+        subscriptionEndedAt: new Date().toISOString(),
+        // Kept, not deleted: it is the evidence of what happened, and re-subscribing
+        // writes a new one anyway.
+        subscriptionLastState: sub.subscriptionState || 'unknown',
+      }, { merge: true });
+      console.log(`[SubSweep] ${doc.id}: ${v.plan} -> free (${sub.subscriptionState}), credits ${v.creditsRemaining} -> ${kept}`);
+    } catch (e) {
+      console.error(`[SubSweep] ${doc.id}: could not downgrade -`, e.message);
+    }
+  }
+}
+
 setInterval(() => {
   cleanupOldFiles(videosDir);
   cleanupOldFiles(audiosDir);
   cleanupUploads();
   creditResetSweep();
 }, 10 * 60 * 1000);
+
+// Its own timer, six-hourly rather than ten-minutely: this one costs a Play API call per
+// subscriber, and a subscription that ended does not need catching within ten minutes.
+setInterval(subscriptionSweep, SUBSCRIPTION_SWEEP_MS);
+// Once at startup too, so a deploy picks up anything that lapsed while it was down.
+subscriptionSweep();
 
 function buildCaptionFilter(script, audioDuration) {
   // Split script into short chunks of ~5 words each
