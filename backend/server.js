@@ -3222,6 +3222,42 @@ const ALLOWED_FILTER_OPS = new Set([
   'vignette', 'noise', 'unsharp',
 ]);
 
+// A motion is one ffmpeg filter string rather than a list, because zoompan and crop
+// carry expressions full of commas and splitting on those would break them apart.
+//
+// Validated by character class instead of by op name for the same reason: the whole
+// point of a motion is the expression, and an allowlist of ops says nothing about what
+// is inside the parentheses. What matters is that it cannot escape its own filter -
+// `;` would start a new filtergraph chain, `[` and `]` would name new pads, and the
+// shell metacharacters would escape the double quotes the command is built with.
+// Everything an expression legitimately needs is permitted.
+//
+// The catalogue lives in the app (constants/motions.js), so a motion added there
+// renders without a deploy here - same arrangement as filters and transitions.
+const MOTION_ALLOWED = /^[A-Za-z0-9_=:.,+\-*/()'<>?%\s]+$/;
+
+function safeMotionChain(spec, w, h, fps) {
+  if (typeof spec !== 'string' || !spec.trim()) return null;
+  if (spec.length > 600) return null;
+  // Substituted BEFORE validating, and the order is the whole point. The placeholders
+  // are written {W}/{H}/{FPS}, and braces are not - and must not be - in the allowed
+  // set, so validating first rejects every motion in the catalogue. It fails silently
+  // too: the clip renders perfectly, just without moving, which is indistinguishable
+  // from a motion nobody selected. Caught by rendering one end to end and measuring
+  // the frames rather than by reading this function.
+  //
+  // Validating the substituted string is also the stricter reading: what is checked is
+  // exactly what reaches ffmpeg, rather than a template that still has to be edited.
+  //
+  // The size comes from the plan's resolution cap rather than the client, or a caller
+  // could name its own and ask for an arbitrarily large intermediate.
+  const filled = spec
+    .replaceAll('{W}', String(w))
+    .replaceAll('{H}', String(h))
+    .replaceAll('{FPS}', String(fps));
+  return MOTION_ALLOWED.test(filled) ? filled : null;
+}
+
 function safeFilterChain(chain) {
   if (!Array.isArray(chain)) return null;
   const ok = chain.filter(part => {
@@ -3393,7 +3429,12 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // the output frame - vidstabtransform shifts and rotates the picture, and doing
       // that after the pad would move the padding around with it.
       const vfHead = srcCrop ? srcCrop + ',' : '';
-      const vfTail = `${frameFitFilter(W, H, background)},setsar=1${look}`;
+      // Motion runs LAST, on frames already fitted to the output size. Running it
+      // earlier would reframe the source and then let the fit undo it - a zoompan
+      // followed by a pad puts the padding back around the zoomed picture, so the zoom
+      // stops reaching the edges of the video and reads as a shrinking photograph.
+      const motion = safeMotionChain(item.motionSpec, W, H, 30);
+      const vfTail = `${frameFitFilter(W, H, background)},setsar=1${look}${motion ? ',' + motion : ''}`;
       const vf = `${vfHead}${vfTail}`;
 
       // Every prepared clip carries an audio stream, even when that stream is
