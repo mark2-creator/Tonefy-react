@@ -750,6 +750,103 @@ const TRANSLATE_LANGS = {
 // or a long clip holds the request open until something upstream gives up.
 const TRANSLATE_MAX_SECONDS = 300;
 
+// --- Admin ---------------------------------------------------------------------
+//
+// This app had no concept of an admin until now, so the gate matters more than the
+// numbers behind it. Membership comes from ADMIN_UIDS in .env - server-side, gitignored -
+// and is checked against req.user.uid, which comes from the VERIFIED Firebase token.
+// Never against an email or a uid in the request body: that is the exact bug that let
+// media-to-video attribute renders to any uid a caller claimed (1a1084de).
+//
+// A non-admin gets 404 rather than 403. 403 confirms the endpoint exists and that
+// someone is worth attacking; 404 says nothing at all.
+const ADMIN_UIDS = String(process.env.ADMIN_UIDS || '').split(',').map(s => s.trim()).filter(Boolean);
+function requireAdmin(req, res, next) {
+  if (!ADMIN_UIDS.length || !ADMIN_UIDS.includes(req.user?.uid)) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  next();
+}
+
+// verifyToken INLINE, not inherited. app.use("/api", verifyToken) is registered further
+// down the file than this route, and registration order decides which middleware a route
+// gets - not its path. Without this, req.user is undefined here and requireAdmin refuses
+// everyone including the admin, which is how this was caught. It failed closed, which is
+// the right direction to fail, but an admin endpoint should never be one edit away from
+// failing open.
+app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (req, res) => {
+  try {
+    const now = Date.now();
+    const DAY = 24 * 60 * 60 * 1000;
+    const since7 = now - 7 * DAY;
+    const since30 = now - 30 * DAY;
+
+    // Auth is the source of truth for "how many people", not the users collection:
+    // a Firestore doc can be missing for an account that predates it, and one can be
+    // left behind by a deleted account. Both have happened here.
+    const authUsers = [];
+    let pageToken;
+    do {
+      const page = await getAuth().listUsers(1000, pageToken);
+      authUsers.push(...page.users);
+      pageToken = page.pageToken;
+    } while (pageToken);
+
+    const signups7 = authUsers.filter(u => Date.parse(u.metadata.creationTime) > since7).length;
+    const signups30 = authUsers.filter(u => Date.parse(u.metadata.creationTime) > since30).length;
+    const verified = authUsers.filter(u => u.emailVerified).length;
+    const signedIn7 = authUsers.filter(u => u.metadata.lastSignInTime && Date.parse(u.metadata.lastSignInTime) > since7).length;
+
+    const usersSnap = await adminDb.collection("users").get();
+    const plans = { free: 0, pro: 0, creator: 0 };
+    const countries = {};
+    usersSnap.forEach(d => {
+      const v = d.data();
+      const plan = v.plan || "free";
+      if (plans[plan] === undefined) plans[plan] = 0;
+      plans[plan] += 1;
+      if (v.country) countries[v.country] = (countries[v.country] || 0) + 1;
+    });
+
+    const videosSnap = await adminDb.collection("userVideos").get();
+    let bytes = 0, videos7 = 0, videos30 = 0;
+    const creators = new Set();
+    videosSnap.forEach(d => {
+      const v = d.data();
+      bytes += Number(v.size) || 0;
+      const t = Date.parse(v.createdAt || "");
+      if (t > since7) videos7 += 1;
+      if (t > since30) videos30 += 1;
+      if (v.userId) creators.add(v.userId);
+    });
+
+    res.json({
+      users: {
+        total: authUsers.length,
+        verified,
+        signups7,
+        signups30,
+        signedIn7,
+        plans,
+        countries: Object.entries(countries).sort((a, b) => b[1] - a[1]).slice(0, 10),
+      },
+      videos: {
+        total: videosSnap.size,
+        last7: videos7,
+        last30: videos30,
+        // People who have actually MADE something, which is the number that says whether
+        // the app is being used rather than merely installed.
+        creators: creators.size,
+        storageMB: Math.round(bytes / 1024 / 1024),
+      },
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("admin/stats error:", e.message);
+    res.status(500).json({ error: "Could not load stats." });
+  }
+});
+
 app.get("/api/translate-languages", mediaProcLimiter, (req, res) => {
   res.json({ languages: Object.entries(TRANSLATE_LANGS).map(([code, v]) => ({ code, label: v.label })) });
 });
