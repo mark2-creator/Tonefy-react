@@ -1899,7 +1899,7 @@ Video script:`
 });
 
 app.post("/api/generate-script", scriptLimiter, async (req, res) => {
-  const { prompt } = req.body;
+  const { prompt, targetSeconds: requestedSeconds } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
   try {
     // Ask for a script that will actually fit the plan's export limit. Raising the
@@ -1912,7 +1912,16 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
     // social-media script stops being a short-form script whatever the plan allows.
     const { plan: scriptPlan } = await getUserPlanData(adminDb, req.user?.uid);
     const capSeconds = tierConfig(scriptPlan).maxExportSeconds;
-    const targetSeconds = Math.min(90, Math.round(capSeconds * 0.6));
+    // Idea-to-Audio asks for a length, because for an audio product the length IS the
+    // product - a 30-second clip and a 5-minute one are different things a user chose
+    // between. Video callers send nothing and keep the behaviour above unchanged.
+    //
+    // Still clamped to the plan's own export cap rather than a number invented here:
+    // that is the length limit this app already decided on and already shows in the
+    // pricing, so a longer audio being a paid feature needs no new policy.
+    const targetSeconds = Number(requestedSeconds) > 0
+      ? Math.max(15, Math.min(Math.round(Number(requestedSeconds)), capSeconds))
+      : Math.min(90, Math.round(capSeconds * 0.6));
 
     // The target belongs in the cache key. Without it the first caller's plan
     // decides the length everyone else gets - a Pro-length script served from
@@ -1924,9 +1933,35 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
       return res.json({ script: cached, cached: true });
     }
     const script = await callLLM({
-      system: `You are a professional video script writer. Write an engaging social media video script that takes about ${targetSeconds} seconds to read aloud at a natural pace - roughly ${Math.round(targetSeconds * 2.5)} words. Do not exceed that length. Write ONLY spoken narration - no stage directions, no Narrator:, no timestamps, no scene descriptions. Just pure spoken words.`,
+      // A range with a floor, not a ceiling. "Do not exceed N words" alone made the
+      // model treat N as a limit to stay safely under: a 30-second ask came back at
+      // 36 words against a 75-word target - half the length the user picked - while
+      // 90s and 300s landed almost exactly. Naming a minimum is what fixes the short
+      // end, and the ceiling still has to be there or a long script overshoots the
+      // plan's export cap.
+      //
+      // 1.8-2.0 words per second, MEASURED by rendering real scripts and ffprobing
+      // them, not the 150wpm (2.5/s) this used to assume - at which a 30s ask came
+      // back as 20s of audio and a 120s ask as 153s.
+      //
+      // Erring slightly SHORT is deliberate. The cap above is the plan's export
+      // limit, so a script that overruns its target does not merely misjudge the
+      // chip the user tapped - it can put the resulting video past the length that
+      // account is allowed to export, and that failure lands at the very end, after
+      // the voiceover has been made and the wait has been spent.
+      //
+      // Worth not re-deriving: a fixed paragraph read by these same voices clocks
+      // 2.5 (gtts) to 2.8 (edge) words per second, so the engine is NOT the slow
+      // part. Generated scripts are slower because they are written in short
+      // sentences and every sentence end is a pause. Timing a passage of prose to
+      // pick this number gives the wrong answer by about 25%.
+      system: `You are a professional video script writer. Write an engaging social media video script that takes about ${targetSeconds} seconds to read aloud at a natural pace. It must be between ${Math.round(targetSeconds * 1.8)} and ${Math.round(targetSeconds * 2.0)} words - do not go under the minimum or over the maximum. Write ONLY spoken narration - no stage directions, no Narrator:, no timestamps, no scene descriptions. Just pure spoken words.`,
       user: `Create a short video script about: ${prompt}`,
-      max_tokens: 400,
+      // Scaled with the target, or a long request comes back quietly truncated: the
+      // old flat 400 is about two minutes of speech, so a five-minute script would
+      // have stopped mid-sentence and looked like the model losing its thread rather
+      // than a budget being hit.
+      max_tokens: Math.min(2000, Math.max(400, Math.round(targetSeconds * 2.5 * 1.5))),
       temperature: 0.8,
     });
     setCache(cacheKey, script);
