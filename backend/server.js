@@ -3434,7 +3434,14 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // followed by a pad puts the padding back around the zoomed picture, so the zoom
       // stops reaching the edges of the video and reads as a shrinking photograph.
       const motion = safeMotionChain(item.motionSpec, W, H, 30);
-      const vfTail = `${frameFitFilter(W, H, background)},setsar=1${look}${motion ? ',' + motion : ''}`;
+      // Effect after motion, deliberately. The effect should act on the framing the
+      // motion chose - a glitch tear across a picture that is then zoomed would have
+      // its own tear scaled up along with the picture, which is not what either of them
+      // was asked to do. Same validator: both are single filter strings carrying
+      // expressions, and both must be unable to escape into the wider filtergraph.
+      const effect = safeMotionChain(item.effectSpec, W, H, 30);
+      const vfTail = `${frameFitFilter(W, H, background)},setsar=1${look}`
+        + `${motion ? ',' + motion : ''}${effect ? ',' + effect : ''}`;
       const vf = `${vfHead}${vfTail}`;
 
       // Every prepared clip carries an audio stream, even when that stream is
