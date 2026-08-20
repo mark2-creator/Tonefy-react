@@ -573,6 +573,11 @@ app.use("/audios", express.static(audiosDir, { maxAge: "30d", setHeaders: (res) 
 app.use("/stickers", express.static(path.join(__dirname, "public", "stickers"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/filters", express.static(path.join(__dirname, "public", "filters"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/transitions", express.static(path.join(__dirname, "public", "transitions"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
+// Animated WebP tiles for the two catalogues that cannot be shown as a still. Same
+// treatment as the transitions above: immutable content at a versioned URL, so a long
+// max-age costs one download per tile ever.
+app.use("/motions", express.static(path.join(__dirname, "public", "motions"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
+app.use("/effects", express.static(path.join(__dirname, "public", "effects"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 app.use("/music", express.static(path.join(__dirname, "public", "music"), { maxAge: "30d", setHeaders: (res) => { res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); } }));
 // Voice previews, generated once by scripts/generate-voice-previews.py and then never
 // again. Each is a fixed line in a fixed voice, so the file for a given voice can never
