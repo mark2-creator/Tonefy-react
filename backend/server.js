@@ -599,13 +599,38 @@ function trackIdToDisplayName(id) {
     .replace(/\b\w/g, c => c.toUpperCase());
 }
 
+// Mood, tempo, BPM and length per track, from scripts/analyse-music.py in the app repo.
+// Read once at boot rather than per request: it is a small file that only changes when
+// the library does.
+//
+// Without it a track is a filename, and 68 filenames in one alphabetical column is why
+// the library felt like a folder rather than a music library. BPM is measured from the
+// audio by onset autocorrelation; mood comes from the track's own title where it says
+// something, and from the measured tempo where it does not.
+let MUSIC_META = {};
+try {
+  MUSIC_META = JSON.parse(fs.readFileSync(path.join(__dirname, "music-meta.json"), "utf8"));
+  console.log(`[music] metadata for ${Object.keys(MUSIC_META).length} tracks`);
+} catch (e) {
+  console.warn("[music] no music-meta.json - tracks will carry names only:", e.message);
+}
+
 app.get("/api/music-tracks", mediaProcLimiter, (req, res) => {
   try {
     const musicDir = path.join(__dirname, "public", "music");
     const files = fs.readdirSync(musicDir).filter(f => f.endsWith(".mp3"));
     const tracks = files.map(f => {
       const id = f.replace(/\.mp3$/, "");
-      return { id, name: trackIdToDisplayName(id), previewUrl: `/music/${f}` };
+      const m = MUSIC_META[id] || {};
+      return {
+        id,
+        name: m.name || trackIdToDisplayName(id),
+        previewUrl: `/music/${f}`,
+        mood: m.mood || null,
+        tempo: m.tempo || null,
+        bpm: m.bpm || null,
+        seconds: m.seconds || null,
+      };
     }).sort((a, b) => a.name.localeCompare(b.name));
     res.json({ tracks });
   } catch (err) {
