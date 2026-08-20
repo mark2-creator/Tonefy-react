@@ -2344,7 +2344,7 @@ app.post("/api/search-pexels-segment", pexelsLimiter, async (req, res) => {
 });
 
 app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
-  const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, transition = "fade", musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0 } = req.body || {};
+  const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, transition = "fade", transitionSpec = null, musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0 } = req.body || {};
   const userId = req.user?.uid;
 
   // No voiceId param here - this endpoint consumes audio that was already
@@ -2605,8 +2605,18 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
         transClips.forEach(p => fs.unlink(p, ()=>{}));
 
       } else {
-        // Standard xfade transitions — single pass
-        const xft = XFADE_MAP[transition] || 'fade';
+        // Standard xfade transitions — single pass.
+        //
+        // A transitionSpec is the same {base, fx} recipe the editor's own export
+        // consumes, so the three generation screens can offer the whole catalogue
+        // instead of the twenty names XFADE_MAP happens to know. One transition for
+        // the whole video here, rather than one per join, because that is what these
+        // screens ask for - so the spec is read once outside the loop.
+        //
+        // Older clients send only an id and XFADE_MAP still answers for those.
+        const specT = safeTransitionSpec(transitionSpec);
+        const xft = specT ? specT.base : (XFADE_MAP[transition] || 'fade');
+        const specFx = specT ? specT.fx : [];
         const minClipDur = Math.min(...segDurations);
         const safeXDUR = Math.min(XDUR, minClipDur * 0.4);
         const inputs3 = clipPaths.map(p => `-i "${p}"`).join(' ');
@@ -2615,7 +2625,26 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
           timeline += Math.max(safeXDUR + 0.01, segDurations[i-1] - safeXDUR);
           const offset = parseFloat(timeline.toFixed(2));
           const outLabel = i === clipPaths.length - 1 ? 'vout' : `v${i}`;
-          parts.push(`[${prevLabel}][${i}:v]xfade=transition=${xft}:duration=${safeXDUR}:offset=${offset}[${outLabel}]`);
+          if (specFx.length) {
+            // The xfade writes to a private label and the fx chain carries it on to the
+            // one the next boundary expects, so adding character never changes the
+            // shape of the chain around it. Identical to the editor's export path.
+            const xfLabel = `xf${i}`;
+            parts.push(`[${prevLabel}][${i}:v]xfade=transition=${xft}:duration=${safeXDUR}:offset=${offset}[${xfLabel}]`);
+            let cur = xfLabel;
+            const from = offset.toFixed(3);
+            const to = (offset + safeXDUR).toFixed(3);
+            specFx.forEach((f, k) => {
+              const dst = k === specFx.length - 1 ? outLabel : `gfx${i}_${k}`;
+              // enable confines the effect to the join, or a blur meant for half a
+              // second sits over the whole finished video.
+              const sep = String(f).includes('=') ? ':' : '=';
+              parts.push(`[${cur}]${f}${sep}enable='between(t,${from},${to})'[${dst}]`);
+              cur = dst;
+            });
+          } else {
+            parts.push(`[${prevLabel}][${i}:v]xfade=transition=${xft}:duration=${safeXDUR}:offset=${offset}[${outLabel}]`);
+          }
           prevLabel = outLabel;
         }
         filterComplex = parts.join(';');
@@ -3258,6 +3287,31 @@ function safeMotionChain(spec, w, h, fps) {
   return MOTION_ALLOWED.test(filled) ? filled : null;
 }
 
+// A transition recipe from the client: an xfade base plus fx fragments gated to the
+// join. Same shape the editor's export already sends, validated the same way its
+// filter chains are - a known op name and no way out of the filter it belongs to.
+// The filter ops a TRANSITION's fx may use. A superset of ALLOWED_FILTER_OPS, because
+// a transition adds movement and damage where a grade only adds colour - a whip is
+// gblur, a glitch is rgbashift, a VHS join is chromashift. Validating transition fx
+// against the grade list silently strips exactly the fragments that make each
+// transition distinct, leaving a plain xfade wearing its name.
+const ALLOWED_TRANSITION_FX_OPS = new Set([
+  ...ALLOWED_FILTER_OPS, 'gblur', 'rgbashift', 'chromashift',
+]);
+
+function safeTransitionSpec(spec) {
+  if (!spec || typeof spec !== 'object') return null;
+  const base = String(spec.base || '').trim();
+  // xfade transition names are plain identifiers. Anything else is not one.
+  if (!/^[a-z0-9]+$/.test(base)) return null;
+  const fx = Array.isArray(spec.fx) ? spec.fx.filter(part => {
+    const str = String(part);
+    if (/[;"'`$\\\n\[\]]/.test(str)) return false;
+    return ALLOWED_TRANSITION_FX_OPS.has(str.split('=')[0].trim());
+  }) : [];
+  return { base, fx };
+}
+
 function safeFilterChain(chain) {
   if (!Array.isArray(chain)) return null;
   const ok = chain.filter(part => {
@@ -3626,7 +3680,11 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
         // so the catalogue lives in one place and a transition added there needs no
         // deploy here. An older client sends only an id, and EDIT_XFADE_MAP still
         // answers for those.
-        const spec = mediaItems[i - 1]?.transitionSpec || null;
+        // Validated, not trusted. This used to read spec.base and spec.fx straight off
+        // the request body and splice them into the filtergraph, so a crafted fx
+        // fragment could have carried `[labels]` or a `;` and written its own chain.
+        // Same check the generation endpoint uses, so neither can drift from the other.
+        const spec = safeTransitionSpec(mediaItems[i - 1]?.transitionSpec);
         const hasTransition = spec
           ? !!spec.base
           : (boundaryTransition && boundaryTransition !== 'none');
