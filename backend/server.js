@@ -3804,6 +3804,15 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       const wantsDenoise = isVideo && item.denoise === true;
       const wantsMotionBlur = isVideo && item.motionBlur === true;
       const wantsStabilize = isVideo && item.stabilize === true;
+      // Hold the last frame. The outro move - a clip that stops dead is abrupt, and a
+      // held final frame is where a caption or a logo goes.
+      //
+      // Clamped rather than trusted: this is duration the client asks the server to
+      // invent, and it is also duration the credit check upstream did not count, so an
+      // unbounded value would render time nobody was charged for.
+      const freezeEnd = isVideo
+        ? Math.max(0, Math.min(5, Number(item.freezeEnd) || 0))
+        : 0;
 
       // reverse is the one that cannot simply be switched on: it holds every
       // decoded frame of the clip in memory at once, because the last frame has to
@@ -3826,7 +3835,11 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // that will actually be shown.
       const extraVf =
         (wantsReverse ? ',reverse' : '') +
-        (wantsMotionBlur ? ',tmix=frames=3' : '');
+        (wantsMotionBlur ? ',tmix=frames=3' : '') +
+        // LAST in the chain, deliberately. tpad clones the final frame, so it has to
+        // see the frame every other filter has already finished with - put before
+        // reverse it would hold the frame the clip no longer ends on.
+        (freezeEnd > 0 ? `,tpad=stop_mode=clone:stop_duration=${freezeEnd}` : '');
       // afftdn is a spectral denoiser - it lifts hiss and room tone off a phone
       // voiceover, which is the case this exists for. areverse mirrors the video.
       // A clip can carry the voice chain too - a talking head recorded in camera has
@@ -3899,7 +3912,12 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
           // same voice. The preview is told to correct pitch too (shouldCorrectPitch),
           // because the two have to agree - expo-av left to its default shifts pitch
           // with rate, and the export would then not sound like what was auditioned.
-          const af = ['volume=' + clipVol].concat(extraAfPre).concat(spd !== 1 ? atempoChain(spd) : []).join(',');
+          // apad matches the audio to the held frame. Without it the stream ends where
+        // the sound did and the frozen tail has nothing under it, which ffmpeg resolves
+        // by ending the clip early - so the freeze silently would not happen at all.
+        const af = ['volume=' + clipVol].concat(extraAfPre)
+          .concat(spd !== 1 ? atempoChain(spd) : [])
+          .concat(freezeEnd > 0 ? [`apad=pad_dur=${freezeEnd}`] : []).join(',');
           cmd = `ffmpeg -y ${inSpec} -vf "${vfForClip}${extraVf}${speedVf}" -af "${af}" -pix_fmt yuv420p -r 30 -c:a aac "${clipOut}"`;
         } else {
           cmd = `ffmpeg -y ${inSpec} ${SILENCE_IN} -vf "${vfForClip}${extraVf}${speedVf}" -pix_fmt yuv420p -r 30 -map 0:v:0 -map 1:a:0 -c:a aac -shortest "${clipOut}"`;
