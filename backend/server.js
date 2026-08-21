@@ -2774,7 +2774,52 @@ const TIKTOK_CLIENT_SECRET = process.env.TIKTOK_SANDBOX_CLIENT_SECRET;
 const TIKTOK_REDIRECT_URI = process.env.TIKTOK_REDIRECT_URI;
 
 // In-memory token store (replace with DB later)
+// PKCE state lives here only for the length of one OAuth handshake, which is fine in
+// memory. Access tokens do not.
 const tiktokTokens = {};
+
+// TikTok access tokens, in Firestore rather than in that object.
+//
+// They were in it, and it is a plain `{}` - so every pm2 restart disconnected every
+// account. Nothing said so: the "Connected" badge reads connectedAccounts, which the
+// client writes and which survives, while the token the server actually needs did not.
+// The account looked linked and posting answered "TikTok not connected".
+//
+// Its own collection, not connectedAccounts/{uid}, because that document is readable by
+// its owner and these are bearer credentials. No security rule mentions this path, and
+// Firestore denies by default where no rule matches, so it is Admin-SDK-only by
+// construction rather than by a rule someone has to remember to keep.
+const TIKTOK_TOKENS = 'tiktokTokens';
+
+async function saveTikTokToken(openId, data) {
+  try {
+    await adminDb.collection(TIKTOK_TOKENS).doc(openId).set({
+      ...data,
+      // When the access token stops working, so a refresh can be attempted rather than
+      // the connection simply failing.
+      expiresAt: Date.now() + (Number(data.expires_in) || 86400) * 1000,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error('[tiktok] could not persist token:', e.message);
+  }
+}
+
+async function getTikTokToken(openId) {
+  if (!openId) return null;
+  const cached = tiktokTokens[openId];
+  if (cached?.access_token) return cached;
+  try {
+    const snap = await adminDb.collection(TIKTOK_TOKENS).doc(openId).get();
+    if (!snap.exists) return null;
+    const t = snap.data();
+    tiktokTokens[openId] = t;      // cache, so a burst of calls hits Firestore once
+    return t;
+  } catch (e) {
+    console.error('[tiktok] token lookup failed:', e.message);
+    return null;
+  }
+}
 
 // Step 1: Generate TikTok OAuth URL
 app.get('/tiktok/auth', tiktokLimiter, (req, res) => {
@@ -2831,8 +2876,9 @@ app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
 
     const { access_token, open_id, refresh_token, expires_in } = tokenData;
 
-    // Store token
+    // Store token, in memory AND on disk. The in-memory copy is only a cache now.
     tiktokTokens[open_id] = { access_token, refresh_token, expires_in, open_id };
+    await saveTikTokToken(open_id, { access_token, refresh_token, expires_in, open_id });
     delete tiktokTokens[state];
 
     // Get user info
@@ -2855,7 +2901,7 @@ app.get('/tiktok/user/:openId', tiktokLimiter, verifyToken, async (req, res) => 
   if (!(await tiktokOwnedBy(req.user?.uid, req.params.openId))) {
     return res.status(403).json({ error: 'Not your account.' });
   }
-  const token = tiktokTokens[req.params.openId];
+  const token = await getTikTokToken(req.params.openId);
   if (!token) return res.status(404).json({ error: 'Not connected' });
   res.json({ open_id: token.open_id, connected: true });
 });
@@ -2913,7 +2959,7 @@ app.post('/tiktok/post-video', tiktokLimiter, verifyToken, async (req, res) => {
     return res.status(400).json({ error: 'Only a video created in Tonefy can be posted.' });
   }
 
-  const token = tiktokTokens[openId];
+  const token = await getTikTokToken(openId);
   if (!token) return res.status(401).json({ error: 'TikTok not connected' });
 
   try {
@@ -2983,7 +3029,7 @@ app.get('/tiktok/post-status/:openId/:publishId', tiktokLimiter, verifyToken, as
     return res.status(403).json({ error: 'Not your account.' });
   }
   const { openId, publishId } = req.params;
-  const token = tiktokTokens[openId];
+  const token = await getTikTokToken(openId);
   if (!token) return res.status(401).json({ error: 'Not connected' });
 
   try {
