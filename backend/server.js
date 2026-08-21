@@ -2949,6 +2949,121 @@ function isOwnMediaUrl(u) {
   }
 }
 
+// Publishing, as a function rather than only as a route, so the queue sweep below runs
+// exactly the same path a Post Now does. Two implementations of "send this to TikTok"
+// would drift the first time one of them got a fix.
+//
+// Returns { ok, publishId } or { ok: false, error }. It never throws: the sweep records
+// the reason on the post rather than failing a whole pass over one bad item.
+async function publishToTikTok({ openId, videoUrl, title, privacyLevel = 'SELF_ONLY' }) {
+  const token = await getTikTokToken(openId);
+  if (!token) return { ok: false, error: 'TikTok not connected' };
+  try {
+    const videoRes = await fetch(videoUrl);
+    if (!videoRes.ok) return { ok: false, error: `Could not read the video (${videoRes.status})` };
+    const videoBuffer = Buffer.from(await videoRes.arrayBuffer());
+    const videoSize = videoBuffer.length;
+
+    const initRes = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token.access_token}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+      },
+      body: JSON.stringify({
+        post_info: {
+          title: title || 'Created with Tonefy AI',
+          privacy_level: privacyLevel,
+          disable_duet: false, disable_comment: false, disable_stitch: false,
+          video_cover_timestamp_ms: 1000,
+        },
+        source_info: {
+          source: 'FILE_UPLOAD', video_size: videoSize,
+          chunk_size: videoSize, total_chunk_count: 1,
+        },
+      }),
+    });
+    const initData = await initRes.json();
+    if (initData.error?.code !== 'ok') {
+      return { ok: false, error: initData.error?.message || 'Failed to init post' };
+    }
+    const uploadUrl = initData.data?.upload_url;
+    const publishId = initData.data?.publish_id;
+    await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Range': `bytes 0-${videoSize - 1}/${videoSize}`,
+        'Content-Type': 'video/mp4',
+      },
+      body: videoBuffer,
+    });
+    return { ok: true, publishId };
+  } catch (e) {
+    return { ok: false, error: e.message || 'Upload failed' };
+  }
+}
+
+// The queue actually publishes now.
+//
+// "Add to queue" wrote a scheduledPosts document with status 'queued' and told the user
+// "Added to queue!" - and nothing anywhere read that collection. The post never
+// happened, and the Calendar screen listed it as though it would. A promise the app
+// could not keep.
+//
+// Every 5 minutes: anything queued and due, published through the same function Post Now
+// uses, then marked posted or failed with the reason on the document so the Calendar can
+// say what went wrong rather than showing it as pending for ever.
+//
+// Ownership is re-checked at publish time, not trusted from the queued document. A post
+// sitting in a queue for a week outlives the connection that created it, and by then the
+// account may have been disconnected or linked to someone else.
+const QUEUE_SWEEP_MS = 5 * 60 * 1000;
+async function scheduledPostSweep() {
+  let snap;
+  try {
+    snap = await adminDb.collection('scheduledPosts').where('status', '==', 'queued').get();
+  } catch (e) {
+    console.error('[queue] could not read scheduled posts:', e.message);
+    return;
+  }
+  const now = Date.now();
+  for (const doc of snap.docs) {
+    const p = doc.data();
+    const due = Date.parse(p.scheduledFor || '');
+    if (Number.isFinite(due) && due > now) continue;          // not yet
+    if (!Array.isArray(p.platforms) || !p.platforms.includes('tiktok')) continue;
+
+    const fail = async (error) => {
+      await doc.ref.set({ status: 'failed', error, attemptedAt: new Date().toISOString() }, { merge: true });
+      console.warn(`[queue] ${doc.id}: ${error}`);
+    };
+
+    let openId = null;
+    try {
+      const acc = await adminDb.collection('connectedAccounts').doc(p.userId).get();
+      openId = acc.exists ? acc.data()?.tiktok?.openId : null;
+    } catch (e) {
+      // Could not establish ownership. Leave it queued and try next pass rather than
+      // marking a good post failed over a transient Firestore error.
+      console.warn(`[queue] ${doc.id}: ownership lookup failed, leaving queued`);
+      continue;
+    }
+    if (!openId) { await fail('TikTok is no longer connected to this account.'); continue; }
+    if (!isOwnMediaUrl(p.videoUrl)) { await fail('That video is no longer available.'); continue; }
+
+    const r = await publishToTikTok({ openId, videoUrl: p.videoUrl, title: p.caption });
+    if (r.ok) {
+      await doc.ref.set({ status: 'posted', publishId: r.publishId || null,
+        postedAt: new Date().toISOString(), error: null }, { merge: true });
+      console.log(`[queue] posted ${doc.id}`);
+    } else {
+      await fail(r.error);
+    }
+  }
+}
+setInterval(scheduledPostSweep, QUEUE_SWEEP_MS);
+scheduledPostSweep();
+
 app.post('/tiktok/post-video', tiktokLimiter, verifyToken, async (req, res) => {
   const { openId, videoUrl, title, privacyLevel = 'SELF_ONLY' } = req.body;
 
