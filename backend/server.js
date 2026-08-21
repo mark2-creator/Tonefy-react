@@ -938,6 +938,69 @@ app.get("/api/translate-languages", mediaProcLimiter, (req, res) => {
 // is ten-plus minutes of work, which would sit past nginx's 600s proxy_read_timeout
 // and past any patience the caller has. The app already polls /api/job/:jobId for
 // renders, so this reuses that rather than inventing a second waiting mechanism.
+// Pull a clip's sound out into a file of its own, so it can live on the timeline as an
+// audio track - draggable, trimmable, fadeable, and able to outlive the clip it came from.
+//
+// Synchronous, unlike /api/translate-video which this otherwise mirrors. That one returns
+// a jobId because whisper runs SLOWER THAN REALTIME (measured: 74s of audio did not finish
+// inside two minutes), so a five-minute clip would sail past nginx's 600s proxy_read_timeout.
+// This is a straight demux-and-encode with no model in it - a few seconds for a long clip -
+// so a job, a poller and a render slot would all be machinery around nothing.
+//
+// No credit charge and no plan gate: this spends almost nothing and produces no video.
+// It is the kind of thing that being metered would make people avoid using.
+app.post("/api/extract-audio", verifyToken, mediaProcLimiter, async (req, res) => {
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url required" });
+
+  const scratch = [];
+  try {
+    let srcPath;
+    if (url.startsWith("http")) {
+      if (!isOwnMediaUrl(url)) {
+        // Fetching an arbitrary caller-supplied URL server-side is an SSRF, and this
+        // server sits on a VPS with other services on localhost.
+        return res.status(400).json({ error: "That media is not on this server." });
+      }
+      srcPath = path.join(uploadsDir, uniqueName("extractsrc", "mp4"));
+      await downloadToFile(url, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+      scratch.push(srcPath);
+    } else {
+      srcPath = resolveMediaPath(url);
+    }
+    if (!fs.existsSync(srcPath)) {
+      return res.status(404).json({ error: "That clip could not be found on the server." });
+    }
+
+    // Probe for an audio stream FIRST. Without this, a silent clip returns a valid but
+    // empty mp3 and the user gets a track on the timeline that plays nothing, with no
+    // explanation - a worse outcome than being told the clip has no sound.
+    const streams = await run("ffprobe", ["-v", "error", "-select_streams", "a",
+      "-show_entries", "stream=codec_type", "-of", "csv=p=0", srcPath], { timeout: 30000 })
+      .catch(() => "");
+    if (!String(streams).includes("audio")) {
+      return res.status(400).json({ error: "This clip has no sound to extract." });
+    }
+
+    const outName = uniqueName("extracted", "mp3");
+    const outPath = path.join(audiosDir, outName);
+    // 192k stereo: this becomes a real track the user may keep after deleting the clip,
+    // so it should not be the last generation at which quality still mattered.
+    await run("ffmpeg", ["-y", "-i", srcPath, "-vn", "-c:a", "libmp3lame",
+      "-b:a", "192k", "-ar", "44100", outPath], { timeout: 180000 });
+
+    const durationSeconds = await probeDurationSeconds(outPath).catch(() => 0);
+    res.json({ audioUrl: `/audios/${outName}`, durationSeconds });
+  } catch (e) {
+    console.error("[extract-audio]", e.message);
+    res.status(500).json({ error: "Could not extract the audio from this clip." });
+  } finally {
+    // The txtrender-*.png leak (aaa0f043) is the precedent: a scratch file with no
+    // unlink grows without bound and nobody notices until the disk does.
+    for (const f of scratch) { try { fs.unlinkSync(f); } catch (e) {} }
+  }
+});
+
 app.post("/api/translate-video", verifyToken, mediaProcLimiter, async (req, res) => {
   const { url, targetLang } = req.body || {};
   if (!url) return res.status(400).json({ error: "url required" });
@@ -3645,6 +3708,70 @@ const VOICE_CHAIN = [
   'loudnorm=I=-16:TP=-1.5:LRA=11',
 ];
 
+// Audio effects, applied to a clip's own sound or to an audio track.
+//
+// The app sends an ID and nothing else. It does NOT send a filter string, unlike the
+// video effect/motion/transition paths which take a chain and validate it - and that
+// asymmetry is deliberate. Those exist because their catalogues are large, live in the
+// app, and change without a deploy. This one is small enough that the safer shape is
+// affordable: an unknown id renders nothing rather than being rejected-or-injected, and
+// there is no filtergraph-injection surface here at all because no caller-supplied text
+// ever reaches the command line.
+//
+// Every chain below was rendered against real speech and MEASURED, not eyeballed, with
+// an instrument chosen per class - because the wrong instrument reports a working effect
+// as dead, which is exactly what happened on the first pass here:
+//
+//   reverbs   autocorrelation at the delay lag. A whole-file FFT magnitude spectrum is
+//             nearly blind to an echo (a delay moves phase, not magnitude), and reported
+//             all five as no-ops. Measured properly they lift the lag peak from ~0.00 to
+//             +0.27 (room) .. +0.60 (stadium).
+//   pitch     median spectral-peak ratio across voiced frames. Autocorrelation f0 octave-
+//             errored and reported `deep` as unchanged; by peak ratio it is exactly 0.700.
+//   tone      energy share in the band the filter targets, not overall distance.
+//   loudness  level, not spectrum. loudnorm is SUPPOSED to leave tone alone; judged on a
+//             spectral measure it looks like a no-op while working perfectly (x1.40 level).
+//
+// bassBoost was retuned because of this pass rather than in spite of it: at
+// `g=8:f=110` it measured x1.10 on speech - technically applied, inaudible in practice,
+// since voice carries almost nothing below 110Hz. At `g=12:f=180` it measures x2.06.
+const AUDIO_FX = {
+  // Space
+  room:        'aecho=0.8:0.85:40:0.25',
+  hall:        'aecho=0.8:0.9:60|120:0.4|0.25',
+  cathedral:   'aecho=0.8:0.9:150|300|450:0.5|0.35|0.2',
+  stadium:     'aecho=0.8:0.9:250|500|750:0.5|0.35|0.2,bass=g=3:f=110',
+  slapback:    'aecho=0.8:0.88:120:0.5',
+  // Tone
+  bassboost:   'bass=g=12:f=180:w=0.4',
+  trebleboost: 'treble=g=6:f=4000',
+  warm:        'bass=g=4:f=120,treble=g=-3:f=6000',
+  bright:      'treble=g=7:f=5000,equalizer=f=2500:t=q:w=1.2:g=3',
+  deess:       'deesser=i=0.5',
+  loudness:    'loudnorm=I=-16:TP=-1.5:LRA=11',
+  // Voice
+  chipmunk:    'rubberband=pitch=1.5',
+  deep:        'rubberband=pitch=0.7',
+  uptone:      'rubberband=pitch=1.122',
+  downtone:    'rubberband=pitch=0.891',
+  robot:       "afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:overlap=0.75",
+  // Character
+  telephone:   'highpass=f=400,lowpass=f=3200,acompressor=ratio=4',
+  radio:       'highpass=f=200,lowpass=f=5000,acompressor=threshold=0.1:ratio=6:attack=5:release=50,volume=1.3',
+  podcast:     'highpass=f=80,equalizer=f=200:t=q:w=1:g=-3,equalizer=f=3000:t=q:w=1:g=3,acompressor=threshold=0.08:ratio=3:attack=10:release=120',
+  underwater:  'lowpass=f=700,aecho=0.8:0.9:60:0.4',
+  megaphone:   'highpass=f=500,lowpass=f=4000,acrusher=bits=8:mode=log,volume=1.2',
+  vinyl:       'highpass=f=100,lowpass=f=7000,aecho=0.9:0.9:12:0.15,volume=1.1',
+  bitcrush:    'acrusher=bits=6:samples=4:mode=log',
+};
+
+// Returns the filters for an id, or [] for anything unknown - including undefined, which
+// is the ordinary case for every clip and track nobody has put an effect on.
+function audioFxChain(id) {
+  const chain = AUDIO_FX[typeof id === 'string' ? id : ''];
+  return chain ? [chain] : [];
+}
+
 function safeTransitionSpec(spec) {
   if (!spec || typeof spec !== 'object') return null;
   const base = String(spec.base || '').trim();
@@ -4030,7 +4157,7 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
           // apad matches the audio to the held frame. Without it the stream ends where
         // the sound did and the frozen tail has nothing under it, which ffmpeg resolves
         // by ending the clip early - so the freeze silently would not happen at all.
-        const af = ['volume=' + clipVol].concat(extraAfPre)
+        const af = ['volume=' + clipVol].concat(audioFxChain(item.audioFx)).concat(extraAfPre)
           .concat(spd !== 1 ? atempoChain(spd) : [])
           .concat(freezeEnd > 0 ? [`apad=pad_dur=${freezeEnd}`] : []).join(',');
           cmd = `ffmpeg -y ${inSpec} -vf "${vfForClip}${extraVf}${speedVf}" -af "${af}" -pix_fmt yuv420p -r 30 -c:a aac "${clipOut}"`;
@@ -4831,6 +4958,10 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
         // No model anywhere in it. arnndn exists on this box and would need a .rnnn
         // file; afftdn gets close enough on speech without one.
         if (t.enhanceVoice === true) chain.push(...VOICE_CHAIN);
+        // Before atrim, so the effect applies to the audio itself rather than to a
+        // window of it - and before adelay for the same reason a fade is: the effect
+        // belongs to the sound, not to where the sound sits in the finished video.
+        chain.push(...audioFxChain(t.audioFx));
         const trimStart = Number(t.trimStart) > 0 ? sec(t.trimStart) : 0;
         const trimEnd = Number(t.trimEnd) > trimStart ? sec(t.trimEnd) : null;
         if (trimStart > 0 || trimEnd !== null) {
