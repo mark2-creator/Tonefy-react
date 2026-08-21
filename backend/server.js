@@ -236,9 +236,10 @@ const jobPollLimiter = rateLimit({
   validate: { xForwardedForHeader: false }
 });
 
-// TikTok's routes are outside /api, so app.use("/api", verifyToken) does not
-// reach them and they are unauthenticated. Rate limiting is not a substitute
-// for that - see the note on /tiktok/post-video - but it does bound the damage.
+// TikTok's routes are outside /api, so app.use("/api", verifyToken) does not reach
+// them. The three that ACT on an account now carry verifyToken inline plus an ownership
+// check; auth and callback stay open because they are the OAuth handshake and the
+// callback arrives from TikTok, not from a logged-in client.
 const tiktokLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 60,
@@ -2850,15 +2851,67 @@ app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
 });
 
 // Step 3: Get stored TikTok user info
-app.get('/tiktok/user/:openId', tiktokLimiter, (req, res) => {
+app.get('/tiktok/user/:openId', tiktokLimiter, verifyToken, async (req, res) => {
+  if (!(await tiktokOwnedBy(req.user?.uid, req.params.openId))) {
+    return res.status(403).json({ error: 'Not your account.' });
+  }
   const token = tiktokTokens[req.params.openId];
   if (!token) return res.status(404).json({ error: 'Not connected' });
   res.json({ open_id: token.open_id, connected: true });
 });
 
 // Step 4: Post video to TikTok
-app.post('/tiktok/post-video', tiktokLimiter, async (req, res) => {
+// Does this openId belong to the caller?
+//
+// tiktokTokens is keyed by openId alone, so knowing someone's openId was enough to act
+// as them - post to their account, read their profile, poll their uploads. An openId is
+// not a secret: it travels to both clients and is stored in Firestore.
+//
+// connectedAccounts/{uid}.tiktok.openId is written when the account is linked, so it is
+// the record of who owns what. Checked against the VERIFIED uid from the token, never
+// anything in the body.
+async function tiktokOwnedBy(uid, openId) {
+  if (!uid || !openId) return false;
+  try {
+    const snap = await adminDb.collection('connectedAccounts').doc(uid).get();
+    return snap.exists && snap.data()?.tiktok?.openId === openId;
+  } catch (e) {
+    // A lookup failure must not become an authorisation. Unlike the plan checks, where
+    // failing open costs a subscriber nothing, failing open here posts to a stranger's
+    // TikTok.
+    console.error('tiktokOwnedBy lookup failed:', e.message);
+    return false;
+  }
+}
+
+// The video must live on THIS server.
+//
+// The handler downloads whatever URL it is given, and the route was unauthenticated, so
+// anyone on the internet could make this box fetch any address - including the other
+// pm2 services on localhost and the cloud metadata endpoint. That is a server-side
+// request forgery, and rate limiting bounds it without preventing it.
+//
+// Both clients already send `${BACKEND}${videoPath}`, so nothing legitimate is refused.
+function isOwnMediaUrl(u) {
+  try {
+    const parsed = new URL(String(u));
+    if (parsed.protocol !== 'https:') return false;
+    if (parsed.hostname !== 'api.fitlifesolutions.site') return false;
+    return /^\/(videos|uploads)\//.test(parsed.pathname);
+  } catch (e) {
+    return false;
+  }
+}
+
+app.post('/tiktok/post-video', tiktokLimiter, verifyToken, async (req, res) => {
   const { openId, videoUrl, title, privacyLevel = 'SELF_ONLY' } = req.body;
+
+  if (!(await tiktokOwnedBy(req.user?.uid, openId))) {
+    return res.status(403).json({ error: 'That TikTok account is not connected to this login.' });
+  }
+  if (!isOwnMediaUrl(videoUrl)) {
+    return res.status(400).json({ error: 'Only a video created in Tonefy can be posted.' });
+  }
 
   const token = tiktokTokens[openId];
   if (!token) return res.status(401).json({ error: 'TikTok not connected' });
@@ -2925,7 +2978,10 @@ app.post('/tiktok/post-video', tiktokLimiter, async (req, res) => {
 });
 
 // Step 5: Check post status
-app.get('/tiktok/post-status/:openId/:publishId', tiktokLimiter, async (req, res) => {
+app.get('/tiktok/post-status/:openId/:publishId', tiktokLimiter, verifyToken, async (req, res) => {
+  if (!(await tiktokOwnedBy(req.user?.uid, req.params.openId))) {
+    return res.status(403).json({ error: 'Not your account.' });
+  }
   const { openId, publishId } = req.params;
   const token = tiktokTokens[openId];
   if (!token) return res.status(401).json({ error: 'Not connected' });
