@@ -1024,7 +1024,12 @@ app.post("/api/thumbnail", verifyToken, mediaProcLimiter, async (req, res) => {
     const outPath = path.join(videosDir, outName);
     await run("convert", [composed, "-quality", "92", outPath], { timeout: 60000 });
 
-    res.json({ thumbnailUrl: `/videos/${outName}`, width: size.w, height: size.h });
+    // The source's length goes back with it, because the app cannot rely on having it:
+    // only two of the three userVideos writers store durationSeconds, and the one that
+    // does not is Idea-to-Video - which is where most of these videos come from. Without
+    // this the frame slider has no range to offer and every thumbnail is frame zero.
+    const durationSeconds = await probeDurationSeconds(srcPath).catch(() => 0);
+    res.json({ thumbnailUrl: `/videos/${outName}`, width: size.w, height: size.h, durationSeconds });
   } catch (e) {
     console.error("[thumbnail]", e.message);
     res.status(500).json({ error: "Could not make a thumbnail from this video." });
