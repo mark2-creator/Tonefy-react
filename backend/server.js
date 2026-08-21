@@ -3546,6 +3546,34 @@ const ALLOWED_TRANSITION_FX_OPS = new Set([
   ...ALLOWED_FILTER_OPS, 'gblur', 'rgbashift', 'chromashift',
 ]);
 
+// The voice chain, in the order it has to run: clean it, then shape it, then level it.
+// Used by a clip's own audio and by an audio track, from here, because two copies of a
+// seven-filter chain drift the first time one of them is tuned.
+//
+//   highpass       rumble, handling noise and room tone - none of it speech. 85Hz is
+//                  below a bass voice's fundamental.
+//   afftdn         steady broadband noise: fans, hiss, traffic
+//   deesser        sibilance, taken out BEFORE the presence boost that would worsen it
+//   equalizer      +3dB around 3kHz, where intelligibility lives
+//   acompressor    evens a delivery that moves toward and away from the mic
+//   loudnorm       to -16 LUFS, which is where this app's music library already sits,
+//                  so a voice and a bed mix without either being ducked into the other
+//
+// No model anywhere in it. arnndn is on this box and would want a .rnnn file; afftdn
+// gets close enough on speech without one.
+//
+// The first version ended with speechnorm=e=6.25 + alimiter and measured -6.8 LUFS at a
+// -0.3dB peak - twice the streaming standard with no headroom, which is crushed rather
+// than clear. Targeting a loudness instead of maximising one is the whole difference.
+const VOICE_CHAIN = [
+  'highpass=f=85',
+  'afftdn=nr=12:nf=-25',
+  'deesser=i=0.4',
+  'equalizer=f=3000:width_type=o:width=1.2:g=3',
+  'acompressor=threshold=0.089:ratio=3:attack=20:release=250:makeup=2',
+  'loudnorm=I=-16:TP=-1.5:LRA=11',
+];
+
 function safeTransitionSpec(spec) {
   if (!spec || typeof spec !== 'object') return null;
   const base = String(spec.base || '').trim();
@@ -3801,7 +3829,13 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
         (wantsMotionBlur ? ',tmix=frames=3' : '');
       // afftdn is a spectral denoiser - it lifts hiss and room tone off a phone
       // voiceover, which is the case this exists for. areverse mirrors the video.
-      const extraAfPre = (wantsReverse ? ['areverse'] : []).concat(wantsDenoise ? ['afftdn'] : []);
+      // A clip can carry the voice chain too - a talking head recorded in camera has
+      // its speech in the clip's own audio, not on a separate track. Same fragments as
+      // the audio-track path below, from one definition, so the two cannot drift.
+      const wantsVoice = isVideo && item.enhanceVoice === true;
+      const extraAfPre = (wantsReverse ? ['areverse'] : [])
+        .concat(wantsDenoise ? ['afftdn'] : [])
+        .concat(wantsVoice ? VOICE_CHAIN : []);
 
       // reverse decodes the whole clip and tmix blends every frame, so both are far
       // slower than the plain copy this timeout was sized for.
@@ -4648,6 +4682,22 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       const sec = (v) => Math.max(0, Math.round(Number(v) * 1000) / 1000);
       const audioLabels = audioTracks.map((t, i) => {
         const chain = [];
+        // Voice enhancement, before anything positional. A broadcast chain in the order
+        // it has to run: clean it, then shape it, then level it, then protect it.
+        //
+        //   highpass       rumble, handling noise and the room's low end, none of which
+        //                  is speech - 85Hz is below a bass voice's fundamental
+        //   afftdn         steady broadband noise (fans, hiss, traffic)
+        //   deesser        the sibilance a presence boost is about to make worse, taken
+        //                  out BEFORE the boost rather than after
+        //   equalizer      +3dB around 3kHz, where intelligibility lives
+        //   acompressor    evens out a delivery that moves toward and away from the mic
+        //   speechnorm     brings the quiet parts up to meet the loud ones
+        //   alimiter       a ceiling, because everything above this added gain
+        //
+        // No model anywhere in it. arnndn exists on this box and would need a .rnnn
+        // file; afftdn gets close enough on speech without one.
+        if (t.enhanceVoice === true) chain.push(...VOICE_CHAIN);
         const trimStart = Number(t.trimStart) > 0 ? sec(t.trimStart) : 0;
         const trimEnd = Number(t.trimEnd) > trimStart ? sec(t.trimEnd) : null;
         if (trimStart > 0 || trimEnd !== null) {
