@@ -939,6 +939,100 @@ app.get("/api/translate-languages", mediaProcLimiter, (req, res) => {
 // is ten-plus minutes of work, which would sit past nginx's 600s proxy_read_timeout
 // and past any patience the caller has. The app already polls /api/job/:jobId for
 // renders, so this reuses that rather than inventing a second waiting mechanism.
+// A thumbnail: one frame of a video, with a headline burned into it.
+//
+// The text goes through createTextRenderer - the SAME code that burns captions into an
+// export - so a thumbnail's stroke, glow, shadow, box and tracking are the app's caption
+// styles rather than a second interpretation of them. That was the whole reason the
+// renderer was extracted; a lookalike here would drift from the export the first time
+// either got a fix.
+//
+// Synchronous. One frame extract plus one overlay render is a couple of seconds, well
+// inside nginx's 600s window, so no job and no render slot.
+const THUMB_SIZES = {
+  '16:9':  { w: 1280, h: 720 },   // YouTube
+  '9:16':  { w: 720,  h: 1280 },  // Shorts / TikTok / Reels
+  '1:1':   { w: 1080, h: 1080 },  // feed
+};
+
+app.post("/api/thumbnail", verifyToken, mediaProcLimiter, async (req, res) => {
+  const { url, atSeconds = 0, aspectRatio = '16:9', textOverlays = [], previewWidth } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url required" });
+  const size = THUMB_SIZES[aspectRatio] || THUMB_SIZES['16:9'];
+
+  const scratch = [];
+  try {
+    let srcPath;
+    if (url.startsWith("http")) {
+      if (!isOwnMediaUrl(url)) {
+        return res.status(400).json({ error: "That media is not on this server." });
+      }
+      srcPath = path.join(uploadsDir, uniqueName("thumbsrc", "mp4"));
+      await downloadToFile(url, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+      scratch.push(srcPath);
+    } else {
+      srcPath = resolveMediaPath(url);
+    }
+    if (!fs.existsSync(srcPath)) {
+      return res.status(404).json({ error: "That media could not be found on the server." });
+    }
+
+    // The frame, scaled and cropped to fill the thumbnail rather than letterboxed - a
+    // thumbnail with black bars down the side is not one anybody would publish.
+    // -ss before -i so ffmpeg seeks rather than decoding up to the timestamp; a
+    // thumbnail from four minutes in should not cost four minutes of decoding.
+    const at = Math.max(0, num(atSeconds, 0));
+    const framePng = path.join(uploadsDir, uniqueName("thumbframe", "png"));
+    scratch.push(framePng);
+    await run("ffmpeg", ["-y", "-ss", String(at), "-i", srcPath, "-frames:v", "1",
+      "-vf", `scale=${size.w}:${size.h}:force_original_aspect_ratio=increase,crop=${size.w}:${size.h}`,
+      framePng], { timeout: 120000 });
+    if (!fs.existsSync(framePng)) {
+      // Seeking past the end of the file produces no frame and no error.
+      return res.status(400).json({ error: "There is no frame at that moment in this video." });
+    }
+
+    let composed = framePng;
+    if (Array.isArray(textOverlays) && textOverlays.length > 0) {
+      const renderer = createTextRenderer({
+        W: size.w, H: size.h,
+        exportScale: size.w / (previewWidth || 360),
+        uploadsDir,
+        fontsDir: path.join(__dirname, 'fonts'),
+        fontFileMap: loadFontFileMap(),
+        run, uniqueName, mapWithConcurrency, num, safeColor,
+      });
+      const rendered = await renderer.render(textOverlays);
+      // One composite per overlay. The export builds an ffmpeg filtergraph instead
+      // because it is placing these onto a moving picture with timing; a still needs
+      // neither, and `composite` is the cheaper tool for it.
+      for (const { outPng, placeX, placeY } of rendered) {
+        const next = path.join(uploadsDir, uniqueName("thumbcomp", "png"));
+        await run("composite", ["-geometry", `+${placeX}+${placeY}`, outPng, composed, next],
+          { timeout: 60000 });
+        if (composed !== framePng) { try { fs.unlinkSync(composed); } catch (e) {} }
+        try { fs.unlinkSync(outPng); } catch (e) {}
+        composed = next;
+        scratch.push(next);
+      }
+    }
+
+    // JPEG, not PNG: a thumbnail is a photograph with text on it, and every platform
+    // that takes one re-encodes it anyway. quality 92 is visually lossless here and
+    // roughly a tenth of the PNG.
+    const outName = uniqueName("thumbnail", "jpg");
+    const outPath = path.join(videosDir, outName);
+    await run("convert", [composed, "-quality", "92", outPath], { timeout: 60000 });
+
+    res.json({ thumbnailUrl: `/videos/${outName}`, width: size.w, height: size.h });
+  } catch (e) {
+    console.error("[thumbnail]", e.message);
+    res.status(500).json({ error: "Could not make a thumbnail from this video." });
+  } finally {
+    for (const f of scratch) { try { fs.unlinkSync(f); } catch (e) {} }
+  }
+});
+
 // Beat times for an audio track, so cuts can land on the beat instead of near it.
 //
 // Returns a GRID, not raw onsets. A grid is what a musician means by "the beat" and what
