@@ -351,7 +351,16 @@ async function callLLM({ system, user, max_tokens = 400, temperature = 0.8 }) {
     );
     const cfData = await cfRes.json();
     if (cfRes.ok) {
-      const text = cfData.result?.response?.trim();
+      // Cloudflare moved to an OpenAI-shaped reply: result.choices[0].message.content.
+      // The old field was result.response, which is now undefined - so calling .trim()
+      // on it THREW, and the throw was caught by the wrapper below and reported as
+      // "Cloudflare AI fallback failed". The fallback has therefore been dead, silently,
+      // and every AI feature in the app - scripts, translation, this - has had no cover
+      // at all whenever Groq rate-limits. Both shapes are read, so a revert on their
+      // side does not break it again.
+      const text = (cfData.result?.choices?.[0]?.message?.content
+        ?? cfData.result?.response
+        ?? '')?.trim?.();
       if (text) {
         console.log('[FALLBACK] Used Cloudflare Workers AI');
         return text;
@@ -2006,6 +2015,68 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
   } catch (err) {
     console.error("Script error:", err.message);
     res.status(500).json({ error: "Failed to generate script" });
+  }
+});
+
+// Turn "make the colours warmer and add film grain" into real catalogue choices.
+//
+// The screen offered a text box, a send button and three prompt chips, and none of them
+// did anything. This is the one part of that section that can be built for nothing:
+// Groq is already wired for scripts and translation, so a request costs what every other
+// LLM call here costs.
+//
+// The model PICKS FROM A LIST rather than describing a look. Asked to invent, it returns
+// plausible ids that do not exist and the app silently applies nothing - so the reply is
+// constrained to ids the client sent, and anything not on that list is dropped here
+// rather than failing quietly on the device.
+app.post("/api/suggest-look", scriptLimiter, async (req, res) => {
+  const { prompt, filters = [], effects = [], motions = [], speeds = [] } = req.body || {};
+  if (!prompt?.trim()) return res.status(400).json({ error: "Describe what you want." });
+
+  // Bounded: this goes into a prompt, and a caller could otherwise paste a catalogue of
+  // any size and turn one request into a very expensive one.
+  const list = (a) => a.filter(x => typeof x === 'string').slice(0, 200).join(', ');
+  try {
+    const reply = await callLLM({
+      system:
+        'You choose video edit settings. Reply with ONLY a JSON object, no prose, no code fence.\n' +
+        'Keys: filter, effect, motion, speed. Each value must be EXACTLY one id from the lists given, ' +
+        'or null if nothing fits. Never invent an id. Prefer null over a poor match.\n' +
+        `filters: ${list(filters)}\n` +
+        `effects: ${list(effects)}\n` +
+        `motions: ${list(motions)}\n` +
+        // Slow motion is a speed, not a look. Without this list the model answered a
+        // request for slow-mo with a saturated filter and a strobe - a valid id from
+        // the lists it was given, and not remotely what was asked for. The options a
+        // model is offered decide what it can possibly be right about.
+        `speeds (playback rate, 1 is normal): ${list(speeds)}`,
+      user: prompt.slice(0, 400),
+      max_tokens: 120,
+      // Near zero: this is a lookup, not a piece of writing.
+      temperature: 0.1,
+    });
+
+    let parsed = null;
+    try {
+      // Models wrap JSON in prose or a fence however firmly asked not to, so the object
+      // is extracted rather than the whole reply being parsed.
+      const m = /\{[\s\S]*\}/.exec(reply || '');
+      parsed = m ? JSON.parse(m[0]) : null;
+    } catch (e) { parsed = null; }
+    if (!parsed) return res.status(502).json({ error: "Could not understand that. Try describing the look differently." });
+
+    // Only ids the caller actually offered. A hallucinated one would apply nothing and
+    // look like the feature ignoring the request.
+    const pick = (v, allowed) => (typeof v === 'string' && allowed.includes(v) ? v : null);
+    res.json({
+      filter: pick(parsed.filter, filters),
+      effect: pick(parsed.effect, effects),
+      motion: pick(parsed.motion, motions),
+      speed: pick(String(parsed.speed ?? ''), speeds),
+    });
+  } catch (err) {
+    console.error("suggest-look error:", err.message);
+    res.status(500).json({ error: "Could not work that out. Please try again." });
   }
 });
 
