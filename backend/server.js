@@ -4033,11 +4033,67 @@ function chromaKeyFilter(W, H, item, bg) {
     + `[ckbgout][ckfgout]overlay=(W-w)/2:(H-h)/2`;
 }
 
+// Quarter-turn rotation. It has to run BEFORE the fit-to-frame, because a transpose
+// swaps width and height and the fit is what puts the result back into the output frame.
+// Quarter turns only, deliberately: an arbitrary angle leaves empty corners that need a
+// cover-zoom computed from the clip's real dimensions, and the case that actually comes
+// up is footage shot sideways.
+function clipRotateFilter(item = {}) {
+  const deg = ((Math.round(num(item.rotate, 0) / 90) * 90) % 360 + 360) % 360;
+  if (deg === 90) return 'transpose=1';
+  if (deg === 270) return 'transpose=2';
+  if (deg === 180) return 'hflip,vflip';
+  return '';
+}
+
+// Zoom and pan inside the frame, and clip opacity. Both run after the fit, so the frame
+// is already W x H and these cannot change its size.
+//
+// The crop expressions are deliberately dimension-agnostic: after `scale=iw*S:ih*S`, the
+// crop filter's own `in_w` IS the scaled width, so `in_w/S` is exactly the original. No
+// clip's real dimensions are needed at build time, which is what lets this sit in a
+// shared helper rather than being computed per clip.
+//
+// Zoom is 1.0 and up only. Below 1 the crop would ask for more picture than exists and
+// the filter fails - zooming out needs a pad and a decision about what fills the margin,
+// which is what the Background setting already answers.
+function clipTransformFilter(item = {}) {
+  const t = item.transform;
+  if (!t || typeof t !== 'object') return [];
+  const z = Math.max(1, Math.min(3, num(t.zoom, 1)));
+  const dx = Math.round(Math.max(-100, Math.min(100, num(t.x, 0))));
+  const dy = Math.round(Math.max(-100, Math.min(100, num(t.y, 0))));
+  if (z === 1 && dx === 0 && dy === 0) return [];
+  const S = z.toFixed(4);
+  // The offset is a percentage of the hidden margin, so the pan cannot run off the
+  // picture at any zoom - at z=1 there is no margin and it correctly does nothing.
+  const ox = `(in_w-in_w/${S})*${(0.5 + dx / 200).toFixed(4)}`;
+  const oy = `(in_h-in_h/${S})*${(0.5 + dy / 200).toFixed(4)}`;
+  return [`scale=iw*${S}:ih*${S}`, `crop=in_w/${S}:in_h/${S}:${ox}:${oy}`];
+}
+
+// Clip opacity, over black.
+//
+// It composites against a box it draws itself rather than relying on whatever is behind
+// it, because in the default `fill` mode there IS nothing behind it: frameFitFilter only
+// builds a background layer when fit is 'fit'. Setting alpha alone would have been
+// discarded on the way to yuv420p and done nothing at all - visibly fine in `fit` mode
+// and a silent no-op in the mode almost everyone uses.
+function clipOpacityFilter(item = {}) {
+  const o = num(item.opacity, 1);
+  if (!(o >= 0 && o < 1)) return '';
+  const a = o.toFixed(3);
+  return `split[opa][opb];[opa]drawbox=x=0:y=0:w=iw:h=ih:color=black@1:t=fill[opbg];`
+    + `[opb]format=rgba,colorchannelmixer=aa=${a}[opfg];[opbg][opfg]overlay=0:0`;
+}
+
 function clipLookFilter(item = {}) {
   const parts = [];
   // Mirroring is about the framing, so it comes before the grade.
   if (item.flipH) parts.push('hflip');
   if (item.flipV) parts.push('vflip');
+  // Framing before grading: a zoom changes what is in shot, not how it is coloured.
+  parts.push(...clipTransformFilter(item));
 
   // The app sends the grade as a chain, so the catalogue lives in one place and a
   // filter added there renders without a deploy here. Older clients send only a name
@@ -4144,7 +4200,11 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // between them. It has to run on source-resolution frames, before the fit into
       // the output frame - vidstabtransform shifts and rotates the picture, and doing
       // that after the pad would move the padding around with it.
-      const vfHead = srcCrop ? srcCrop + ',' : '';
+      // Rotation belongs with the source crop, ahead of the fit: a transpose swaps
+      // width and height, and the fit is what puts the turned picture back into the
+      // output frame. After the fit it would leave the frame the wrong shape.
+      const rotate = clipRotateFilter(item);
+      const vfHead = [srcCrop, rotate].filter(Boolean).join(',') + ((srcCrop || rotate) ? ',' : '');
       // Motion runs LAST, on frames already fitted to the output size. Running it
       // earlier would reframe the source and then let the fit undo it - a zoompan
       // followed by a pad puts the padding back around the zoomed picture, so the zoom
@@ -4163,8 +4223,12 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // was asked to do. Same validator: both are single filter strings carrying
       // expressions, and both must be unable to escape into the wider filtergraph.
       const effect = safeMotionChain(item.effectSpec, W, H, 30);
+      // Opacity is last because it composites the finished picture - the grade, the
+      // motion and the effect all have to have happened before it fades.
+      const opacity = clipOpacityFilter(item);
       const vfTail = `${chroma || frameFitFilter(W, H, background)},setsar=1${look}`
-        + `${motion ? ',' + motion : ''}${effect ? ',' + effect : ''}`;
+        + `${motion ? ',' + motion : ''}${effect ? ',' + effect : ''}`
+        + `${opacity ? ',' + opacity : ''}`;
       const vf = `${vfHead}${vfTail}`;
 
       // Every prepared clip carries an audio stream, even when that stream is
