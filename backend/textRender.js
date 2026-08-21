@@ -188,12 +188,21 @@ export function createTextRenderer({
     // phrase's own words sequential - the cache still helps exactly as it
     // did before - while different phrases (or ordinary non-highlight
     // overlays, one to a group) run concurrently with each other.
+    // Each overlay carries the index it arrived at, because the results are SORTED BACK
+    // into that order before being returned. Grouping reorders, and the groups then run
+    // concurrently, so without this `renderedTextPngs` comes out in COMPLETION order -
+    // which the caller turns into a chain of ffmpeg overlay filters, where later means
+    // on top. Stacking order was therefore decided by which `convert` finished first.
+    //
+    // Mostly invisible, because overlays rarely sit on top of one another and a
+    // highlight caption's words never do. Not invisible at all once anything lets a
+    // user say which overlay is in front.
     const phraseGroups = new Map();
-    for (const t of textOverlays) {
+    textOverlays.forEach((t, sourceIndex) => {
       const groupKey = JSON.stringify([t.text, t.font, t.size, t.captionSpec || null]);
       if (!phraseGroups.has(groupKey)) phraseGroups.set(groupKey, []);
-      phraseGroups.get(groupKey).push(t);
-    }
+      phraseGroups.get(groupKey).push({ t, sourceIndex });
+    });
     // Bounded concurrency, not one at a time: a highlight-style caption
     // sends one overlay per spoken word, so a normal-length voiceover can
     // mean hundreds of these, each several `convert` process-spawns on top
@@ -209,7 +218,7 @@ export function createTextRenderer({
     // or its other workload changes.
     const OVERLAY_CONCURRENCY = 6;
     await mapWithConcurrency(Array.from(phraseGroups.values()), OVERLAY_CONCURRENCY, async (group) => {
-    for (const t of group) {
+    for (const { t, sourceIndex } of group) {
       const isGradient = Array.isArray(t.gradient) && t.gradient.length >= 2;
       const fontFileName = FONT_FILE_MAP[t.font];
       const fontPath = fontFileName ? path.join(FONTS_DIR, fontFileName) : null;
@@ -567,7 +576,7 @@ export function createTextRenderer({
       const placeX = Math.min(Math.max(Math.round(centerX - WR / 2), EDGE_MARGIN), W - EDGE_MARGIN - WR);
       const placeY = Math.min(Math.max(Math.round(centerY - HR / 2), EDGE_MARGIN), H - EDGE_MARGIN - HR);
 
-      renderedTextPngs.push({ t, outPng, placeX, placeY });
+      renderedTextPngs.push({ t, outPng, placeX, placeY, sourceIndex });
 
       try { fs.unlinkSync(maskPng); } catch (e) {}
       try { fs.unlinkSync(alphaPng); } catch (e) {}
@@ -594,6 +603,9 @@ export function createTextRenderer({
       for (const f of Object.values(l)) { try { fs.unlinkSync(f); } catch (e) {} }
     }
     phraseLayerCache.clear();
+    // Back into the order they were given in, so the caller's overlay chain stacks them
+    // the way the app listed them rather than the way the CPU finished them.
+    renderedTextPngs.sort((a, b) => a.sourceIndex - b.sourceIndex);
     return renderedTextPngs;
   }
 
