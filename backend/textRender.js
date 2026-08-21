@@ -268,6 +268,16 @@ export function createTextRenderer({
         // Tracking has to go on here rather than at composite time - it changes
         // the glyph positions, and every layer below is cut from this one mask.
         ...(spec && spec.spacing ? ['-kerning', (num(spec.spacing) * sscale).toFixed(2)] : []),
+        // Line spacing, for the same reason tracking goes here: every layer below is
+        // cut from this one mask, so spacing set anywhere else would move the fill
+        // without moving the outline.
+        //
+        // -interline-spacing is EXTRA pixels per gap, not a line height - measured, not
+        // assumed: three lines at 60pt went 247px tall at 0 and 267px at 10, which is
+        // exactly 10 per gap across two gaps. So it takes the same "points at the 18pt
+        // base, scaled by sscale" treatment every other length in a spec gets.
+        ...(spec && spec.lineSpacing
+          ? ['-interline-spacing', (num(spec.lineSpacing) * sscale).toFixed(2)] : []),
         '-gravity', gravityArg,
         `label:${safeText}`,
         maskPng,
