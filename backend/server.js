@@ -984,7 +984,12 @@ app.post("/api/thumbnail", verifyToken, mediaProcLimiter, async (req, res) => {
     const at = Math.max(0, num(atSeconds, 0));
     const framePng = path.join(uploadsDir, uniqueName("thumbframe", "png"));
     scratch.push(framePng);
-    await run("ffmpeg", ["-y", "-ss", String(at), "-i", srcPath, "-frames:v", "1",
+    // -ss is omitted entirely at 0, which is what makes a STILL IMAGE work as a source.
+    // A photo has exactly one frame, and `-ss 0` before `-i` seeks past it: ffmpeg exits
+    // 0 having written nothing, so the only symptom is a missing file. For a video,
+    // seeking to 0 and not seeking are the same thing, so nothing changes there.
+    const seek = at > 0 ? ["-ss", String(at)] : [];
+    await run("ffmpeg", ["-y", ...seek, "-i", srcPath, "-frames:v", "1",
       "-vf", `scale=${size.w}:${size.h}:force_original_aspect_ratio=increase,crop=${size.w}:${size.h}`,
       framePng], { timeout: 120000 });
     if (!fs.existsSync(framePng)) {
