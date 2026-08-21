@@ -4079,6 +4079,63 @@ function clipTransformFilter(item = {}) {
 // builds a background layer when fit is 'fit'. Setting alpha alone would have been
 // discarded on the way to yuv420p and done nothing at all - visibly fine in `fit` mode
 // and a silent no-op in the mode almost everyone uses.
+// Shape masks.
+//
+// The mask is a grey PNG generated ONCE per (shape, size, feather) and multiplied into
+// the picture. Three approaches were timed on a real 4-second 720x1280 clip against a
+// 2.3s baseline re-encode:
+//
+//   geq per-pixel alpha        33.9s   - 8.5x realtime. A one-minute clip would take
+//                                        over eight minutes, with four renders sharing
+//                                        six cores. Not usable.
+//   alphamerge + overlay        9.8s
+//   blend=multiply              4.8s   - the mask costs ~2.5s. This one.
+//
+// It must multiply in **gbrp, not yuv420p**. Multiplying yuv multiplies the chroma
+// planes too, and U/V are centred at 128, so the result is driven toward green - the
+// shape comes out right and every colour is destroyed. That is not visible in a timing
+// test and only shows up by looking at a frame or sampling a pixel: the same spot read
+// srgb(119,255,0) in yuv against srgb(253,244,45) in gbrp, on a yellow bar.
+//
+// Loaded with `movie=` rather than a second -i, so this stays a single -vf string and
+// the clip pipeline does not have to learn about extra inputs. Verified equivalent to
+// the two-input form: RMSE 0.37%, which is encoder noise, against 37% for a real
+// difference.
+const MASK_SHAPES = ['ellipse', 'circle', 'rect', 'rounded'];
+
+async function ensureMaskImage(shape, W, H, feather) {
+  const f = Math.max(0, Math.min(100, Math.round(feather)));
+  const name = `maskshape-${shape}-${W}x${H}-f${f}.png`;
+  const out = path.join(uploadsDir, name);
+  // Deterministic name, so the second clip using the same mask pays nothing. Cheap to
+  // regenerate if the uploads sweep ever takes it.
+  if (fs.existsSync(out)) return out;
+
+  const cx = Math.round(W / 2), cy = Math.round(H / 2);
+  const rx = Math.round(W * 0.455), ry = Math.round(H * 0.455);
+  const r = Math.min(rx, ry);
+  let draw;
+  if (shape === 'circle') draw = `ellipse ${cx},${cy} ${r},${r} 0,360`;
+  else if (shape === 'rect') draw = `rectangle ${cx - rx},${cy - ry} ${cx + rx},${cy + ry}`;
+  else if (shape === 'rounded') draw = `roundrectangle ${cx - rx},${cy - ry} ${cx + rx},${cy + ry} ${Math.round(r * 0.22)},${Math.round(r * 0.22)}`;
+  else draw = `ellipse ${cx},${cy} ${rx},${ry} 0,360`;
+
+  // Blur sigma scaled to the frame, so the same feather setting looks the same at 720p
+  // and 1080p rather than softening by a fixed number of pixels.
+  const sigma = Math.max(0, Math.round((f / 100) * Math.min(W, H) * 0.12));
+  const args = ['-size', `${W}x${H}`, 'xc:black', '-fill', 'white', '-draw', draw];
+  if (sigma > 0) args.push('-blur', `0x${sigma}`);
+  args.push(out);
+  await run('convert', args, { timeout: 60000 });
+  return out;
+}
+
+function clipMaskFilter(maskPath, W, H) {
+  if (!maskPath) return '';
+  return `format=gbrp[mksrc];movie=${maskPath},format=gbrp,scale=${W}:${H}[mkimg];`
+    + `[mksrc][mkimg]blend=all_mode=multiply,format=yuv420p`;
+}
+
 function clipOpacityFilter(item = {}) {
   const o = num(item.opacity, 1);
   if (!(o >= 0 && o < 1)) return '';
@@ -4223,11 +4280,21 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // was asked to do. Same validator: both are single filter strings carrying
       // expressions, and both must be unable to escape into the wider filtergraph.
       const effect = safeMotionChain(item.effectSpec, W, H, 30);
+      // Mask after the fit, so the shape is measured against the OUTPUT frame rather
+      // than the source - a mask sized to a landscape clip inside a 9:16 project would
+      // otherwise be cropped along with the picture and come out an off-centre sliver.
+      const maskShape = item.mask && MASK_SHAPES.includes(item.mask.shape) ? item.mask.shape : null;
+      const maskPath = maskShape
+        ? await ensureMaskImage(maskShape, W, H, num(item.mask.feather, 40))
+        : null;
+      const mask = clipMaskFilter(maskPath, W, H);
+
       // Opacity is last because it composites the finished picture - the grade, the
-      // motion and the effect all have to have happened before it fades.
+      // motion, the effect and the mask all have to have happened before it fades.
       const opacity = clipOpacityFilter(item);
       const vfTail = `${chroma || frameFitFilter(W, H, background)},setsar=1${look}`
         + `${motion ? ',' + motion : ''}${effect ? ',' + effect : ''}`
+        + `${mask ? ',' + mask : ''}`
         + `${opacity ? ',' + opacity : ''}`;
       const vf = `${vfHead}${vfTail}`;
 
