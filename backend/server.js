@@ -3646,6 +3646,43 @@ function frameFitFilter(W, H, bg) {
     + `[bgblur][fgfit]overlay=(W-w)/2:(H-h)/2`;
 }
 
+// Green screen. Keys the backdrop out and puts the project's own canvas background
+// behind the subject - a colour, or a blurred copy of the clip, which is the same
+// choice frameFitFilter already offers.
+//
+// Keying alone is not a feature: it makes the backdrop transparent, and transparent
+// renders black. What makes it useful is having something to composite onto, and this
+// app already had that.
+//
+// despill is not optional. Chromakey removes the green pixels; the green LIGHT bounced
+// onto the subject's edges and hair stays, and reads as a lime fringe against whatever
+// is now behind them. Every convincing key has a despill after it.
+//
+// similarity too low leaves the backdrop, too high eats the subject - 0.30 with 0.10
+// blend is the usual starting point for evenly lit footage, and both are adjustable
+// from the app.
+function chromaKeyFilter(W, H, item, bg) {
+  const ck = item.chromaKey;
+  if (!ck) return null;
+  const fill = `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}`;
+  const colour = safeColor(ck.colour, '#00b140').replace('#', '0x');
+  const similarity = Math.max(0.01, Math.min(0.9, Number(ck.similarity) || 0.30)).toFixed(2);
+  const blend = Math.max(0, Math.min(0.5, Number(ck.blend) || 0.10)).toFixed(2);
+  // Which green to despill is decided by the key colour, not assumed: a blue screen
+  // needs the blue variant, and despilling the wrong channel does nothing at all.
+  const spill = /^0x[0-9a-f]{2}[0-9a-f]{2}([0-9a-f]{2})$/i.test(colour)
+    && parseInt(colour.slice(6, 8), 16) > parseInt(colour.slice(4, 6), 16) ? 'blue' : 'green';
+
+  const backdrop = (bg && bg.type === 'colour')
+    ? `${fill},drawbox=c=${safeColor(bg.colour, '#000000')}@1:t=fill`
+    : `${fill},gblur=sigma=${Math.max(0, Math.min(60, Number(bg?.blur) || 20)).toFixed(1)}`;
+
+  return `split[ckbg][ckfg];`
+    + `[ckbg]${backdrop}[ckbgout];`
+    + `[ckfg]chromakey=${colour}:${similarity}:${blend},despill=type=${spill},${fill}[ckfgout];`
+    + `[ckbgout][ckfgout]overlay=(W-w)/2:(H-h)/2`;
+}
+
 function clipLookFilter(item = {}) {
   const parts = [];
   // Mirroring is about the framing, so it comes before the grade.
@@ -3762,6 +3799,13 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // earlier would reframe the source and then let the fit undo it - a zoompan
       // followed by a pad puts the padding back around the zoomed picture, so the zoom
       // stops reaching the edges of the video and reads as a shrinking photograph.
+      // Replaces the fit rather than following it: both decide how the frame is filled,
+      // and running the ordinary fit first would crop the picture the key is about to
+      // composite, leaving the backdrop and the subject scaled differently.
+      // item.type checked inline rather than via isVideo, which is a const declared
+      // forty lines BELOW this point - reading it here is a temporal dead zone error
+      // that node --check cannot see and that would throw on the first render.
+      const chroma = item.type !== 'image' ? chromaKeyFilter(W, H, item, background) : null;
       const motion = safeMotionChain(item.motionSpec, W, H, 30);
       // Effect after motion, deliberately. The effect should act on the framing the
       // motion chose - a glitch tear across a picture that is then zoomed would have
@@ -3769,7 +3813,7 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // was asked to do. Same validator: both are single filter strings carrying
       // expressions, and both must be unable to escape into the wider filtergraph.
       const effect = safeMotionChain(item.effectSpec, W, H, 30);
-      const vfTail = `${frameFitFilter(W, H, background)},setsar=1${look}`
+      const vfTail = `${chroma || frameFitFilter(W, H, background)},setsar=1${look}`
         + `${motion ? ',' + motion : ''}${effect ? ',' + effect : ''}`;
       const vf = `${vfHead}${vfTail}`;
 
