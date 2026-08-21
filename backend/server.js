@@ -938,6 +938,58 @@ app.get("/api/translate-languages", mediaProcLimiter, (req, res) => {
 // is ten-plus minutes of work, which would sit past nginx's 600s proxy_read_timeout
 // and past any patience the caller has. The app already polls /api/job/:jobId for
 // renders, so this reuses that rather than inventing a second waiting mechanism.
+// Beat times for an audio track, so cuts can land on the beat instead of near it.
+//
+// Returns a GRID, not raw onsets. A grid is what a musician means by "the beat" and what
+// a cut wants to land on; raw onsets include every snare flam and vocal consonant, and
+// cutting to those looks nervous rather than rhythmic.
+//
+// `strength` is how periodic the audio actually turned out to be. It is reported rather
+// than used as a gate here, because the honest answer for spoken word is "there is no
+// beat in this" and the caller is better placed to say so than a 400 is.
+//
+// Synchronous: 5-7 seconds for a full track, measured on this box, against nginx's 600s
+// proxy_read_timeout. No credits and no plan gate - it produces no video and spends
+// almost nothing.
+app.post("/api/detect-beats", verifyToken, mediaProcLimiter, async (req, res) => {
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url required" });
+
+  const scratch = [];
+  try {
+    let srcPath;
+    if (url.startsWith("http")) {
+      if (!isOwnMediaUrl(url)) {
+        return res.status(400).json({ error: "That media is not on this server." });
+      }
+      srcPath = path.join(uploadsDir, uniqueName("beatsrc", "mp3"));
+      await downloadToFile(url, srcPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+      scratch.push(srcPath);
+    } else {
+      srcPath = resolveMediaPath(url);
+    }
+    if (!fs.existsSync(srcPath)) {
+      return res.status(404).json({ error: "That track could not be found on the server." });
+    }
+
+    const out = await new Promise((resolve) => {
+      execFile("python3", [path.join(__dirname, "detect_beats.py"), srcPath],
+        { timeout: 180000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+          if (err || !String(stdout).trim()) return resolve(null);
+          try { resolve(JSON.parse(String(stdout).trim())); } catch (e) { resolve(null); }
+        });
+    });
+    if (!out) return res.status(500).json({ error: "Could not analyse this track." });
+    if (out.error) return res.status(400).json({ error: out.error });
+    res.json(out);
+  } catch (e) {
+    console.error("[detect-beats]", e.message);
+    res.status(500).json({ error: "Could not analyse this track." });
+  } finally {
+    for (const f of scratch) { try { fs.unlinkSync(f); } catch (e) {} }
+  }
+});
+
 // Pull a clip's sound out into a file of its own, so it can live on the timeline as an
 // audio track - draggable, trimmable, fadeable, and able to outlive the clip it came from.
 //
