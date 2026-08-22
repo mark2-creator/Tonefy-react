@@ -19,7 +19,7 @@ import { google } from "googleapis";
 import { initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
-import { getFirestore as getAdminFirestore } from "firebase-admin/firestore";
+import { getFirestore as getAdminFirestore, FieldValue } from "firebase-admin/firestore";
 import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, isAdminUid, FREE_RESET_MS } from "./tiers.js";
 import nodemailer from "nodemailer";
 
@@ -3349,6 +3349,244 @@ async function publishToTikTok({ openId, videoUrl, title, privacyLevel = 'SELF_O
 // sitting in a queue for a week outlives the connection that created it, and by then the
 // account may have been disconnected or linked to someone else.
 const QUEUE_SWEEP_MS = 5 * 60 * 1000;
+// ---------------------------------------------------------------------------
+// YouTube OAuth (server-side)
+//
+// MIRRORS TikTok: callback outside /api (app.use("/api", verifyToken) would 401 Google's
+// plain browser redirect before the handler ran), refresh token in its own Admin-SDK-only
+// collection, non-secret display data on connectedAccounts/{uid} for the app to read.
+//
+// DIVERGES from TikTok in one place, deliberately, because TikTok does not actually solve
+// the problem: /tiktok/auth's `state` carries only the PKCE verifier, so the SERVER never
+// learns which Tonefy user connected. It redirects to tiktok-success.html and the CLIENT
+// writes connectedAccounts/{uid}.tiktok itself. That is why the openId then has to be
+// re-checked by tiktokOwnedBy on every call - ownership was asserted by the client.
+//
+// Here the state is an HMAC-signed token carrying the verified uid, so the callback knows
+// who is connecting and the SERVER writes the record. Nothing client-asserted is trusted,
+// and there is no equivalent of the "knowing an openId lets you act as them" hole that
+// tiktokOwnedBy exists to close.
+const YOUTUBE_TOKENS = 'youtubeTokens';
+const YOUTUBE_SCOPE = 'https://www.googleapis.com/auth/youtube.upload';
+const YOUTUBE_REDIRECT_URI = process.env.YOUTUBE_REDIRECT_URI
+  || 'https://api.fitlifesolutions.site/youtube/callback';
+
+// Derived from a secret this process already holds, so state signing needs no new
+// configuration and survives a restart. A per-boot random key would invalidate every
+// in-flight consent the moment pm2 restarted.
+const OAUTH_STATE_SECRET = process.env.OAUTH_STATE_SECRET
+  || crypto.createHash('sha256').update(String(serviceAccount?.private_key || 'tonefy')).digest('hex');
+
+function signState(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', OAUTH_STATE_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function readState(state) {
+  if (typeof state !== 'string' || !state.includes('.')) return null;
+  const [body, sig] = state.split('.');
+  const expect = crypto.createHmac('sha256', OAUTH_STATE_SECRET).update(body).digest('base64url');
+  // timingSafeEqual throws on a length mismatch, which is itself a rejection.
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect))) return null;
+  } catch (e) { return null; }
+  try {
+    const p = JSON.parse(Buffer.from(body, 'base64url').toString());
+    // Ten minutes is longer than any consent screen takes and short enough that a state
+    // captured from a browser history or a log is useless by the time anyone finds it.
+    if (!p.uid || !p.exp || Date.now() > p.exp) return null;
+    return p;
+  } catch (e) { return null; }
+}
+
+function youtubeOAuthClient() {
+  return new google.auth.OAuth2(
+    process.env.YOUTUBE_CLIENT_ID,
+    process.env.YOUTUBE_CLIENT_SECRET,
+    YOUTUBE_REDIRECT_URI
+  );
+}
+
+// Starts the flow. INSIDE /api and authenticated, unlike /tiktok/auth, because this is
+// the only point where the user's identity can be established - the callback arrives
+// from Google with no token of ours on it. The app opens the returned authUrl.
+//
+// Returns a URL rather than redirecting: a 302 to Google from an XHR the app made would
+// be followed by fetch, not by a browser, and the consent screen would never be seen.
+app.get('/api/youtube/connect', verifyToken, (req, res) => {
+  if (!process.env.YOUTUBE_CLIENT_ID || !process.env.YOUTUBE_CLIENT_SECRET) {
+    return res.status(503).json({ error: 'YouTube is not configured on this server yet.' });
+  }
+  const state = signState({ uid: req.user.uid, exp: Date.now() + 10 * 60 * 1000 });
+  const authUrl = youtubeOAuthClient().generateAuthUrl({
+    // offline is what returns a refresh token at all. Without it we get an access token
+    // that dies in an hour, and a post scheduled for tomorrow has nothing to post with.
+    access_type: 'offline',
+    // Google only re-issues a refresh token on FIRST consent unless prompted. A user who
+    // connects, disconnects and reconnects would otherwise come back with no refresh
+    // token and a connection that works for one hour and then silently stops.
+    prompt: 'consent',
+    scope: [YOUTUBE_SCOPE],
+    state,
+    include_granted_scopes: true,
+  });
+  res.json({ authUrl });
+});
+
+// The callback. OUTSIDE /api on purpose - see the note at the top of this block.
+app.get('/youtube/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  const back = (q) => res.redirect(`https://tonefy-ai.fitlifesolutions.site/tiktok-success.html?${q}`);
+  if (error) return back(`youtube_error=${encodeURIComponent(String(error))}`);
+
+  const parsed = readState(state);
+  if (!parsed) return res.status(400).send('This connection link has expired. Please try again from the app.');
+  if (!code) return back('youtube_error=no_code');
+
+  try {
+    const client = youtubeOAuthClient();
+    const { tokens } = await client.getToken(String(code));
+    if (!tokens.refresh_token) {
+      // Nothing to schedule with. Better to refuse the connection than to record one
+      // that works for an hour and then fails with no explanation.
+      return back('youtube_error=no_refresh_token');
+    }
+    client.setCredentials(tokens);
+
+    // Which channel this is, for the app to display. mine:true resolves it from the
+    // token, so no extra permission and nothing the client could get wrong.
+    let channelId = null, channelTitle = null;
+    try {
+      const yt = google.youtube({ version: 'v3', auth: client });
+      const me = await yt.channels.list({ part: ['snippet'], mine: true });
+      const ch = me.data.items?.[0];
+      channelId = ch?.id || null;
+      channelTitle = ch?.snippet?.title || null;
+    } catch (e) {
+      // youtube.upload alone may not permit channels.list. Not fatal: the connection is
+      // still usable for uploading, which is the point, and the app falls back to a
+      // generic "Connected".
+      console.warn('[youtube] channel lookup failed:', e.message);
+    }
+
+    await saveYouTubeToken(parsed.uid, tokens, { channelId, channelTitle });
+    back(`youtube_connected=1${channelTitle ? `&channel=${encodeURIComponent(channelTitle)}` : ''}`);
+  } catch (e) {
+    console.error('[youtube] callback error:', e.message);
+    back('youtube_error=server_error');
+  }
+});
+
+// Refresh token in its OWN collection, keyed by uid. Not on connectedAccounts/{uid},
+// which the owner can read - a refresh token is a bearer credential and belongs nowhere
+// a client rule can reach. No security rule mentions youtubeTokens, and Firestore denies
+// where no rule matches, so it is Admin-SDK-only by construction. Same reasoning as
+// tiktokTokens, and keyed by the VERIFIED uid rather than a public channel id.
+async function saveYouTubeToken(uid, tokens, meta = {}) {
+  await adminDb.collection(YOUTUBE_TOKENS).doc(uid).set({
+    refreshToken: tokens.refresh_token,
+    accessToken: tokens.access_token || null,
+    expiresAt: tokens.expiry_date || (Date.now() + 3500 * 1000),
+    updatedAt: new Date().toISOString(),
+  }, { merge: true });
+
+  // Non-secret display data, where the app can read it - the same split TikTok uses.
+  // Written by the SERVER here, not by the client as tiktok-success.html does.
+  await adminDb.collection('connectedAccounts').doc(uid).set({
+    youtube: {
+      channelId: meta.channelId || null,
+      channelTitle: meta.channelTitle || null,
+      connectedAt: new Date().toISOString(),
+    },
+  }, { merge: true });
+}
+
+async function disconnectYouTube(uid, reason) {
+  try { await adminDb.collection(YOUTUBE_TOKENS).doc(uid).delete(); } catch (e) {}
+  try {
+    await adminDb.collection('connectedAccounts').doc(uid)
+      .set({ youtube: FieldValue.delete() }, { merge: true });
+  } catch (e) {}
+  console.warn(`[youtube] disconnected ${uid}: ${reason}`);
+}
+
+// An access token good right now, refreshing if needed.
+//
+// Access tokens last about an hour; a scheduled post may fire days later, so every path
+// that touches YouTube goes through this rather than reading a stored access token.
+//
+// A revoked grant comes back as invalid_grant, and that is PERMANENT - the user removed
+// this app in their Google account. Retrying it every five minutes forever would be the
+// sweep quietly hammering a dead credential, so the connection is torn down and the next
+// post fails with something a human can act on.
+async function getYouTubeAccessToken(uid) {
+  let stored;
+  try {
+    const snap = await adminDb.collection(YOUTUBE_TOKENS).doc(uid).get();
+    stored = snap.exists ? snap.data() : null;
+  } catch (e) {
+    // A Firestore blip is not a revoked grant. Fail soft so the sweep leaves the post
+    // queued rather than marking a good connection dead.
+    console.error('[youtube] token read failed:', e.message);
+    return { error: 'transient' };
+  }
+  if (!stored?.refreshToken) return { error: 'not_connected' };
+
+  // 60s of slack, so a token that expires mid-upload is refreshed before it is used.
+  if (stored.accessToken && Number(stored.expiresAt) > Date.now() + 60000) {
+    return { accessToken: stored.accessToken };
+  }
+
+  const client = youtubeOAuthClient();
+  client.setCredentials({ refresh_token: stored.refreshToken });
+  try {
+    const { credentials } = await client.refreshAccessToken();
+    await adminDb.collection(YOUTUBE_TOKENS).doc(uid).set({
+      accessToken: credentials.access_token,
+      expiresAt: credentials.expiry_date || (Date.now() + 3500 * 1000),
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
+    return { accessToken: credentials.access_token };
+  } catch (e) {
+    const msg = String(e?.response?.data?.error || e.message || '');
+    if (msg.includes('invalid_grant')) {
+      await disconnectYouTube(uid, 'refresh token revoked');
+      return { error: 'revoked' };
+    }
+    console.error('[youtube] refresh failed:', msg);
+    return { error: 'transient' };
+  }
+}
+
+// Connected state for the app. Inside /api and authenticated, so it reads the caller's
+// own connection and cannot be asked about anyone else's.
+app.get('/api/youtube/status', verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  try {
+    const [tok, acc] = await Promise.all([
+      adminDb.collection(YOUTUBE_TOKENS).doc(uid).get(),
+      adminDb.collection('connectedAccounts').doc(uid).get(),
+    ]);
+    const connected = tok.exists && !!tok.data()?.refreshToken;
+    const yt = acc.exists ? acc.data()?.youtube : null;
+    res.json({
+      connected,
+      configured: !!(process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET),
+      channelTitle: connected ? (yt?.channelTitle || null) : null,
+      channelId: connected ? (yt?.channelId || null) : null,
+    });
+  } catch (e) {
+    console.error('[youtube] status failed:', e.message);
+    res.status(500).json({ error: 'Could not read your YouTube connection.' });
+  }
+});
+
+app.post('/api/youtube/disconnect', verifyToken, async (req, res) => {
+  await disconnectYouTube(req.user.uid, 'user disconnected');
+  res.json({ ok: true });
+});
+
 // Which platforms this server can publish to, and how.
 //
 // The sweep and the post route were both TikTok-shaped - `platforms.includes('tiktok')`,
@@ -3391,7 +3629,11 @@ const PUBLISHERS = {
     //     through the API is LOCKED TO PRIVATE and cannot be made public. That reads
     //     exactly like a bug in the app if nobody knows it.
     enabled: () => !!(process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET),
-    accountFrom: (acc) => acc?.youtube?.channelId || null,
+    // The uid, not the channelId. youtubeTokens is keyed by uid, and channels.list can
+    // legitimately fail under youtube.upload alone - so a perfectly working connection
+    // can have a null channelId, and keying on it would make the sweep declare that
+    // connection dead and fail every scheduled post against it.
+    accountFrom: (acc, uid) => (acc?.youtube ? uid : null),
     notConnected: 'YouTube is no longer connected to this account.',
     publish: async () => ({ ok: false, error: 'YouTube publishing is not configured on this server yet.' }),
   },
@@ -3463,7 +3705,7 @@ async function scheduledPostSweep() {
 
     const results = [];
     for (const [id, pub] of targets) {
-      const account = pub.accountFrom(accountDoc);
+      const account = pub.accountFrom(accountDoc, p.userId);
       if (!account) { results.push({ id, ok: false, error: pub.notConnected }); continue; }
       const r = await pub.publish({ account, videoUrl: p.videoUrl, caption: p.caption });
       results.push({ id, ...r });
