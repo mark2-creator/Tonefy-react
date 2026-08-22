@@ -3617,6 +3617,25 @@ async function publishToYouTube({ account: uid, videoUrl, caption, privacyStatus
   if (!process.env.YOUTUBE_CLIENT_ID || !process.env.YOUTUBE_CLIENT_SECRET) {
     return { ok: false, error: 'YouTube is not configured on this server.' };
   }
+
+  // Pro and Creator only, and enforced HERE rather than at the two call sites - the
+  // "post now" route and the scheduled sweep both funnel through this function, so a
+  // gate on either alone leaves the other open. A downgrade between scheduling and
+  // publishing is also caught, because this runs at publish time rather than at queue
+  // time. Product decision recorded in CLAUDE.md: each posting integration becomes a
+  // paid benefit as it becomes real.
+  //
+  // Fails CLOSED, unlike the render checks. Being wrong there costs a subscriber a
+  // render; being wrong here spends someone else's YouTube quota and posts to a channel.
+  try {
+    const { plan } = await getUserPlanData(adminDb, uid);
+    if (!isAdminUid(uid) && plan !== 'pro' && plan !== 'creator') {
+      return { ok: false, error: 'Posting to YouTube is available on the Pro and Creator plans.' };
+    }
+  } catch (e) {
+    console.error('[youtube] plan lookup failed:', e.message);
+    return { ok: false, error: 'Could not confirm your plan just now. It will be retried.' };
+  }
   const tok = await getYouTubeAccessToken(uid);
   if (tok.error === 'revoked') {
     return { ok: false, error: 'YouTube access was revoked. Reconnect the account to post again.' };
@@ -3758,6 +3777,69 @@ app.get('/api/platforms', (req, res) => {
       id, label: p.label, kind: p.kind, enabled: p.enabled(),
     })),
   });
+});
+
+// Publish immediately, to any registered platform.
+//
+// "Post now" previously called /tiktok/post-video directly, so it worked for exactly one
+// platform and a second one had nowhere to go. This routes through the same PUBLISHERS
+// registry and the same publish functions the sweep uses, so behaviour cannot drift
+// between posting now and posting later - which two separate code paths guarantee it
+// eventually would.
+//
+// Ownership comes from the verified token, never the body. Every per-platform check
+// (plan gating, connection, revocation) lives inside the publisher, so this route cannot
+// forget one.
+app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
+  const uid = req.user.uid;
+  const { videoUrl, caption = '', platforms = [] } = req.body || {};
+  if (!videoUrl) return res.status(400).json({ error: 'videoUrl required' });
+  if (!Array.isArray(platforms) || platforms.length === 0) {
+    return res.status(400).json({ error: 'Choose at least one platform.' });
+  }
+  if (!isOwnMediaUrl(videoUrl)) {
+    return res.status(400).json({ error: 'That video is not on this server.' });
+  }
+
+  const targets = platforms.map(id => [id, PUBLISHERS[id]]).filter(([, p]) => p && p.enabled());
+  if (targets.length === 0) return res.status(400).json({ error: 'None of those platforms are available.' });
+
+  let accountDoc = {};
+  try {
+    const snap = await adminDb.collection('connectedAccounts').doc(uid).get();
+    accountDoc = snap.exists ? snap.data() : {};
+  } catch (e) {
+    return res.status(503).json({ error: 'Could not read your connected accounts. Try again.' });
+  }
+
+  const results = [];
+  for (const [id, pub] of targets) {
+    const account = pub.accountFrom(accountDoc, uid);
+    if (!account) { results.push({ platform: id, ok: false, error: pub.notConnected }); continue; }
+    const r = await pub.publish({ account, videoUrl, caption });
+    results.push({ platform: id, ...r });
+  }
+
+  // Recorded the same way a scheduled post is, so one Calendar shows both and neither
+  // route needs its own history.
+  const failed = results.filter(r => !r.ok);
+  try {
+    await adminDb.collection('scheduledPosts').add({
+      userId: uid, platforms: targets.map(([id]) => id), caption, videoUrl,
+      status: failed.length === 0 ? 'posted' : 'failed',
+      postedAt: new Date().toISOString(),
+      error: failed.length ? failed.map(f => `${PUBLISHERS[f.platform].label}: ${f.error}`).join(' | ') : null,
+      publishId: results.find(r => r.ok)?.publishId || null,
+      createdAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error('[post-now] could not record:', e.message);
+  }
+
+  // 207 when some succeeded and some did not, so the client can tell a total failure
+  // from a partial one rather than treating both as "it failed".
+  const code = failed.length === 0 ? 200 : (failed.length === results.length ? 502 : 207);
+  res.status(code).json({ ok: failed.length === 0, results });
 });
 
 async function scheduledPostSweep() {
