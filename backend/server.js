@@ -3349,6 +3349,79 @@ async function publishToTikTok({ openId, videoUrl, title, privacyLevel = 'SELF_O
 // sitting in a queue for a week outlives the connection that created it, and by then the
 // account may have been disconnected or linked to someone else.
 const QUEUE_SWEEP_MS = 5 * 60 * 1000;
+// Which platforms this server can publish to, and how.
+//
+// The sweep and the post route were both TikTok-shaped - `platforms.includes('tiktok')`,
+// `acc.tiktok.openId`, `publishToTikTok` - so a second platform meant editing the same
+// three places and getting all three right. A registry means adding one is one entry.
+//
+// `enabled` is read from the environment rather than hardcoded, and /api/platforms
+// reports it, so turning a platform on is a credential and a restart rather than an app
+// update. That matters here: the app ships over the air but its platform list would
+// otherwise be a constant compiled into a bundle.
+//
+// YOUTUBE and PINTEREST are registered as KNOWN but not implemented, deliberately. Both
+// are blocked on app registration and review rather than on code, and writing an upload
+// path against an API I cannot call would be exactly the "verified by reading" work this
+// project keeps being bitten by. What each needs is written down at its entry so the
+// next session does not re-derive it.
+const PUBLISHERS = {
+  tiktok: {
+    label: 'TikTok',
+    kind: 'video',
+    enabled: () => !!(process.env.TIKTOK_CLIENT_KEY || process.env.TIKTOK_SANDBOX_CLIENT_KEY),
+    // Where this platform's identity lives on connectedAccounts/{uid}.
+    accountFrom: (acc) => acc?.tiktok?.openId || null,
+    notConnected: 'TikTok is no longer connected to this account.',
+    publish: ({ account, videoUrl, caption }) =>
+      publishToTikTok({ openId: account, videoUrl, title: caption }),
+  },
+
+  youtube: {
+    label: 'YouTube',
+    kind: 'video',
+    // Needs: a Google Cloud project with YouTube Data API v3 enabled, an OAuth client,
+    // and the https://www.googleapis.com/auth/youtube.upload scope.
+    //
+    // Two things that decide whether this is worth doing, both external to the code:
+    //   - videos.insert costs 1,600 quota units against a default 10,000/day, so it is
+    //     about SIX uploads a day until a quota increase is granted.
+    //   - youtube.upload is a SENSITIVE scope, so the OAuth consent screen needs Google
+    //     verification, and until the API project passes that audit every video uploaded
+    //     through the API is LOCKED TO PRIVATE and cannot be made public. That reads
+    //     exactly like a bug in the app if nobody knows it.
+    enabled: () => !!(process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET),
+    accountFrom: (acc) => acc?.youtube?.channelId || null,
+    notConnected: 'YouTube is no longer connected to this account.',
+    publish: async () => ({ ok: false, error: 'YouTube publishing is not configured on this server yet.' }),
+  },
+
+  pinterest: {
+    label: 'Pinterest',
+    // IMAGE, not video, and that is the point of listing it: this app now makes
+    // thumbnails, and an image pin is a single POST /v5/pins - by far the simplest
+    // publish on this list. A video pin needs register-media, an upload, a status poll
+    // and then the pin, which is four steps and worth doing separately.
+    kind: 'image',
+    // Needs: a Pinterest developer app and OAuth 2.0. Default is TRIAL access; standard
+    // access needs review, and trial cannot post to a real audience.
+    enabled: () => !!(process.env.PINTEREST_APP_ID && process.env.PINTEREST_APP_SECRET),
+    accountFrom: (acc) => acc?.pinterest?.userId || null,
+    notConnected: 'Pinterest is no longer connected to this account.',
+    publish: async () => ({ ok: false, error: 'Pinterest publishing is not configured on this server yet.' }),
+  },
+};
+
+// What the app should offer. Reported rather than hardcoded client-side so a platform
+// coming online needs no app update.
+app.get('/api/platforms', (req, res) => {
+  res.json({
+    platforms: Object.entries(PUBLISHERS).map(([id, p]) => ({
+      id, label: p.label, kind: p.kind, enabled: p.enabled(),
+    })),
+  });
+});
+
 async function scheduledPostSweep() {
   let snap;
   try {
@@ -3362,33 +3435,51 @@ async function scheduledPostSweep() {
     const p = doc.data();
     const due = Date.parse(p.scheduledFor || '');
     if (Number.isFinite(due) && due > now) continue;          // not yet
-    if (!Array.isArray(p.platforms) || !p.platforms.includes('tiktok')) continue;
+    if (!Array.isArray(p.platforms) || p.platforms.length === 0) continue;
+    // One post can name several platforms. Each is published independently and the post
+    // only counts as posted when they all succeed - a partial success recorded as
+    // "posted" would silently lose whichever platform failed.
+    const targets = p.platforms
+      .map(id => [id, PUBLISHERS[id]])
+      .filter(([, pub]) => pub && pub.enabled());
+    if (targets.length === 0) continue;
 
     const fail = async (error) => {
       await doc.ref.set({ status: 'failed', error, attemptedAt: new Date().toISOString() }, { merge: true });
       console.warn(`[queue] ${doc.id}: ${error}`);
     };
 
-    let openId = null;
+    let accountDoc = null;
     try {
       const acc = await adminDb.collection('connectedAccounts').doc(p.userId).get();
-      openId = acc.exists ? acc.data()?.tiktok?.openId : null;
+      accountDoc = acc.exists ? acc.data() : {};
     } catch (e) {
       // Could not establish ownership. Leave it queued and try next pass rather than
       // marking a good post failed over a transient Firestore error.
       console.warn(`[queue] ${doc.id}: ownership lookup failed, leaving queued`);
       continue;
     }
-    if (!openId) { await fail('TikTok is no longer connected to this account.'); continue; }
     if (!isOwnMediaUrl(p.videoUrl)) { await fail('That video is no longer available.'); continue; }
 
-    const r = await publishToTikTok({ openId, videoUrl: p.videoUrl, title: p.caption });
-    if (r.ok) {
-      await doc.ref.set({ status: 'posted', publishId: r.publishId || null,
-        postedAt: new Date().toISOString(), error: null }, { merge: true });
-      console.log(`[queue] posted ${doc.id}`);
+    const results = [];
+    for (const [id, pub] of targets) {
+      const account = pub.accountFrom(accountDoc);
+      if (!account) { results.push({ id, ok: false, error: pub.notConnected }); continue; }
+      const r = await pub.publish({ account, videoUrl: p.videoUrl, caption: p.caption });
+      results.push({ id, ...r });
+    }
+    const failed = results.filter(r => !r.ok);
+    if (failed.length === 0) {
+      await doc.ref.set({
+        status: 'posted',
+        publishId: results[0]?.publishId || null,
+        postedAt: new Date().toISOString(), error: null,
+      }, { merge: true });
+      console.log(`[queue] posted ${doc.id} to ${results.map(r => r.id).join(', ')}`);
     } else {
-      await fail(r.error);
+      // Names WHICH platform failed. "Post failed" on a two-platform post leaves the
+      // user unable to tell whether to retry one or both.
+      await fail(failed.map(f => `${PUBLISHERS[f.id].label}: ${f.error}`).join(' | '));
     }
   }
 }
