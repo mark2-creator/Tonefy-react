@@ -3429,7 +3429,18 @@ app.get('/api/youtube/connect', verifyToken, (req, res) => {
     prompt: 'consent',
     scope: [YOUTUBE_SCOPE],
     state,
-    include_granted_scopes: true,
+    // include_granted_scopes is deliberately ABSENT, and was present here once.
+    //
+    // It is Google's incremental authorisation: the issued token inherits every scope
+    // this OAuth client was ever granted by that account. On the first real consent it
+    // produced a token carrying 31 scopes - Drive, gmail.modify, Calendar, Contacts,
+    // Classroom - because this Cloud project's client had been used for other things.
+    //
+    // Tonefy needs exactly one scope. Holding a credential with thirty more is a
+    // least-privilege failure, it contradicts the privacy policy's own "Data We Do NOT
+    // Access" list, and it is the kind of thing that fails a Google verification review
+    // outright. Nothing here wants it: incremental authorisation only helps an app that
+    // asks for more scopes later, and this one never will.
   });
   res.json({ authUrl });
 });
@@ -3437,7 +3448,10 @@ app.get('/api/youtube/connect', verifyToken, (req, res) => {
 // The callback. OUTSIDE /api on purpose - see the note at the top of this block.
 app.get('/youtube/callback', async (req, res) => {
   const { code, state, error } = req.query;
-  const back = (q) => res.redirect(`https://tonefy-ai.fitlifesolutions.site/tiktok-success.html?${q}`);
+  // Its own page, not tiktok-success.html - which is branded TikTok and, worse, writes
+  // connectedAccounts.tiktok from the client. The first real consent landed on it and
+  // cheerfully announced "TikTok Connected!" for a YouTube connection.
+  const back = (q) => res.redirect(`https://tonefy-ai.fitlifesolutions.site/youtube-success.html?${q}`);
   if (error) return back(`youtube_error=${encodeURIComponent(String(error))}`);
 
   const parsed = readState(state);
