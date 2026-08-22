@@ -3601,6 +3601,88 @@ app.post('/api/youtube/disconnect', verifyToken, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Upload a finished video to the connected channel.
+//
+// Reads the file from DISK rather than fetching its own URL the way publishToTikTok
+// does. TikTok needs a byte count up front and gets it from a fetch; here the file is
+// already on this box - the sweep has just checked isOwnMediaUrl - so a round trip
+// through nginx to read our own disk would be pure waste on a VPS that is also encoding.
+//
+// Uploads PRIVATE by default, and that is not timidity: until the Cloud project passes
+// Google's YouTube API Services audit, every video uploaded through the API is forced to
+// private regardless of what is asked for. Asking for public before then produces a
+// video that silently is not, which reads as a bug. Once the audit passes, a post can
+// carry privacyStatus and this default stops mattering.
+async function publishToYouTube({ account: uid, videoUrl, caption, privacyStatus = 'private' }) {
+  if (!process.env.YOUTUBE_CLIENT_ID || !process.env.YOUTUBE_CLIENT_SECRET) {
+    return { ok: false, error: 'YouTube is not configured on this server.' };
+  }
+  const tok = await getYouTubeAccessToken(uid);
+  if (tok.error === 'revoked') {
+    return { ok: false, error: 'YouTube access was revoked. Reconnect the account to post again.' };
+  }
+  if (tok.error === 'not_connected') {
+    return { ok: false, error: 'YouTube is no longer connected to this account.' };
+  }
+  if (!tok.accessToken) {
+    // transient - Firestore or Google was briefly unreachable. Named as retryable so the
+    // sweep's caller can tell it apart from a dead connection.
+    return { ok: false, error: 'Could not reach YouTube just now. It will be retried.' };
+  }
+
+  let filePath;
+  try {
+    filePath = resolveMediaPath(String(videoUrl).replace(/^https?:\/\/[^/]+/, ''));
+  } catch (e) {
+    return { ok: false, error: 'That video is not one of ours.' };
+  }
+  if (!fs.existsSync(filePath)) return { ok: false, error: 'That video is no longer on the server.' };
+
+  // A title is required and is capped at 100 characters by the API; a caption written
+  // for TikTok is routinely longer, so it becomes the description and the title is the
+  // first line of it. Truncating silently at 100 would cut a sentence mid-word and put
+  // the remainder nowhere.
+  const text = String(caption || '').trim();
+  const firstLine = (text.split('\n')[0] || 'Untitled').slice(0, 100).trim() || 'Untitled';
+
+  const auth = youtubeOAuthClient();
+  auth.setCredentials({ access_token: tok.accessToken });
+  const yt = google.youtube({ version: 'v3', auth });
+
+  try {
+    const r = await yt.videos.insert({
+      part: ['snippet', 'status'],
+      requestBody: {
+        snippet: { title: firstLine, description: text },
+        status: { privacyStatus, selfDeclaredMadeForKids: false },
+      },
+      // A stream, not a buffer. A 1080p export is tens of megabytes and this box runs
+      // five other services; reading one wholly into memory per upload is how a queue of
+      // them becomes an out-of-memory kill.
+      media: { body: fs.createReadStream(filePath) },
+    });
+    const id = r.data?.id;
+    if (!id) return { ok: false, error: 'YouTube accepted the upload but returned no video id.' };
+    return { ok: true, publishId: id, url: `https://youtu.be/${id}` };
+  } catch (e) {
+    const g = e?.response?.data?.error;
+    const reason = g?.errors?.[0]?.reason || '';
+    // quotaExceeded is the one worth naming: videos.insert costs 1,600 units against a
+    // default 10,000/day, so this is reachable after about six uploads and is NOT a bug.
+    if (reason === 'quotaExceeded' || reason === 'dailyLimitExceeded') {
+      return { ok: false, error: 'YouTube’s daily upload quota for this app is used up. It resets at midnight Pacific.' };
+    }
+    if (reason === 'youtubeSignupRequired') {
+      return { ok: false, error: 'That Google account has no YouTube channel yet. Create one and reconnect.' };
+    }
+    if (e?.code === 401 || reason === 'authError') {
+      return { ok: false, error: 'YouTube rejected our access. Reconnect the account.' };
+    }
+    console.error('[youtube] upload failed:', g?.message || e.message);
+    return { ok: false, error: g?.message || 'The upload to YouTube failed.' };
+  }
+}
+
 // Which platforms this server can publish to, and how.
 //
 // The sweep and the post route were both TikTok-shaped - `platforms.includes('tiktok')`,
@@ -3649,7 +3731,7 @@ const PUBLISHERS = {
     // connection dead and fail every scheduled post against it.
     accountFrom: (acc, uid) => (acc?.youtube ? uid : null),
     notConnected: 'YouTube is no longer connected to this account.',
-    publish: async () => ({ ok: false, error: 'YouTube publishing is not configured on this server yet.' }),
+    publish: publishToYouTube,
   },
 
   pinterest: {
