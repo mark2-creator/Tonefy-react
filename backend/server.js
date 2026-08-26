@@ -3601,6 +3601,115 @@ app.post('/api/youtube/disconnect', verifyToken, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Firestore commits at most 500 writes per batch, and an account with a long history
+// can pass that. Chunked rather than assumed small.
+async function deleteAllDocs(snap) {
+  const docs = snap.docs;
+  for (let i = 0; i < docs.length; i += 400) {
+    const batch = adminDb.batch();
+    for (const d of docs.slice(i, i + 400)) batch.delete(d.ref);
+    await batch.commit();
+  }
+}
+
+// Everything this server holds for one account, removed in a single call.
+//
+// The app's Delete Account could only ever reach users/{uid}. youtubeTokens and
+// tiktokTokens are Admin-SDK-only by construction - no security rule mentions either,
+// and Firestore denies where no rule matches - which is the right home for a bearer
+// credential and is precisely why the client cannot clean them up. So deleting an
+// account left a live, refreshable YouTube refresh token behind, with no path anywhere
+// to remove it.
+//
+// Nothing could be POSTED with it: publishToYouTube's plan gate reads users/{uid},
+// which is gone by then, and fails closed. The credential simply persisted - which the
+// privacy policy states plainly does not happen, in the very section the YouTube API
+// Services audit reads.
+//
+// Two ordering rules, both load-bearing:
+//   - this runs BEFORE the client deletes the Auth user, because verifyToken needs a
+//     live ID token to establish whose account this is;
+//   - if any of it fails, the caller is told and must NOT delete the Auth user. Once
+//     that is gone the uid keying these leftovers is unrecoverable and they can never
+//     be found again - which is the exact failure this endpoint exists to prevent, so
+//     it must not cause it.
+app.post('/api/account/delete', verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  const removed = [];
+  const failed = [];
+  const step = async (name, fn) => {
+    try { await fn(); removed.push(name); }
+    catch (e) { console.error(`[account-delete] ${name} failed:`, e.message); failed.push(name); }
+  };
+
+  // Revoked at Google, not merely dropped from our disk. A token we forget is still a
+  // token that works; revoking invalidates it at the source, which is what "we do not
+  // keep a copy after revocation" has to mean to be worth writing down.
+  await step('youtube', async () => {
+    let refreshToken = null;
+    try {
+      const snap = await adminDb.collection(YOUTUBE_TOKENS).doc(uid).get();
+      refreshToken = snap.exists ? snap.data()?.refreshToken : null;
+    } catch (e) {
+      // Fall through deliberately: the delete below still has to run.
+      console.warn('[account-delete] youtube token read:', e.message);
+    }
+    if (refreshToken) {
+      // Best effort. An already-revoked token answers 400 and a network blip must not
+      // stop us deleting our own copy, so a failure here is logged, not thrown.
+      try { await youtubeOAuthClient().revokeToken(refreshToken); }
+      catch (e) { console.warn('[account-delete] youtube revoke:', e.message); }
+    }
+    await disconnectYouTube(uid, 'account deleted');
+  });
+
+  await step('tiktok', async () => {
+    let openId = null;
+    try {
+      const snap = await adminDb.collection('connectedAccounts').doc(uid).get();
+      openId = snap.exists ? snap.data()?.tiktok?.openId : null;
+    } catch (e) {
+      console.warn('[account-delete] tiktok lookup:', e.message);
+    }
+    if (openId) {
+      await adminDb.collection(TIKTOK_TOKENS).doc(openId).delete();
+      delete tiktokTokens[openId];   // the in-process cache, or it outlives the row
+    }
+  });
+
+  await step('connectedAccounts', () =>
+    adminDb.collection('connectedAccounts').doc(uid).delete());
+
+  // Queued posts would otherwise be picked up by the sweep every five minutes forever,
+  // failing each time against an account that no longer exists.
+  await step('scheduledPosts', async () => {
+    const snap = await adminDb.collection('scheduledPosts').where('userId', '==', uid).get();
+    await deleteAllDocs(snap);
+  });
+
+  // The records only. The FILES are left to cleanupOldFiles, which finds no record for
+  // them once these are gone and so treats them as free tier - deleted after 72h -
+  // rather than being stranded on disk.
+  await step('userVideos', async () => {
+    const snap = await adminDb.collection('userVideos').where('userId', '==', uid).get();
+    await deleteAllDocs(snap);
+  });
+
+  // Deleted here as well as by the client. The client deletes it first to satisfy its
+  // own security rules, but a server that cannot guarantee this doc is gone cannot
+  // promise the account is.
+  await step('users', () => adminDb.collection('users').doc(uid).delete());
+
+  if (failed.length) {
+    return res.status(500).json({
+      ok: false, removed, failed,
+      error: 'Some of your data could not be removed, so your account has been left in place. Please try again.',
+    });
+  }
+  console.log(`[account-delete] purged ${uid}: ${removed.join(', ')}`);
+  res.json({ ok: true, removed });
+});
+
 // Upload a finished video to the connected channel.
 //
 // Reads the file from DISK rather than fetching its own URL the way publishToTikTok
