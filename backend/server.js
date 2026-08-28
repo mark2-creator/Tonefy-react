@@ -3100,9 +3100,23 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
 
 // ===== TikTok OAuth & Content Posting =====
 
-const TIKTOK_CLIENT_KEY = process.env.TIKTOK_SANDBOX_CLIENT_KEY;
-const TIKTOK_CLIENT_SECRET = process.env.TIKTOK_SANDBOX_CLIENT_SECRET;
+// Which TikTok app to talk to. Sandbox by default, because that is what the currently
+// connected accounts were authorised against and flipping this INVALIDATES THEM: a token
+// issued by the sandbox app is not accepted by the production app, so every connected
+// account must reconnect after a switch. Set TIKTOK_ENV=production in .env and restart
+// once the production app is approved for video.upload and video.publish.
+//
+// Kept as an env switch rather than an edit here so the change is one line in .env and
+// revertible in seconds if the scopes turn out not to be approved.
+const TIKTOK_USE_PRODUCTION = String(process.env.TIKTOK_ENV || '').toLowerCase() === 'production';
+const TIKTOK_CLIENT_KEY = TIKTOK_USE_PRODUCTION
+  ? process.env.TIKTOK_CLIENT_KEY
+  : process.env.TIKTOK_SANDBOX_CLIENT_KEY;
+const TIKTOK_CLIENT_SECRET = TIKTOK_USE_PRODUCTION
+  ? process.env.TIKTOK_CLIENT_SECRET
+  : process.env.TIKTOK_SANDBOX_CLIENT_SECRET;
 const TIKTOK_REDIRECT_URI = process.env.TIKTOK_REDIRECT_URI;
+console.log(`[tiktok] using ${TIKTOK_USE_PRODUCTION ? 'PRODUCTION' : 'SANDBOX'} credentials`);
 
 // In-memory token store (replace with DB later)
 // PKCE state lives here only for the length of one OAuth handshake, which is fine in
