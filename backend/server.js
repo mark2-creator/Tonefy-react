@@ -930,6 +930,125 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
   }
 });
 
+/**
+ * The people behind the numbers, so the dashboard can be acted on rather than only read.
+ *
+ * Auth is the source of truth for who exists - a Firestore doc can be missing for an
+ * account that predates the users collection, and can be left behind by a deleted one.
+ * Both have happened here, which is why this walks Auth and joins Firestore onto it
+ * rather than the other way round.
+ *
+ * Subscription state is NOT re-derived per user: /api/admin/stats already pays one Play
+ * API call per subscriber, and doing it again here would double that on every screen
+ * load. This reports what Firestore believes; the stats endpoint is what checks it
+ * against Play.
+ */
+app.get("/api/admin/users", verifyToken, requireAdmin, mediaProcLimiter, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+
+    const authUsers = [];
+    let pageToken;
+    do {
+      const page = await getAuth().listUsers(1000, pageToken);
+      authUsers.push(...page.users);
+      pageToken = page.pageToken;
+    } while (pageToken);
+
+    const usersSnap = await adminDb.collection("users").get();
+    const byUid = new Map(usersSnap.docs.map(d => [d.id, d.data()]));
+
+    // One pass for video counts rather than a query per user.
+    const counts = new Map();
+    const videosSnap = await adminDb.collection("userVideos").get();
+    videosSnap.forEach(d => {
+      const uid = d.data().userId;
+      if (uid) counts.set(uid, (counts.get(uid) || 0) + 1);
+    });
+
+    let rows = authUsers.map(u => {
+      const f = byUid.get(u.uid) || {};
+      return {
+        uid: u.uid,
+        email: u.email || null,
+        name: u.displayName || null,
+        verified: !!u.emailVerified,
+        disabled: !!u.disabled,
+        created: u.metadata.creationTime || null,
+        lastSignIn: u.metadata.lastSignInTime || null,
+        plan: f.plan || 'free',
+        credits: f.creditsRemaining ?? null,
+        country: f.country || null,
+        videos: counts.get(u.uid) || 0,
+        // How they came to be on a paid plan, which is the difference between revenue
+        // and someone I set by hand while testing.
+        source: f.plan && f.plan !== 'free'
+          ? (f.subscriptionPurchaseToken ? 'purchase' : 'manual')
+          : null,
+        // No Firestore doc at all: predates the collection, or was half-deleted.
+        orphan: !byUid.has(u.uid),
+      };
+    });
+
+    if (q) {
+      rows = rows.filter(r =>
+        (r.email && r.email.toLowerCase().includes(q))
+        || (r.name && r.name.toLowerCase().includes(q))
+        || r.uid.toLowerCase() === q);
+    }
+
+    // Newest first: the question this screen answers most often is "who just signed up".
+    rows.sort((a, b) => Date.parse(b.created || 0) - Date.parse(a.created || 0));
+
+    res.json({ total: rows.length, rows: rows.slice(0, limit) });
+  } catch (e) {
+    console.error("admin/users error:", e.message);
+    res.status(500).json({ error: "Could not load users." });
+  }
+});
+
+/**
+ * Change someone's plan without opening the Firebase console.
+ *
+ * Credits are reset to the new tier's allowance and the cycle restarted, because a plan
+ * with the previous tier's credit count is a state no normal path produces and every
+ * later check would read it as real.
+ *
+ * It deliberately does NOT touch subscriptionPurchaseToken. If Play says someone is
+ * paying, that is Play's fact and this endpoint has no business erasing it - clearing it
+ * would make a real subscriber look manual forever. Downgrading a lapsed subscriber
+ * leaves the token as the record of what they once had.
+ */
+app.post("/api/admin/user/:uid/plan", verifyToken, requireAdmin, async (req, res) => {
+  const { uid } = req.params;
+  const plan = String(req.body?.plan || '').toLowerCase();
+  if (!['free', 'pro', 'creator'].includes(plan)) {
+    return res.status(400).json({ error: "plan must be free, pro or creator" });
+  }
+  try {
+    // Confirm the account exists before writing a doc for it. Without this a typo'd uid
+    // silently creates a users record for nobody, which then shows up as a real account.
+    await getAuth().getUser(uid);
+
+    const caps = tierConfig(plan);
+    await adminDb.collection("users").doc(uid).set({
+      plan,
+      creditsRemaining: caps.creditsPerCycle,
+      creditsResetAt: new Date(Date.now() + FREE_RESET_MS).toISOString(),
+      planSetBy: req.user.uid,
+      planSetAt: new Date().toISOString(),
+    }, { merge: true });
+
+    console.log(`[admin] ${req.user.uid} set ${uid} to ${plan}`);
+    res.json({ ok: true, uid, plan, credits: caps.creditsPerCycle });
+  } catch (e) {
+    if (e.code === 'auth/user-not-found') return res.status(404).json({ error: "No such account." });
+    console.error("admin/plan error:", e.message);
+    res.status(500).json({ error: "Could not change the plan." });
+  }
+});
+
 app.get("/api/translate-languages", mediaProcLimiter, (req, res) => {
   res.json({ languages: Object.entries(TRANSLATE_LANGS).map(([code, v]) => ({ code, label: v.label })) });
 });
