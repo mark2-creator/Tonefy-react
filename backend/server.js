@@ -4433,6 +4433,80 @@ const uploadFiles = (req, res, next) => {
   });
 };
 
+// ---- Profile photos -------------------------------------------------------------
+//
+// Kept OUT of the uploads directory on purpose. cleanupUploads() deletes genuine
+// uploads at a flat 30 days (item 12), and a profile picture that vanishes after a
+// month is worse than none. Avatars live in their own directory that nothing sweeps.
+//
+// Firebase Auth's photoURL stays the source of truth, set by the client after this
+// returns the URL - the app already reads user.photoURL. This endpoint only hosts the
+// bytes.
+const avatarsDir = path.join(__dirname, "avatars");
+if (!fs.existsSync(avatarsDir)) fs.mkdirSync(avatarsDir, { recursive: true });
+app.use("/avatars", express.static(avatarsDir, { maxAge: "365d" }));
+
+// A separate, image-only multer with a small cap: a profile photo is not a 500MB video,
+// and the app already crops it square before sending.
+const avatarUpload = multer({
+  dest: avatarsDir,
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = /^image\//.test(file.mimetype);
+    cb(ok ? null : new Error('not an image'), ok);
+  },
+}).single('photo');
+
+app.post('/api/profile-photo', verifyToken, uploadLimiter, (req, res) => {
+  avatarUpload(req, res, (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'That image is too large. Keep it under 8MB.' });
+      if (err.message === 'not an image') return res.status(400).json({ error: 'Please choose an image.' });
+      return res.status(400).json({ error: err.message || 'Upload failed.' });
+    }
+    if (!req.file) return res.status(400).json({ error: 'No image was uploaded.' });
+
+    const uid = req.user.uid;
+    try {
+      const ext = (path.extname(req.file.originalname) || '.jpg').toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12) || '.jpg';
+      // Timestamped, so each upload is a NEW url. Keying purely by uid would let the
+      // 365-day cache serve the old photo after a change; a fresh name sidesteps that
+      // without any cache-busting query for the client to remember.
+      const finalName = `${uid}-${Date.now()}${ext}`;
+      fs.renameSync(req.file.path, path.join(avatarsDir, finalName));
+
+      // Remove this user's previous avatars, so one stale file per change does not
+      // accumulate on disk forever.
+      for (const f of fs.readdirSync(avatarsDir)) {
+        if (f.startsWith(uid + '-') && f !== finalName) {
+          try { fs.unlinkSync(path.join(avatarsDir, f)); } catch (e) {}
+        }
+      }
+      res.json({ url: `${process.env.BASE_URL || ""}/avatars/${finalName}` });
+    } catch (e) {
+      try { fs.unlinkSync(req.file.path); } catch (_) {}
+      console.error('profile-photo error:', e.message);
+      res.status(500).json({ error: 'Could not save the image.' });
+    }
+  });
+});
+
+// Removing a photo: delete this user's avatar files. The client clears photoURL on Auth
+// separately; a stored file with no photoURL pointing at it is just orphaned bytes.
+app.post('/api/profile-photo/remove', verifyToken, (req, res) => {
+  const uid = req.user.uid;
+  try {
+    for (const f of fs.readdirSync(avatarsDir)) {
+      if (f.startsWith(uid + '-')) {
+        try { fs.unlinkSync(path.join(avatarsDir, f)); } catch (e) {}
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not remove the image.' });
+  }
+});
+
 app.post('/api/upload-media', uploadLimiter, uploadFiles, async (req, res) => {
   try {
     const urls = (req.files || []).map(f => {
