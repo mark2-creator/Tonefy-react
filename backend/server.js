@@ -3428,19 +3428,23 @@ async function publishToTikTok({ openId, videoUrl, title, privacyLevel = 'SELF_O
     const videoBuffer = Buffer.from(await videoRes.arrayBuffer());
     const videoSize = videoBuffer.length;
 
-    const initRes = await fetch('https://open.tiktokapis.com/v2/post/publish/video/init/', {
+    // INBOX (draft) upload, not Direct Post. The Direct Post endpoint
+    // (/v2/post/publish/video/init/) requires the app to be AUDITED for direct posting;
+    // an unaudited app calling it gets "Please review our integration guidelines" and
+    // nothing posts (verified against the live API Sep 8 2026). The inbox endpoint is the
+    // supported path for unaudited apps: it drops the video into the user's TikTok inbox
+    // as a DRAFT that they finish and publish inside TikTok - which is also exactly what
+    // this app's privacy policy and terms promise ("uploaded as drafts by default"). It
+    // takes source_info only; title/privacy/cover are chosen by the user in TikTok when
+    // they finish the draft, so post_info (and `title`/`privacyLevel`) do not apply here.
+    // If the app is later audited for Direct Post, switch back to the video/init endpoint.
+    const initRes = await fetch('https://open.tiktokapis.com/v2/post/publish/inbox/video/init/', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token.access_token}`,
         'Content-Type': 'application/json; charset=UTF-8',
       },
       body: JSON.stringify({
-        post_info: {
-          title: title || 'Created with Tonefy AI',
-          privacy_level: privacyLevel,
-          disable_duet: false, disable_comment: false, disable_stitch: false,
-          video_cover_timestamp_ms: 1000,
-        },
         source_info: {
           source: 'FILE_UPLOAD', video_size: videoSize,
           chunk_size: videoSize, total_chunk_count: 1,
@@ -3453,7 +3457,7 @@ async function publishToTikTok({ openId, videoUrl, title, privacyLevel = 'SELF_O
     }
     const uploadUrl = initData.data?.upload_url;
     const publishId = initData.data?.publish_id;
-    await fetch(uploadUrl, {
+    const put = await fetch(uploadUrl, {
       method: 'PUT',
       headers: {
         'Content-Range': `bytes 0-${videoSize - 1}/${videoSize}`,
@@ -3461,7 +3465,10 @@ async function publishToTikTok({ openId, videoUrl, title, privacyLevel = 'SELF_O
       },
       body: videoBuffer,
     });
-    return { ok: true, publishId };
+    if (!put.ok && put.status !== 201) {
+      return { ok: false, error: `Upload to TikTok failed (${put.status})` };
+    }
+    return { ok: true, publishId, draft: true };
   } catch (e) {
     return { ok: false, error: e.message || 'Upload failed' };
   }
