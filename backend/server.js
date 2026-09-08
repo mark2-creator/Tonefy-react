@@ -3419,9 +3419,18 @@ function isOwnMediaUrl(u) {
 //
 // Returns { ok, publishId } or { ok: false, error }. It never throws: the sweep records
 // the reason on the post rather than failing a whole pass over one bad item.
-async function publishToTikTok({ openId, videoUrl, title, privacyLevel = 'SELF_ONLY' }) {
+async function publishToTikTok({
+  openId, videoUrl, title, privacyLevel = 'SELF_ONLY',
+  disableComment = false, disableDuet = false, disableStitch = false,
+  brandContentToggle = false, brandOrganicToggle = false,
+}) {
   const token = await getTikTokToken(openId);
   if (!token) return { ok: false, error: 'TikTok not connected' };
+  // TikTok forbids private branded content. Enforced in the UI too, but a client cannot be
+  // trusted, so refuse it here rather than let TikTok reject the whole post opaquely.
+  if (brandContentToggle && privacyLevel === 'SELF_ONLY') {
+    return { ok: false, error: 'Branded content cannot be posted privately. Choose Public or Friends.' };
+  }
   try {
     const videoRes = await fetch(videoUrl);
     if (!videoRes.ok) return { ok: false, error: `Could not read the video (${videoRes.status})` };
@@ -3472,8 +3481,15 @@ async function publishToTikTok({ openId, videoUrl, title, privacyLevel = 'SELF_O
       post_info: {
         title: title || 'Created with Tonefy AI',
         privacy_level: privacyLevel,
-        disable_duet: false, disable_comment: false, disable_stitch: false,
+        disable_comment: !!disableComment,
+        disable_duet: !!disableDuet,
+        disable_stitch: !!disableStitch,
         video_cover_timestamp_ms: 1000,
+        // Commercial-content disclosure, chosen by the user in the compliant posting sheet.
+        // brand_organic = "Your brand" (promoting own business); brand_content = "Branded
+        // content" (a paid partnership). Both false = no disclosure.
+        brand_organic_toggle: !!brandOrganicToggle,
+        brand_content_toggle: !!brandContentToggle,
       },
       source_info: sourceInfo,
     });
@@ -3994,8 +4010,16 @@ const PUBLISHERS = {
     // Where this platform's identity lives on connectedAccounts/{uid}.
     accountFrom: (acc) => acc?.tiktok?.openId || null,
     notConnected: 'TikTok is no longer connected to this account.',
-    publish: ({ account, videoUrl, caption }) =>
-      publishToTikTok({ openId: account, videoUrl, title: caption }),
+    publish: ({ account, videoUrl, caption, options }) =>
+      publishToTikTok({
+        openId: account, videoUrl, title: caption,
+        privacyLevel: options?.privacyLevel || 'SELF_ONLY',
+        disableComment: options?.disableComment,
+        disableDuet: options?.disableDuet,
+        disableStitch: options?.disableStitch,
+        brandContentToggle: options?.brandContentToggle,
+        brandOrganicToggle: options?.brandOrganicToggle,
+      }),
   },
 
   youtube: {
@@ -4060,7 +4084,7 @@ app.get('/api/platforms', (req, res) => {
 // forget one.
 app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
   const uid = req.user.uid;
-  const { videoUrl, caption = '', platforms = [] } = req.body || {};
+  const { videoUrl, caption = '', platforms = [], tiktok: tiktokOptions } = req.body || {};
   if (!videoUrl) return res.status(400).json({ error: 'videoUrl required' });
   if (!Array.isArray(platforms) || platforms.length === 0) {
     return res.status(400).json({ error: 'Choose at least one platform.' });
@@ -4084,7 +4108,7 @@ app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
   for (const [id, pub] of targets) {
     const account = pub.accountFrom(accountDoc, uid);
     if (!account) { results.push({ platform: id, ok: false, error: pub.notConnected }); continue; }
-    const r = await pub.publish({ account, videoUrl, caption });
+    const r = await pub.publish({ account, videoUrl, caption, options: id === 'tiktok' ? tiktokOptions : undefined });
     results.push({ platform: id, ...r });
   }
 
@@ -4173,6 +4197,40 @@ async function scheduledPostSweep() {
 }
 setInterval(scheduledPostSweep, QUEUE_SWEEP_MS);
 scheduledPostSweep();
+
+// Creator info for the compliant Direct Post sheet. TikTok's UX guidelines REQUIRE the
+// app to fetch the creator's allowed privacy levels and interaction settings and have the
+// user choose before a direct post - this endpoint feeds that screen. verifyToken inline
+// (this route is outside the /api prefix, like the other tiktok routes).
+app.get('/tiktok/creator-info', tiktokLimiter, verifyToken, async (req, res) => {
+  try {
+    const snap = await adminDb.collection('connectedAccounts').doc(req.user.uid).get();
+    const openId = snap.exists ? snap.data()?.tiktok?.openId : null;
+    if (!openId) return res.status(400).json({ error: 'TikTok is not connected.' });
+    const token = await getTikTokToken(openId);
+    if (!token) return res.status(400).json({ error: 'TikTok is not connected.' });
+    const r = await fetch('https://open.tiktokapis.com/v2/post/publish/creator_info/query/', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token.access_token}`, 'Content-Type': 'application/json; charset=UTF-8' },
+    });
+    const d = await r.json();
+    if (d.error?.code !== 'ok') {
+      return res.status(502).json({ error: d.error?.message || 'Could not load your TikTok settings.' });
+    }
+    const info = d.data || {};
+    res.json({
+      nickname: info.creator_nickname || info.creator_username || 'Your TikTok',
+      avatar: info.creator_avatar_url || null,
+      privacyOptions: info.privacy_level_options || [],
+      commentDisabled: !!info.comment_disabled,
+      duetDisabled: !!info.duet_disabled,
+      stitchDisabled: !!info.stitch_disabled,
+      maxDurationSec: info.max_video_post_duration_sec || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Could not load your TikTok settings.' });
+  }
+});
 
 app.post('/tiktok/post-video', tiktokLimiter, verifyToken, async (req, res) => {
   const { openId, videoUrl, title, privacyLevel = 'SELF_ONLY' } = req.body;
