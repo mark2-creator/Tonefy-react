@@ -4198,6 +4198,42 @@ async function scheduledPostSweep() {
 setInterval(scheduledPostSweep, QUEUE_SWEEP_MS);
 scheduledPostSweep();
 
+// Proper disconnect: the app used to only delete connectedAccounts/{uid}.tiktok client-
+// side, which left the real access/refresh token in tiktokTokens (Admin-only, the client
+// cannot reach it) AND valid at TikTok. The privacy policy promises the token is deleted
+// on disconnect, and TikTok's audit expects revocation - so do both here. Mirrors the
+// YouTube disconnect (item 38). Best-effort revoke: an already-dead token must not stop us
+// deleting our own copy.
+app.post('/tiktok/disconnect', tiktokLimiter, verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const snap = await adminDb.collection('connectedAccounts').doc(uid).get();
+    const openId = snap.exists ? snap.data()?.tiktok?.openId : null;
+    if (openId) {
+      const tok = await getTikTokToken(openId);
+      if (tok?.access_token) {
+        try {
+          await fetch('https://open.tiktokapis.com/v2/oauth/revoke/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              client_key: TIKTOK_CLIENT_KEY,
+              client_secret: TIKTOK_CLIENT_SECRET,
+              token: tok.access_token,
+            }),
+          });
+        } catch (e) { console.error('[tiktok] revoke:', e.message); }
+      }
+      try { await adminDb.collection(TIKTOK_TOKENS).doc(openId).delete(); } catch (e) { console.error('[tiktok] token delete:', e.message); }
+      delete tiktokTokens[openId]; // drop the in-memory cache too, or it serves a dead token
+    }
+    await adminDb.collection('connectedAccounts').doc(uid).set({ tiktok: FieldValue.delete() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Could not disconnect.' });
+  }
+});
+
 // Creator info for the compliant Direct Post sheet. TikTok's UX guidelines REQUIRE the
 // app to fetch the creator's allowed privacy levels and interaction settings and have the
 // user choose before a direct post - this endpoint feeds that screen. verifyToken inline
