@@ -3428,47 +3428,66 @@ async function publishToTikTok({ openId, videoUrl, title, privacyLevel = 'SELF_O
     const videoBuffer = Buffer.from(await videoRes.arrayBuffer());
     const videoSize = videoBuffer.length;
 
-    // INBOX (draft) upload, not Direct Post. The Direct Post endpoint
-    // (/v2/post/publish/video/init/) requires the app to be AUDITED for direct posting;
-    // an unaudited app calling it gets "Please review our integration guidelines" and
-    // nothing posts (verified against the live API Sep 8 2026). The inbox endpoint is the
-    // supported path for unaudited apps: it drops the video into the user's TikTok inbox
-    // as a DRAFT that they finish and publish inside TikTok - which is also exactly what
-    // this app's privacy policy and terms promise ("uploaded as drafts by default"). It
-    // takes source_info only; title/privacy/cover are chosen by the user in TikTok when
-    // they finish the draft, so post_info (and `title`/`privacyLevel`) do not apply here.
-    // If the app is later audited for Direct Post, switch back to the video/init endpoint.
-    const initRes = await fetch('https://open.tiktokapis.com/v2/post/publish/inbox/video/init/', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token.access_token}`,
-        'Content-Type': 'application/json; charset=UTF-8',
-      },
-      body: JSON.stringify({
-        source_info: {
-          source: 'FILE_UPLOAD', video_size: videoSize,
-          chunk_size: videoSize, total_chunk_count: 1,
+    // Runs an init call, then PUTs the bytes to the returned upload_url. Returns the
+    // publish_id on success or the TikTok error on failure, so the caller can decide
+    // whether to fall back.
+    const initAndUpload = async (url, body) => {
+      const initRes = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token.access_token}`,
+          'Content-Type': 'application/json; charset=UTF-8',
         },
-      }),
-    });
-    const initData = await initRes.json();
-    if (initData.error?.code !== 'ok') {
-      return { ok: false, error: initData.error?.message || 'Failed to init post' };
-    }
-    const uploadUrl = initData.data?.upload_url;
-    const publishId = initData.data?.publish_id;
-    const put = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: {
-        'Content-Range': `bytes 0-${videoSize - 1}/${videoSize}`,
-        'Content-Type': 'video/mp4',
+        body: JSON.stringify(body),
+      });
+      const initData = await initRes.json();
+      if (initData.error?.code !== 'ok') {
+        return { ok: false, error: initData.error?.message || 'Failed to init post' };
+      }
+      const put = await fetch(initData.data?.upload_url, {
+        method: 'PUT',
+        headers: {
+          'Content-Range': `bytes 0-${videoSize - 1}/${videoSize}`,
+          'Content-Type': 'video/mp4',
+        },
+        body: videoBuffer,
+      });
+      if (!put.ok && put.status !== 201) return { ok: false, error: `Upload to TikTok failed (${put.status})` };
+      return { ok: true, publishId: initData.data?.publish_id };
+    };
+
+    const sourceInfo = { source: 'FILE_UPLOAD', video_size: videoSize, chunk_size: videoSize, total_chunk_count: 1 };
+
+    // 1) DIRECT POST first - the premium, one-step path (posts straight to the profile,
+    //    no manual finish in TikTok). This is the No.1 option on purpose: the app is for
+    //    paying users. It works only once the app is AUDITED for the video.publish scope;
+    //    an unaudited app gets "Please review our integration guidelines" here (verified
+    //    live Sep 8 2026), so we do not treat that as a hard failure - we fall through to
+    //    the draft path below. NOTE: passing a fixed privacy_level here is the interim
+    //    behaviour; TikTok's Direct Post audit additionally requires a compliant posting
+    //    UI (creator_info query + user-chosen Public/Friends/Private + disclosures), which
+    //    is a separate frontend build. Once that ships and the app is audited, this branch
+    //    goes live automatically with no further change.
+    const direct = await initAndUpload('https://open.tiktokapis.com/v2/post/publish/video/init/', {
+      post_info: {
+        title: title || 'Created with Tonefy AI',
+        privacy_level: privacyLevel,
+        disable_duet: false, disable_comment: false, disable_stitch: false,
+        video_cover_timestamp_ms: 1000,
       },
-      body: videoBuffer,
+      source_info: sourceInfo,
     });
-    if (!put.ok && put.status !== 201) {
-      return { ok: false, error: `Upload to TikTok failed (${put.status})` };
-    }
-    return { ok: true, publishId, draft: true };
+    if (direct.ok) return { ok: true, publishId: direct.publishId, mode: 'direct' };
+
+    // 2) INBOX (draft) fallback - the supported path for an unaudited app, and what the
+    //    privacy policy/terms promise ("uploaded as drafts"). The video lands in the
+    //    user's TikTok inbox as a draft they finish and publish inside TikTok. Takes
+    //    source_info only; title/privacy are set by the user there.
+    const inbox = await initAndUpload('https://open.tiktokapis.com/v2/post/publish/inbox/video/init/', {
+      source_info: sourceInfo,
+    });
+    if (!inbox.ok) return { ok: false, error: inbox.error || direct.error };
+    return { ok: true, publishId: inbox.publishId, mode: 'draft', draft: true };
   } catch (e) {
     return { ok: false, error: e.message || 'Upload failed' };
   }
