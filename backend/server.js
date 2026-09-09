@@ -3989,43 +3989,47 @@ async function publishToYouTube({ account: uid, videoUrl, caption, privacyStatus
 // ===========================================================================
 // Meta (Facebook Page + Instagram) publishing.
 //
-// One Meta app covers both. OAuth mirrors YouTube's (HMAC-signed state carrying the
-// verified uid, so the callback - which arrives from Facebook with no token of ours -
-// knows who connected, and the SERVER writes the record). Tokens live in metaTokens/{uid}
-// (Admin-SDK-only, like youtubeTokens/tiktokTokens); only non-secret display data goes on
-// connectedAccounts/{uid}. Facebook posts to a PAGE (not a profile); Instagram publishes
-// from the BUSINESS/CREATOR account LINKED to that Page - both are Meta platform rules.
+// TWO separate connections, on purpose (the user-friendly public design):
+//   - FACEBOOK: Facebook Login -> a Page (Meta forbids posting to personal profiles).
+//     Tokens in metaTokens/{uid}.
+//   - INSTAGRAM: direct Instagram Login (no Facebook Page required) -> the user's own
+//     Business/Creator account. Tokens in igTokens/{uid}.
+// Both use HMAC-signed state (mirrors YouTube) so the callback knows the uid and the
+// SERVER writes the record; both keep only non-secret display data on connectedAccounts.
+// The app shows two buttons: "Connect Facebook" and "Connect Instagram".
 // ===========================================================================
 const META_TOKENS = 'metaTokens';
 const META_GRAPH = 'https://graph.facebook.com/v21.0';
-const META_SCOPES = [
-  'pages_show_list', 'pages_read_engagement', 'pages_manage_posts',
-  'business_management', 'instagram_basic', 'instagram_content_publish',
-].join(',');
+const FB_SCOPES = ['pages_show_list', 'pages_read_engagement', 'pages_manage_posts'].join(',');
 
-function metaConfigured() {
-  return !!(process.env.FACEBOOK_APP_ID && process.env.FACEBOOK_APP_SECRET);
-}
+// Instagram is a SEPARATE, direct Instagram Login (no Facebook Page): its own app
+// credentials, its own OAuth on instagram.com, and graph.instagram.com with the IG user
+// token. This is the low-friction path for creators and what the app's second button uses.
+const IG_TOKENS = 'igTokens';
+const IG_GRAPH = 'https://graph.instagram.com';
+const IG_SCOPES = ['instagram_business_basic', 'instagram_business_content_publish'].join(',');
+
+function fbConfigured() { return !!(process.env.FACEBOOK_APP_ID && process.env.FACEBOOK_APP_SECRET); }
+function igConfigured() { return !!(process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET); }
 function metaOAuthDialogUrl(state) {
   return 'https://www.facebook.com/v21.0/dialog/oauth'
     + `?client_id=${process.env.FACEBOOK_APP_ID}`
     + `&redirect_uri=${encodeURIComponent(process.env.FACEBOOK_REDIRECT_URI)}`
-    + `&state=${encodeURIComponent(state)}&response_type=code&scope=${encodeURIComponent(META_SCOPES)}`;
+    + `&state=${encodeURIComponent(state)}&response_type=code&scope=${encodeURIComponent(FB_SCOPES)}`;
+}
+async function getIgAccount(uid) {
+  try { const s = await adminDb.collection(IG_TOKENS).doc(uid).get(); return s.exists ? s.data() : null; }
+  catch (e) { console.error('[ig] token read:', e.message); return null; }
 }
 
-// From a long-lived USER token, get the first Page (its Page token) and the IG business
-// account linked to it. A multi-Page picker can come later; most users have one.
-async function metaFetchPageAndIg(userToken) {
-  const r = await fetch(`${META_GRAPH}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&access_token=${encodeURIComponent(userToken)}`);
+// From a long-lived USER token, get the first Page and its Page token. Instagram is a
+// separate connection now, so we no longer read a linked IG here.
+async function metaFetchPage(userToken) {
+  const r = await fetch(`${META_GRAPH}/me/accounts?fields=id,name,access_token&access_token=${encodeURIComponent(userToken)}`);
   const d = await r.json();
   if (d.error) throw new Error(d.error.message || 'Could not read your Pages.');
   const page = (d.data || [])[0];
-  if (!page) return null;
-  return {
-    pageId: page.id, pageName: page.name, pageToken: page.access_token,
-    igUserId: page.instagram_business_account?.id || null,
-    igUsername: page.instagram_business_account?.username || null,
-  };
+  return page ? { pageId: page.id, pageName: page.name, pageToken: page.access_token } : null;
 }
 async function getMetaAccount(uid) {
   try {
@@ -4047,31 +4051,28 @@ async function publishToFacebook({ account: uid, videoUrl, caption }) {
   } catch (e) { return { ok: false, error: e.message || 'Facebook post failed.' }; }
 }
 
-// Instagram Reels: create a media container, poll until Graph finishes fetching/transcoding
-// the video, then publish. IG requires the video at a public URL (ours qualifies).
+// Instagram Reels via Instagram Login: create a media container, poll until Graph finishes
+// fetching/transcoding, then publish - on graph.instagram.com with the IG user token from
+// igTokens. IG requires the video at a public URL (ours qualifies).
 async function publishToInstagram({ account: uid, videoUrl, caption }) {
-  const acc = await getMetaAccount(uid);
-  if (!acc?.igUserId) return { ok: false, error: 'No Instagram account is linked to your Facebook Page.' };
-  const token = acc.pageToken; // IG content publishing uses the linked Page's token
+  const acc = await getIgAccount(uid);
+  if (!acc?.igUserId || !acc?.token) return { ok: false, error: 'Instagram is not connected.' };
   try {
-    const initBody = new URLSearchParams({ media_type: 'REELS', video_url: videoUrl, caption: caption || '', access_token: token });
-    const initRes = await fetch(`${META_GRAPH}/${acc.igUserId}/media`, { method: 'POST', body: initBody });
-    const initData = await initRes.json();
+    const initBody = new URLSearchParams({ media_type: 'REELS', video_url: videoUrl, caption: caption || '', access_token: acc.token });
+    const initData = await (await fetch(`${IG_GRAPH}/${acc.igUserId}/media`, { method: 'POST', body: initBody })).json();
     if (initData.error) return { ok: false, error: initData.error.message || 'Instagram upload failed.' };
     const creationId = initData.id;
     let status = '';
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 4000));
-      const sRes = await fetch(`${META_GRAPH}/${creationId}?fields=status_code&access_token=${encodeURIComponent(token)}`);
-      const sData = await sRes.json();
-      status = sData.status_code;
+      const s = await (await fetch(`${IG_GRAPH}/${creationId}?fields=status_code&access_token=${encodeURIComponent(acc.token)}`)).json();
+      status = s.status_code;
       if (status === 'FINISHED') break;
       if (status === 'ERROR') return { ok: false, error: 'Instagram could not process the video.' };
     }
     if (status !== 'FINISHED') return { ok: false, error: 'Instagram is still processing the video. Try again in a moment.' };
-    const pubBody = new URLSearchParams({ creation_id: creationId, access_token: token });
-    const pubRes = await fetch(`${META_GRAPH}/${acc.igUserId}/media_publish`, { method: 'POST', body: pubBody });
-    const pubData = await pubRes.json();
+    const pubBody = new URLSearchParams({ creation_id: creationId, access_token: acc.token });
+    const pubData = await (await fetch(`${IG_GRAPH}/${acc.igUserId}/media_publish`, { method: 'POST', body: pubBody })).json();
     if (pubData.error) return { ok: false, error: pubData.error.message || 'Instagram publish failed.' };
     return { ok: true, publishId: pubData.id };
   } catch (e) { return { ok: false, error: e.message || 'Instagram post failed.' }; }
@@ -4080,7 +4081,7 @@ async function publishToInstagram({ account: uid, videoUrl, caption }) {
 // Start the connection (authenticated, like /api/youtube/connect - the callback carries no
 // token of ours, so the uid rides in the signed state). The app opens the returned authUrl.
 app.get('/api/facebook/connect', verifyToken, (req, res) => {
-  if (!metaConfigured()) return res.status(503).json({ error: 'Facebook is not configured on this server yet.' });
+  if (!fbConfigured()) return res.status(503).json({ error: 'Facebook is not configured on this server yet.' });
   const state = signState({ uid: req.user.uid, exp: Date.now() + 10 * 60 * 1000 });
   res.json({ authUrl: metaOAuthDialogUrl(state) });
 });
@@ -4099,12 +4100,11 @@ app.get('/facebook/callback', async (req, res) => {
     const llRes = await fetch(`${META_GRAPH}/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.FACEBOOK_APP_ID}&client_secret=${process.env.FACEBOOK_APP_SECRET}&fb_exchange_token=${encodeURIComponent(tok.access_token)}`);
     const ll = await llRes.json();
     const userToken = ll.access_token || tok.access_token;
-    const acc = await metaFetchPageAndIg(userToken);
-    if (!acc) throw new Error('No Facebook Page was found on this account.');
-    await adminDb.collection(META_TOKENS).doc(st.uid).set({ userToken, ...acc, updatedAt: new Date().toISOString() }, { merge: true });
+    const page = await metaFetchPage(userToken);
+    if (!page) throw new Error('No Facebook Page was found on this account.');
+    await adminDb.collection(META_TOKENS).doc(st.uid).set({ userToken, ...page, updatedAt: new Date().toISOString() }, { merge: true });
     await adminDb.collection('connectedAccounts').doc(st.uid).set({
-      facebook: { pageId: acc.pageId, pageName: acc.pageName, connectedAt: new Date().toISOString() },
-      ...(acc.igUserId ? { instagram: { igUserId: acc.igUserId, username: acc.igUsername, connectedAt: new Date().toISOString() } } : {}),
+      facebook: { pageId: page.pageId, pageName: page.pageName, connectedAt: new Date().toISOString() },
     }, { merge: true });
     res.redirect(`${site}/facebook-success.html`);
   } catch (e) {
@@ -4123,7 +4123,52 @@ app.post('/api/facebook/disconnect', verifyToken, async (req, res) => {
       catch (e) { console.error('[facebook] revoke:', e.message); }
     }
     try { await adminDb.collection(META_TOKENS).doc(uid).delete(); } catch (e) { console.error('[meta] token delete:', e.message); }
-    await adminDb.collection('connectedAccounts').doc(uid).set({ facebook: FieldValue.delete(), instagram: FieldValue.delete() }, { merge: true });
+    await adminDb.collection('connectedAccounts').doc(uid).set({ facebook: FieldValue.delete() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
+});
+
+// ---- Instagram via Instagram Login (direct; no Facebook Page needed) ----
+app.get('/api/instagram/connect', verifyToken, (req, res) => {
+  if (!igConfigured()) return res.status(503).json({ error: 'Instagram is not configured on this server yet.' });
+  const state = signState({ uid: req.user.uid, exp: Date.now() + 10 * 60 * 1000 });
+  const authUrl = 'https://www.instagram.com/oauth/authorize'
+    + `?client_id=${process.env.INSTAGRAM_APP_ID}&redirect_uri=${encodeURIComponent(process.env.INSTAGRAM_REDIRECT_URI)}`
+    + `&response_type=code&scope=${encodeURIComponent(IG_SCOPES)}&state=${encodeURIComponent(state)}`;
+  res.json({ authUrl });
+});
+
+app.get('/instagram/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  const site = 'https://tonefy-ai.fitlifesolutions.site';
+  if (error) return res.redirect(`${site}?instagram_error=${encodeURIComponent(String(error))}`);
+  const st = readState(String(state || ''));
+  if (!st || !code) return res.redirect(`${site}?instagram_error=bad_state`);
+  try {
+    // code -> short-lived IG user token (+ user_id), on api.instagram.com
+    const form = new URLSearchParams({
+      client_id: process.env.INSTAGRAM_APP_ID, client_secret: process.env.INSTAGRAM_APP_SECRET,
+      grant_type: 'authorization_code', redirect_uri: process.env.INSTAGRAM_REDIRECT_URI, code: String(code),
+    });
+    const short = await (await fetch('https://api.instagram.com/oauth/access_token', { method: 'POST', body: form })).json();
+    if (short.error_type || short.error || !short.access_token) throw new Error(short.error_message || short.error?.message || 'Token exchange failed.');
+    const igUserId = String(short.user_id);
+    // short-lived -> long-lived (60 days), on graph.instagram.com
+    const ll = await (await fetch(`${IG_GRAPH}/access_token?grant_type=ig_exchange_token&client_secret=${process.env.INSTAGRAM_APP_SECRET}&access_token=${encodeURIComponent(short.access_token)}`)).json();
+    const token = ll.access_token || short.access_token;
+    let username = null;
+    try { const me = await (await fetch(`${IG_GRAPH}/me?fields=user_id,username&access_token=${encodeURIComponent(token)}`)).json(); username = me.username || null; } catch (e) { /* username is cosmetic */ }
+    await adminDb.collection(IG_TOKENS).doc(st.uid).set({ igUserId, token, username, updatedAt: new Date().toISOString() }, { merge: true });
+    await adminDb.collection('connectedAccounts').doc(st.uid).set({ instagram: { igUserId, username, connectedAt: new Date().toISOString() } }, { merge: true });
+    res.redirect(`${site}/facebook-success.html`);
+  } catch (e) { console.error('[instagram] callback:', e.message); res.redirect(`${site}?instagram_error=server_error`); }
+});
+
+app.post('/api/instagram/disconnect', verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    try { await adminDb.collection(IG_TOKENS).doc(uid).delete(); } catch (e) { console.error('[ig] token delete:', e.message); }
+    await adminDb.collection('connectedAccounts').doc(uid).set({ instagram: FieldValue.delete() }, { merge: true });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
 });
@@ -4167,7 +4212,7 @@ const PUBLISHERS = {
   facebook: {
     label: 'Facebook',
     kind: 'video',
-    enabled: () => metaConfigured(),
+    enabled: () => fbConfigured(),
     // uid, not pageId: metaTokens is keyed by uid and holds the Page token.
     accountFrom: (acc, uid) => (acc?.facebook?.pageId ? uid : null),
     notConnected: 'Facebook is no longer connected to this account.',
@@ -4177,9 +4222,9 @@ const PUBLISHERS = {
   instagram: {
     label: 'Instagram',
     kind: 'video',
-    enabled: () => metaConfigured(),
+    enabled: () => igConfigured(),
     accountFrom: (acc, uid) => (acc?.instagram?.igUserId ? uid : null),
-    notConnected: 'No Instagram account is linked to your Facebook Page.',
+    notConnected: 'Instagram is no longer connected to this account.',
     publish: publishToInstagram,
   },
 
