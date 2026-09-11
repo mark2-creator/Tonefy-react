@@ -4225,11 +4225,300 @@ app.get('/api/instagram/status', verifyToken, async (req, res) => {
 // update. That matters here: the app ships over the air but its platform list would
 // otherwise be a constant compiled into a bundle.
 //
-// YOUTUBE and PINTEREST are registered as KNOWN but not implemented, deliberately. Both
-// are blocked on app registration and review rather than on code, and writing an upload
-// path against an API I cannot call would be exactly the "verified by reading" work this
-// project keeps being bitten by. What each needs is written down at its entry so the
-// next session does not re-derive it.
+// ===========================================================================
+// PINTEREST + LINKEDIN (added Sep 11 2026) - same shape as YouTube/Meta: a code-flow
+// OAuth on the platform, tokens in an Admin-SDK-only collection keyed by the VERIFIED
+// uid, non-secret display data on connectedAccounts, and a publish() the registry and the
+// scheduled sweep both call.
+//
+// UNTESTED end to end, and honestly so: neither has developer credentials yet, and both
+// need the platform's OWN app review before they can post for anyone but the app owner -
+// which in turn waits on the same URSB business registration Meta needs (owner is
+// funds-blocked on it, Sep 11 2026). Written now so that turning each on is a credential
+// + a review, not a build, exactly how Facebook/Instagram were staged ahead of theirs.
+// enabled() returns false until the env is set, so the connect routes answer 503 and the
+// registry hides the platform until then - nothing here is reachable in the meantime.
+//
+// The publish() flows below follow each platform's v5 / versioned REST docs but have
+// never run against the real API. A future session with real credentials MUST verify:
+//   - Pinterest: media register -> upload -> poll -> create pin, and that a video pin's
+//     required cover_image_url is accepted (we grab a frame with ffmpeg and host it).
+//   - LinkedIn: initializeUpload -> PUT bytes -> finalizeUpload -> create post, and keep
+//     the LinkedIn-Version header current (LinkedIn dates its API and rejects stale ones).
+// Treat them as drafts to confirm, not as proven, per this project's "verified, not read".
+// ===========================================================================
+
+// ---- Pinterest (API v5) ----
+const PIN_TOKENS = 'pinterestTokens';
+const PIN_API = 'https://api.pinterest.com/v5';
+const PIN_SCOPES = ['boards:read', 'pins:read', 'pins:write'].join(',');
+function pinConfigured() { return !!(process.env.PINTEREST_APP_ID && process.env.PINTEREST_APP_SECRET && process.env.PINTEREST_REDIRECT_URI); }
+function pinBasicAuth() { return 'Basic ' + Buffer.from(`${process.env.PINTEREST_APP_ID}:${process.env.PINTEREST_APP_SECRET}`).toString('base64'); }
+async function getPinAccount(uid) {
+  try { const s = await adminDb.collection(PIN_TOKENS).doc(uid).get(); return s.exists ? s.data() : null; }
+  catch (e) { console.error('[pinterest] token read:', e.message); return null; }
+}
+// Pinterest access tokens expire; refresh with the stored refresh_token when they do, so a
+// post scheduled for tomorrow still has a live token. Same intent as YouTube's refresh.
+async function pinValidToken(acc, uid) {
+  if (!acc.expiresAt || Date.now() < acc.expiresAt - 60000 || !acc.refreshToken) return acc.token;
+  try {
+    const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: acc.refreshToken });
+    const r = await (await fetch(`${PIN_API}/oauth/token`, { method: 'POST', headers: { Authorization: pinBasicAuth(), 'Content-Type': 'application/x-www-form-urlencoded' }, body })).json();
+    if (!r.access_token) return acc.token;
+    await adminDb.collection(PIN_TOKENS).doc(uid).set({ token: r.access_token, expiresAt: r.expires_in ? Date.now() + r.expires_in * 1000 : null, updatedAt: new Date().toISOString() }, { merge: true });
+    return r.access_token;
+  } catch (e) { return acc.token; }
+}
+
+app.get('/api/pinterest/connect', verifyToken, (req, res) => {
+  if (!pinConfigured()) return res.status(503).json({ error: 'Pinterest is not configured on this server yet.' });
+  const state = signState({ uid: req.user.uid, exp: Date.now() + 10 * 60 * 1000 });
+  const authUrl = 'https://www.pinterest.com/oauth/'
+    + `?client_id=${encodeURIComponent(process.env.PINTEREST_APP_ID)}`
+    + `&redirect_uri=${encodeURIComponent(process.env.PINTEREST_REDIRECT_URI)}`
+    + `&response_type=code&scope=${encodeURIComponent(PIN_SCOPES)}&state=${encodeURIComponent(state)}`;
+  res.json({ authUrl });
+});
+
+app.get('/pinterest/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  const site = 'https://tonefy-ai.fitlifesolutions.site';
+  if (error) return res.redirect(`${site}?pinterest_error=${encodeURIComponent(String(error))}`);
+  const st = readState(String(state || ''));
+  if (!st || !code) return res.redirect(`${site}?pinterest_error=bad_state`);
+  try {
+    const body = new URLSearchParams({ grant_type: 'authorization_code', code: String(code), redirect_uri: process.env.PINTEREST_REDIRECT_URI });
+    const tok = await (await fetch(`${PIN_API}/oauth/token`, { method: 'POST', headers: { Authorization: pinBasicAuth(), 'Content-Type': 'application/x-www-form-urlencoded' }, body })).json();
+    if (!tok.access_token) throw new Error(tok.message || tok.error_description || 'Token exchange failed.');
+    let username = null;
+    try { const me = await (await fetch(`${PIN_API}/user_account`, { headers: { Authorization: 'Bearer ' + tok.access_token } })).json(); username = me.username || null; } catch (e) { /* display only */ }
+    await adminDb.collection(PIN_TOKENS).doc(st.uid).set({
+      token: tok.access_token,
+      refreshToken: tok.refresh_token || null,
+      expiresAt: tok.expires_in ? Date.now() + tok.expires_in * 1000 : null,
+      username, updatedAt: new Date().toISOString(),
+    }, { merge: true });
+    await adminDb.collection('connectedAccounts').doc(st.uid).set({ pinterest: { username, connectedAt: new Date().toISOString() } }, { merge: true });
+    res.redirect(`${site}/pinterest-success.html`);
+  } catch (e) { console.error('[pinterest] callback:', e.message); res.redirect(`${site}?pinterest_error=server_error`); }
+});
+
+app.post('/api/pinterest/disconnect', verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    try { await adminDb.collection(PIN_TOKENS).doc(uid).delete(); } catch (e) { console.error('[pinterest] token delete:', e.message); }
+    await adminDb.collection('connectedAccounts').doc(uid).set({ pinterest: FieldValue.delete() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
+});
+
+app.get('/api/pinterest/status', verifyToken, async (req, res) => {
+  try {
+    const [tok, acc] = await Promise.all([
+      adminDb.collection(PIN_TOKENS).doc(req.user.uid).get(),
+      adminDb.collection('connectedAccounts').doc(req.user.uid).get(),
+    ]);
+    const connected = tok.exists && !!tok.data()?.token;
+    const pin = acc.exists ? acc.data()?.pinterest : null;
+    res.json({ connected, configured: pinConfigured(), username: connected ? (pin?.username || tok.data()?.username || null) : null });
+  } catch (e) { console.error('[pinterest] status failed:', e.message); res.status(500).json({ error: 'Could not read your Pinterest connection.' }); }
+});
+
+// UNTESTED - see the block header. Video pin: register media, upload the bytes to the
+// returned URL with Pinterest's own form fields, poll until processed, then create the pin
+// with a cover frame (video pins require cover_image_url).
+async function publishToPinterest({ account: uid, videoUrl, caption }) {
+  const acc = await getPinAccount(uid);
+  if (!acc?.token) return { ok: false, error: 'Pinterest is not connected.' };
+  let coverPath = null;
+  try {
+    if (!isOwnMediaUrl(videoUrl)) return { ok: false, error: 'The video must be on Tonefy to post it.' };
+    const token = await pinValidToken(acc, uid);
+    const auth = { Authorization: 'Bearer ' + token };
+    const boards = await (await fetch(`${PIN_API}/boards?page_size=1`, { headers: auth })).json();
+    const board = boards.items?.[0];
+    if (!board) return { ok: false, error: 'Create a board on Pinterest first, then try again.' };
+    const reg = await (await fetch(`${PIN_API}/media`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify({ media_type: 'video' }) })).json();
+    if (!reg.media_id || !reg.upload_url) return { ok: false, error: reg.message || 'Pinterest would not accept the upload.' };
+    const videoRes = await fetch(videoUrl);
+    if (!videoRes.ok) return { ok: false, error: `Could not read the video (${videoRes.status}).` };
+    const videoBuf = Buffer.from(await videoRes.arrayBuffer());
+    const form = new FormData();
+    for (const [k, v] of Object.entries(reg.upload_parameters || {})) form.append(k, String(v));
+    form.append('file', new Blob([videoBuf]), 'video.mp4');
+    await fetch(reg.upload_url, { method: 'POST', body: form });
+    let status = '';
+    for (let i = 0; i < 40; i++) {
+      await new Promise((r) => setTimeout(r, 4000));
+      const m = await (await fetch(`${PIN_API}/media/${reg.media_id}`, { headers: auth })).json();
+      status = m.status;
+      if (status === 'succeeded') break;
+      if (status === 'failed') return { ok: false, error: 'Pinterest could not process the video.' };
+    }
+    if (status !== 'succeeded') return { ok: false, error: 'Pinterest is still processing the video. Try again shortly.' };
+    // Cover frame - video pins require cover_image_url. Grab frame 0 and host it.
+    const coverName = uniqueName('pincover', 'jpg');
+    coverPath = path.join(videosDir, coverName);
+    const srcPath = path.join(videosDir, path.basename(new URL(videoUrl).pathname));
+    try { await run('ffmpeg', ['-y', '-ss', '0', '-i', srcPath, '-frames:v', '1', coverPath], { timeout: 60000 }); } catch (e) { /* Pinterest may still accept without, or reject clearly */ }
+    const coverUrl = `https://api.fitlifesolutions.site/videos/${coverName}`;
+    const pinBody = {
+      board_id: board.id,
+      title: (caption || 'Tonefy video').slice(0, 100),
+      description: caption || '',
+      media_source: { source_type: 'video_id', media_id: reg.media_id, cover_image_url: coverUrl },
+    };
+    const pin = await (await fetch(`${PIN_API}/pins`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(pinBody) })).json();
+    if (!pin.id) return { ok: false, error: pin.message || 'Pinterest publish failed.' };
+    return { ok: true, publishId: pin.id };
+  } catch (e) {
+    return { ok: false, error: e.message || 'Pinterest post failed.' };
+  }
+}
+
+// ---- LinkedIn (versioned REST, member share) ----
+const LI_TOKENS = 'linkedinTokens';
+const LI_VERSION = '202405'; // LinkedIn dates its API; keep current or requests 426/400.
+const LI_SCOPES = ['openid', 'profile', 'w_member_social'].join(' ');
+function liConfigured() { return !!(process.env.LINKEDIN_CLIENT_ID && process.env.LINKEDIN_CLIENT_SECRET && process.env.LINKEDIN_REDIRECT_URI); }
+async function getLiAccount(uid) {
+  try { const s = await adminDb.collection(LI_TOKENS).doc(uid).get(); return s.exists ? s.data() : null; }
+  catch (e) { console.error('[linkedin] token read:', e.message); return null; }
+}
+
+app.get('/api/linkedin/connect', verifyToken, (req, res) => {
+  if (!liConfigured()) return res.status(503).json({ error: 'LinkedIn is not configured on this server yet.' });
+  const state = signState({ uid: req.user.uid, exp: Date.now() + 10 * 60 * 1000 });
+  const authUrl = 'https://www.linkedin.com/oauth/v2/authorization'
+    + `?response_type=code&client_id=${encodeURIComponent(process.env.LINKEDIN_CLIENT_ID)}`
+    + `&redirect_uri=${encodeURIComponent(process.env.LINKEDIN_REDIRECT_URI)}`
+    + `&state=${encodeURIComponent(state)}&scope=${encodeURIComponent(LI_SCOPES)}`;
+  res.json({ authUrl });
+});
+
+app.get('/linkedin/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  const site = 'https://tonefy-ai.fitlifesolutions.site';
+  if (error) return res.redirect(`${site}?linkedin_error=${encodeURIComponent(String(error))}`);
+  const st = readState(String(state || ''));
+  if (!st || !code) return res.redirect(`${site}?linkedin_error=bad_state`);
+  try {
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code', code: String(code),
+      redirect_uri: process.env.LINKEDIN_REDIRECT_URI,
+      client_id: process.env.LINKEDIN_CLIENT_ID, client_secret: process.env.LINKEDIN_CLIENT_SECRET,
+    });
+    const tok = await (await fetch('https://www.linkedin.com/oauth/v2/accessToken', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body })).json();
+    if (!tok.access_token) throw new Error(tok.error_description || tok.error || 'Token exchange failed.');
+    // The member id and name come from OpenID userinfo (the openid+profile scopes).
+    let memberId = null, name = null;
+    try {
+      const me = await (await fetch('https://api.linkedin.com/v2/userinfo', { headers: { Authorization: 'Bearer ' + tok.access_token } })).json();
+      memberId = me.sub || null; name = me.name || null;
+    } catch (e) { /* posting still needs memberId; handled below */ }
+    if (!memberId) throw new Error('Could not read your LinkedIn profile id.');
+    await adminDb.collection(LI_TOKENS).doc(st.uid).set({
+      token: tok.access_token,
+      expiresAt: tok.expires_in ? Date.now() + tok.expires_in * 1000 : null,
+      memberId, name, updatedAt: new Date().toISOString(),
+    }, { merge: true });
+    await adminDb.collection('connectedAccounts').doc(st.uid).set({ linkedin: { name, connectedAt: new Date().toISOString() } }, { merge: true });
+    res.redirect(`${site}/linkedin-success.html`);
+  } catch (e) { console.error('[linkedin] callback:', e.message); res.redirect(`${site}?linkedin_error=server_error`); }
+});
+
+app.post('/api/linkedin/disconnect', verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    try { await adminDb.collection(LI_TOKENS).doc(uid).delete(); } catch (e) { console.error('[linkedin] token delete:', e.message); }
+    await adminDb.collection('connectedAccounts').doc(uid).set({ linkedin: FieldValue.delete() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
+});
+
+app.get('/api/linkedin/status', verifyToken, async (req, res) => {
+  try {
+    const [tok, acc] = await Promise.all([
+      adminDb.collection(LI_TOKENS).doc(req.user.uid).get(),
+      adminDb.collection('connectedAccounts').doc(req.user.uid).get(),
+    ]);
+    const connected = tok.exists && !!tok.data()?.token;
+    const li = acc.exists ? acc.data()?.linkedin : null;
+    res.json({ connected, configured: liConfigured(), name: connected ? (li?.name || tok.data()?.name || null) : null });
+  } catch (e) { console.error('[linkedin] status failed:', e.message); res.status(500).json({ error: 'Could not read your LinkedIn connection.' }); }
+});
+
+// UNTESTED - see the block header. Member video share: initializeUpload for the owner,
+// PUT the bytes to the returned instruction(s), finalizeUpload with the part ids, then
+// create a post referencing the video URN. LinkedIn-Version and X-Restli-Protocol-Version
+// headers are mandatory on the /rest calls.
+async function publishToLinkedIn({ account: uid, videoUrl, caption }) {
+  const acc = await getLiAccount(uid);
+  if (!acc?.token || !acc?.memberId) return { ok: false, error: 'LinkedIn is not connected.' };
+  try {
+    if (!isOwnMediaUrl(videoUrl)) return { ok: false, error: 'The video must be on Tonefy to post it.' };
+    const owner = `urn:li:person:${acc.memberId}`;
+    const restHeaders = {
+      Authorization: 'Bearer ' + acc.token,
+      'LinkedIn-Version': LI_VERSION,
+      'X-Restli-Protocol-Version': '2.0.0',
+      'Content-Type': 'application/json',
+    };
+    const videoRes = await fetch(videoUrl);
+    if (!videoRes.ok) return { ok: false, error: `Could not read the video (${videoRes.status}).` };
+    const videoBuf = Buffer.from(await videoRes.arrayBuffer());
+    // 1) initializeUpload
+    const init = await (await fetch('https://api.linkedin.com/rest/videos?action=initializeUpload', {
+      method: 'POST', headers: restHeaders,
+      body: JSON.stringify({ initializeUploadRequest: { owner, fileSizeBytes: videoBuf.length, uploadCaptions: false, uploadThumbnail: false } }),
+    })).json();
+    const value = init.value;
+    if (!value?.video || !Array.isArray(value.uploadInstructions)) return { ok: false, error: init.message || 'LinkedIn would not accept the upload.' };
+    // 2) PUT each instructed byte range, collecting the returned ETags
+    const partIds = [];
+    for (const ins of value.uploadInstructions) {
+      const slice = videoBuf.subarray(ins.firstByte || 0, (ins.lastByte != null ? ins.lastByte + 1 : videoBuf.length));
+      const up = await fetch(ins.uploadUrl, { method: 'PUT', headers: { Authorization: 'Bearer ' + acc.token }, body: slice });
+      const etag = up.headers.get('etag');
+      if (etag) partIds.push(etag.replace(/"/g, ''));
+    }
+    // 3) finalizeUpload
+    await fetch('https://api.linkedin.com/rest/videos?action=finalizeUpload', {
+      method: 'POST', headers: restHeaders,
+      body: JSON.stringify({ finalizeUploadRequest: { video: value.video, uploadToken: value.uploadToken || '', uploadedPartIds: partIds } }),
+    });
+    // 4) create the post
+    const postRes = await fetch('https://api.linkedin.com/rest/posts', {
+      method: 'POST', headers: restHeaders,
+      body: JSON.stringify({
+        author: owner,
+        commentary: caption || '',
+        visibility: 'PUBLIC',
+        distribution: { feedDistribution: 'MAIN_FEED', targetEntities: [], thirdPartyDistributionChannels: [] },
+        content: { media: { id: value.video, title: (caption || 'Tonefy video').slice(0, 100) } },
+        lifecycleState: 'PUBLISHED',
+        isReshareDisabledByAuthor: false,
+      }),
+    });
+    // A created post returns its URN in x-restli-id (201), with no JSON body.
+    const postId = postRes.headers.get('x-restli-id');
+    if (!postRes.ok || !postId) {
+      let msg = 'LinkedIn publish failed.';
+      try { const j = await postRes.json(); msg = j.message || msg; } catch (e) { /* no body */ }
+      return { ok: false, error: msg };
+    }
+    return { ok: true, publishId: postId };
+  } catch (e) {
+    return { ok: false, error: e.message || 'LinkedIn post failed.' };
+  }
+}
+
+// Every entry has a publish() now; what gates a platform is enabled(), which reads the
+// environment - a platform with no credentials answers "not available" and the app hides
+// it. Pinterest and LinkedIn are written but UNTESTED (no credentials, no review yet);
+// what each still needs externally is noted at its entry and in the block above so the
+// next session does not re-derive it, and does verify rather than trust.
 const PUBLISHERS = {
   tiktok: {
     label: 'TikTok',
@@ -4294,17 +4583,26 @@ const PUBLISHERS = {
 
   pinterest: {
     label: 'Pinterest',
-    // IMAGE, not video, and that is the point of listing it: this app now makes
-    // thumbnails, and an image pin is a single POST /v5/pins - by far the simplest
-    // publish on this list. A video pin needs register-media, an upload, a status poll
-    // and then the pin, which is four steps and worth doing separately.
-    kind: 'image',
-    // Needs: a Pinterest developer app and OAuth 2.0. Default is TRIAL access; standard
-    // access needs review, and trial cannot post to a real audience.
-    enabled: () => !!(process.env.PINTEREST_APP_ID && process.env.PINTEREST_APP_SECRET),
-    accountFrom: (acc) => acc?.pinterest?.userId || null,
+    kind: 'video',
+    // Needs: a Pinterest developer app + OAuth 2.0, and its own review for standard
+    // access (trial access cannot post to a real audience). Connect/publish are written
+    // (publishToPinterest) but UNTESTED until credentials exist - see the block above.
+    enabled: () => pinConfigured(),
+    accountFrom: (acc, uid) => (acc?.pinterest ? uid : null),
     notConnected: 'Pinterest is no longer connected to this account.',
-    publish: async () => ({ ok: false, error: 'Pinterest publishing is not configured on this server yet.' }),
+    publish: publishToPinterest,
+  },
+
+  linkedin: {
+    label: 'LinkedIn',
+    kind: 'video',
+    // Needs: a LinkedIn developer app with the "Share on LinkedIn" / Community Management
+    // products, OAuth 2.0, and app review. Connect/publish are written (publishToLinkedIn)
+    // but UNTESTED until credentials exist - see the block above.
+    enabled: () => liConfigured(),
+    accountFrom: (acc, uid) => (acc?.linkedin ? uid : null),
+    notConnected: 'LinkedIn is no longer connected to this account.',
+    publish: publishToLinkedIn,
   },
 };
 
