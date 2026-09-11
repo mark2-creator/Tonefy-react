@@ -4251,7 +4251,10 @@ app.get('/api/instagram/status', verifyToken, async (req, res) => {
 // ---- Pinterest (API v5) ----
 const PIN_TOKENS = 'pinterestTokens';
 const PIN_API = 'https://api.pinterest.com/v5';
-const PIN_SCOPES = ['boards:read', 'pins:read', 'pins:write'].join(',');
+// boards:write is required to CREATE a pin, not only to edit boards - Pinterest's
+// POST /v5/pins rejects a token without it ("Missing: ['boards:write']"), found by a
+// real test pin. pins:write alone is not enough.
+const PIN_SCOPES = ['boards:read', 'boards:write', 'pins:read', 'pins:write'].join(',');
 function pinConfigured() { return !!(process.env.PINTEREST_APP_ID && process.env.PINTEREST_APP_SECRET && process.env.PINTEREST_REDIRECT_URI); }
 function pinBasicAuth() { return 'Basic ' + Buffer.from(`${process.env.PINTEREST_APP_ID}:${process.env.PINTEREST_APP_SECRET}`).toString('base64'); }
 async function getPinAccount(uid) {
