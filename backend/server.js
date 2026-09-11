@@ -4181,6 +4181,39 @@ app.post('/api/instagram/disconnect', verifyToken, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
 });
 
+// Authoritative connection status, like /api/youtube/status: the token lives server-side
+// and only the backend can say whether it is still usable. The app reads these rather than
+// connectedAccounts directly, so a token we cleared server-side is reported as disconnected.
+app.get('/api/facebook/status', verifyToken, async (req, res) => {
+  try {
+    const [tok, acc] = await Promise.all([
+      adminDb.collection(META_TOKENS).doc(req.user.uid).get(),
+      adminDb.collection('connectedAccounts').doc(req.user.uid).get(),
+    ]);
+    const connected = tok.exists && !!tok.data()?.pageToken;
+    const fb = acc.exists ? acc.data()?.facebook : null;
+    res.json({ connected, configured: fbConfigured(), pageName: connected ? (fb?.pageName || tok.data()?.pageName || null) : null });
+  } catch (e) {
+    console.error('[facebook] status failed:', e.message);
+    res.status(500).json({ error: 'Could not read your Facebook connection.' });
+  }
+});
+
+app.get('/api/instagram/status', verifyToken, async (req, res) => {
+  try {
+    const [tok, acc] = await Promise.all([
+      adminDb.collection(IG_TOKENS).doc(req.user.uid).get(),
+      adminDb.collection('connectedAccounts').doc(req.user.uid).get(),
+    ]);
+    const connected = tok.exists && !!tok.data()?.igUserId && !!tok.data()?.token;
+    const ig = acc.exists ? acc.data()?.instagram : null;
+    res.json({ connected, configured: igConfigured(), username: connected ? (ig?.username || tok.data()?.username || null) : null });
+  } catch (e) {
+    console.error('[instagram] status failed:', e.message);
+    res.status(500).json({ error: 'Could not read your Instagram connection.' });
+  }
+});
+
 // Which platforms this server can publish to, and how.
 //
 // The sweep and the post route were both TikTok-shaped - `platforms.includes('tiktok')`,
