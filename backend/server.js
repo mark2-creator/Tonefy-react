@@ -4152,12 +4152,20 @@ app.get('/instagram/callback', async (req, res) => {
     });
     const short = await (await fetch('https://api.instagram.com/oauth/access_token', { method: 'POST', body: form })).json();
     if (short.error_type || short.error || !short.access_token) throw new Error(short.error_message || short.error?.message || 'Token exchange failed.');
-    const igUserId = String(short.user_id);
     // short-lived -> long-lived (60 days), on graph.instagram.com
     const ll = await (await fetch(`${IG_GRAPH}/access_token?grant_type=ig_exchange_token&client_secret=${process.env.INSTAGRAM_APP_SECRET}&access_token=${encodeURIComponent(short.access_token)}`)).json();
     const token = ll.access_token || short.access_token;
+    // The id the /media publish endpoint needs is the user_id from graph.instagram.com/me -
+    // NOT short.user_id from the token exchange, which is a different app-scoped id that /media
+    // rejects with subcode 33 ("does not exist ... or does not support this operation"). Both
+    // are called "user_id"; only /me's works. Fall back to short.user_id only if /me fails.
+    let igUserId = String(short.user_id);
     let username = null;
-    try { const me = await (await fetch(`${IG_GRAPH}/me?fields=user_id,username&access_token=${encodeURIComponent(token)}`)).json(); username = me.username || null; } catch (e) { /* username is cosmetic */ }
+    try {
+      const me = await (await fetch(`${IG_GRAPH}/me?fields=user_id,username&access_token=${encodeURIComponent(token)}`)).json();
+      if (me.user_id) igUserId = String(me.user_id);
+      username = me.username || null;
+    } catch (e) { /* keep short.user_id; username is cosmetic */ }
     await adminDb.collection(IG_TOKENS).doc(st.uid).set({ igUserId, token, username, updatedAt: new Date().toISOString() }, { merge: true });
     await adminDb.collection('connectedAccounts').doc(st.uid).set({ instagram: { igUserId, username, connectedAt: new Date().toISOString() } }, { merge: true });
     res.redirect(`${site}/facebook-success.html`);
