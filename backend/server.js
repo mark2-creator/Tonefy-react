@@ -4382,7 +4382,9 @@ async function publishToPinterest({ account: uid, videoUrl, caption }) {
 
 // ---- LinkedIn (versioned REST, member share) ----
 const LI_TOKENS = 'linkedinTokens';
-const LI_VERSION = '202405'; // LinkedIn dates its API; keep current or requests 426/400.
+const LI_VERSION = '202606'; // LinkedIn dates its API (YYYYMM) and retires versions after
+// ~12 months - a stale one fails with "Requested version ... is not active". Bump this to a
+// version within the last year if that error appears (was 202405, retired by Sep 2026).
 const LI_SCOPES = ['openid', 'profile', 'w_member_social'].join(' ');
 function liConfigured() { return !!(process.env.LINKEDIN_CLIENT_ID && process.env.LINKEDIN_CLIENT_SECRET && process.env.LINKEDIN_REDIRECT_URI); }
 async function getLiAccount(uid) {
