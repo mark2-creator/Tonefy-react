@@ -4643,6 +4643,17 @@ app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
     return res.status(400).json({ error: 'That video is not on this server.' });
   }
 
+  // Social posting is a Pro/Creator benefit, enforced HERE - the app's diamond/upgrade UI
+  // is only a courtesy and would be trivially bypassable if the server did not check.
+  // Admins resolve to 'creator' in getUserPlanData. Fail OPEN on a lookup error (treat as
+  // paid), matching the render endpoints' documented fail-safe direction - a transient
+  // Firestore blip must not block a paying user's post; only an explicit 'free' is refused.
+  let postingPlan = null;
+  try { postingPlan = (await getUserPlanData(adminDb, uid)).plan; } catch (e) { /* fail open */ }
+  if (postingPlan === 'free') {
+    return res.status(403).json({ error: 'Posting to social media is available on the Pro and Creator plans.' });
+  }
+
   const targets = platforms.map(id => [id, PUBLISHERS[id]]).filter(([, p]) => p && p.enabled());
   if (targets.length === 0) return res.status(400).json({ error: 'None of those platforms are available.' });
 
@@ -4722,6 +4733,17 @@ async function scheduledPostSweep() {
       continue;
     }
     if (!isOwnMediaUrl(p.videoUrl)) { await fail('That video is no longer available.'); continue; }
+
+    // Social posting is Pro/Creator only - same gate as /api/post-now, so a free user's
+    // queued post is not silently published by the sweep. Fail OPEN on a lookup error
+    // (leave queued to retry) rather than mark a paying user's post failed over a blip.
+    try {
+      const { plan } = await getUserPlanData(adminDb, p.userId);
+      if (plan === 'free') { await fail('Posting to social media is available on the Pro and Creator plans.'); continue; }
+    } catch (e) {
+      console.warn(`[queue] ${doc.id}: plan lookup failed, leaving queued`);
+      continue;
+    }
 
     const results = [];
     for (const [id, pub] of targets) {
