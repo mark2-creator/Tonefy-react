@@ -71,13 +71,23 @@ try {
 // config fresh after each attempt rather than trusting the write response. This sends
 // a fully custom branded email instead, through the same Gmail account already
 // configured as this project's SMTP sender.
-const emailTransporter = (process.env.EMAIL_USER && process.env.EMAIL_APP_PASSWORD)
+// Prefer Brevo (reliable transactional delivery to EXTERNAL inboxes) when configured; fall
+// back to Gmail SMTP otherwise. Gmail's personal-account relay accepts the send but does
+// NOT deliver verification links to external inboxes (confirmed Sep 14 2026 - a self-send
+// landed in the inbox, an external send never arrived), which blocked real signups. The
+// `from` stays EMAIL_USER and MUST be a verified sender in Brevo, or Brevo refuses to send.
+const emailTransporter = (process.env.BREVO_SMTP_LOGIN && process.env.BREVO_SMTP_KEY)
   ? nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_APP_PASSWORD },
+      host: 'smtp-relay.brevo.com',
+      port: 587,
+      secure: false,
+      auth: { user: process.env.BREVO_SMTP_LOGIN, pass: process.env.BREVO_SMTP_KEY },
     })
-  : null;
-if (!emailTransporter) console.warn('[email] EMAIL_USER/EMAIL_APP_PASSWORD not set - verification emails will fail');
+  : (process.env.EMAIL_USER && process.env.EMAIL_APP_PASSWORD)
+    ? nodemailer.createTransport({ service: 'gmail', auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_APP_PASSWORD } })
+    : null;
+if (!emailTransporter) console.warn('[email] no email transport configured - verification emails will fail');
+else console.log('[email] transport:', (process.env.BREVO_SMTP_LOGIN && process.env.BREVO_SMTP_KEY) ? 'Brevo' : 'Gmail');
 
 // Reuses the same service account as Firebase Admin above - Android
 // Publisher API access is a separate grant from Firebase project
