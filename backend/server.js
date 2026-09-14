@@ -4387,9 +4387,24 @@ const LI_VERSION = '202606'; // LinkedIn dates its API (YYYYMM) and retires vers
 // version within the last year if that error appears (was 202405, retired by Sep 2026).
 const LI_SCOPES = ['openid', 'profile', 'w_member_social'].join(' ');
 function liConfigured() { return !!(process.env.LINKEDIN_CLIENT_ID && process.env.LINKEDIN_CLIENT_SECRET && process.env.LINKEDIN_REDIRECT_URI); }
-async function getLiAccount(uid) {
-  try { const s = await adminDb.collection(LI_TOKENS).doc(uid).get(); return s.exists ? s.data() : null; }
-  catch (e) { console.error('[linkedin] token read:', e.message); return null; }
+// Returns one account's token record { token, memberId, name, ... } for this uid. The
+// doc holds several accounts under `.accounts[memberId]` (multi-account); tolerant of the
+// old single flat shape (top-level token+memberId). With no memberId, returns the first
+// account (or the flat doc) - used by callers that only have one.
+async function getLiAccount(uid, memberId) {
+  try {
+    const s = await adminDb.collection(LI_TOKENS).doc(uid).get();
+    if (!s.exists) return null;
+    const d = s.data();
+    if (d.accounts && typeof d.accounts === 'object') {
+      if (memberId) return d.accounts[memberId] ? { memberId, ...d.accounts[memberId] } : null;
+      const first = Object.keys(d.accounts)[0];
+      return first ? { memberId: first, ...d.accounts[first] } : null;
+    }
+    // old flat shape = single account
+    if (memberId && d.memberId && d.memberId !== memberId) return null;
+    return d.token ? d : null;
+  } catch (e) { console.error('[linkedin] token read:', e.message); return null; }
 }
 
 app.get('/api/linkedin/connect', verifyToken, (req, res) => {
@@ -4423,12 +4438,19 @@ app.get('/linkedin/callback', async (req, res) => {
       memberId = me.sub || null; name = me.name || null;
     } catch (e) { /* posting still needs memberId; handled below */ }
     if (!memberId) throw new Error('Could not read your LinkedIn profile id.');
+    // Cap: Free 0 (blocked from posting anyway), Pro 1, Creator several. A genuinely new
+    // account beyond the cap is refused; reconnecting an existing one is always allowed.
+    const gate = await canAddPlatformAccount(st.uid, 'linkedin', memberId);
+    if (!gate.ok) return res.redirect(`${site}/linkedin-success.html?linkedin_error=account_limit`);
+    // Store this account's token under accounts[memberId] (merge preserves other accounts).
     await adminDb.collection(LI_TOKENS).doc(st.uid).set({
-      token: tok.access_token,
-      expiresAt: tok.expires_in ? Date.now() + tok.expires_in * 1000 : null,
-      memberId, name, updatedAt: new Date().toISOString(),
+      accounts: { [memberId]: {
+        token: tok.access_token,
+        expiresAt: tok.expires_in ? Date.now() + tok.expires_in * 1000 : null,
+        memberId, name, updatedAt: new Date().toISOString(),
+      } },
     }, { merge: true });
-    await adminDb.collection('connectedAccounts').doc(st.uid).set({ linkedin: { name, connectedAt: new Date().toISOString() } }, { merge: true });
+    await appendPlatformAccount(st.uid, 'linkedin', { accountId: memberId, label: name });
     res.redirect(`${site}/linkedin-success.html`);
   } catch (e) { console.error('[linkedin] callback:', e.message); res.redirect(`${site}?linkedin_error=server_error`); }
 });
@@ -4436,21 +4458,32 @@ app.get('/linkedin/callback', async (req, res) => {
 app.post('/api/linkedin/disconnect', verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
-    try { await adminDb.collection(LI_TOKENS).doc(uid).delete(); } catch (e) { console.error('[linkedin] token delete:', e.message); }
-    await adminDb.collection('connectedAccounts').doc(uid).set({ linkedin: FieldValue.delete() }, { merge: true });
+    const accountId = req.body?.accountId || null; // one account, or all if omitted
+    const ref = adminDb.collection(LI_TOKENS).doc(uid);
+    if (accountId) {
+      // Remove just this account from the map + the array; leave the others.
+      try { await ref.set({ accounts: { [accountId]: FieldValue.delete() } }, { merge: true }); } catch (e) { console.error('[linkedin] token delete:', e.message); }
+      const snap = await adminDb.collection('connectedAccounts').doc(uid).get();
+      const next = accountsArray(snap.exists ? snap.data() : {}, 'linkedin').filter(a => a.accountId !== accountId);
+      await adminDb.collection('connectedAccounts').doc(uid).set({ linkedin: next }, { merge: true });
+    } else {
+      try { await ref.delete(); } catch (e) { console.error('[linkedin] token delete:', e.message); }
+      await adminDb.collection('connectedAccounts').doc(uid).set({ linkedin: FieldValue.delete() }, { merge: true });
+    }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
 });
 
 app.get('/api/linkedin/status', verifyToken, async (req, res) => {
   try {
-    const [tok, acc] = await Promise.all([
-      adminDb.collection(LI_TOKENS).doc(req.user.uid).get(),
-      adminDb.collection('connectedAccounts').doc(req.user.uid).get(),
-    ]);
-    const connected = tok.exists && !!tok.data()?.token;
-    const li = acc.exists ? acc.data()?.linkedin : null;
-    res.json({ connected, configured: liConfigured(), name: connected ? (li?.name || tok.data()?.name || null) : null });
+    const acc = await adminDb.collection('connectedAccounts').doc(req.user.uid).get();
+    const list = accountsArray(acc.exists ? acc.data() : {}, 'linkedin');
+    res.json({
+      connected: list.length > 0,
+      configured: liConfigured(),
+      accounts: list.map(a => ({ accountId: a.accountId, name: a.label })),
+      name: list[0]?.label || null, // back-compat for older app builds
+    });
   } catch (e) { console.error('[linkedin] status failed:', e.message); res.status(500).json({ error: 'Could not read your LinkedIn connection.' }); }
 });
 
@@ -4458,8 +4491,8 @@ app.get('/api/linkedin/status', verifyToken, async (req, res) => {
 // PUT the bytes to the returned instruction(s), finalizeUpload with the part ids, then
 // create a post referencing the video URN. LinkedIn-Version and X-Restli-Protocol-Version
 // headers are mandatory on the /rest calls.
-async function publishToLinkedIn({ account: uid, videoUrl, caption }) {
-  const acc = await getLiAccount(uid);
+async function publishToLinkedIn({ account: memberId, uid, videoUrl, caption }) {
+  const acc = await getLiAccount(uid, memberId);
   if (!acc?.token || !acc?.memberId) return { ok: false, error: 'LinkedIn is not connected.' };
   try {
     if (!isOwnMediaUrl(videoUrl)) return { ok: false, error: 'The video must be on Tonefy to post it.' };
@@ -4519,11 +4552,64 @@ async function publishToLinkedIn({ account: uid, videoUrl, caption }) {
   }
 }
 
+// ---- Multiple accounts per platform (Pro/Creator, added Sep 2026) ----
+// Free cannot post at all (gated in /api/post-now); Pro gets 1 account per platform;
+// Creator gets several. The cap is per-platform, so Creator could have 5 TikToks AND 5
+// Instagrams. Changeable here without touching logic.
+const ACCOUNT_CAPS = { free: 0, pro: 1, creator: 5 };
+function accountCap(plan) { return ACCOUNT_CAPS[plan] ?? 0; }
+
+// connectedAccounts/{uid}.{platform} is migrating from a single object to an ARRAY of
+// { accountId, label, connectedAt }. This reader is TOLERANT of both shapes so a platform
+// that has not been migrated yet keeps working: an array passes through; an old single
+// object is wrapped, its id dug out of whatever field that platform used.
+function accountsArray(accDoc, platform) {
+  const v = accDoc?.[platform];
+  if (Array.isArray(v)) return v.filter(a => a && a.accountId);
+  if (v && typeof v === 'object') {
+    const id = v.accountId || v.memberId || v.openId || v.igUserId || v.pageId || v.channelId || v.userId || null;
+    if (!id) return [];
+    return [{ accountId: id, label: v.label || v.name || v.username || v.channelTitle || v.pageName || v.displayName || null, connectedAt: v.connectedAt || null }];
+  }
+  return [];
+}
+
+// Append/update one account in the platform's array (dedupe by accountId), returning the
+// new list. Used by a platform's OAuth callback so a second connection of the same
+// platform ADDS rather than REPLACES.
+async function appendPlatformAccount(uid, platform, entry) {
+  const ref = adminDb.collection('connectedAccounts').doc(uid);
+  const snap = await ref.get();
+  const cur = accountsArray(snap.exists ? snap.data() : {}, platform);
+  const rest = cur.filter(a => a.accountId !== entry.accountId);
+  const next = [...rest, { accountId: entry.accountId, label: entry.label || null, connectedAt: entry.connectedAt || new Date().toISOString() }];
+  await ref.set({ [platform]: next }, { merge: true });
+  return next;
+}
+
+// True if the plan may add this (possibly new) account without exceeding its cap. An
+// accountId already connected is always allowed (reconnect/refresh), so only a genuinely
+// new account counts against the cap.
+async function canAddPlatformAccount(uid, platform, newAccountId) {
+  const [{ plan }, snap] = await Promise.all([
+    getUserPlanData(adminDb, uid),
+    adminDb.collection('connectedAccounts').doc(uid).get(),
+  ]);
+  const cur = accountsArray(snap.exists ? snap.data() : {}, platform);
+  if (cur.some(a => a.accountId === newAccountId)) return { ok: true, plan };
+  if (cur.length >= accountCap(plan)) {
+    return { ok: false, plan, error: plan === 'free'
+      ? 'Posting to social media is available on the Pro and Creator plans.'
+      : `Your plan allows ${accountCap(plan)} ${platform} account${accountCap(plan) === 1 ? '' : 's'}. Multiple accounts per platform is a Creator feature.` };
+  }
+  return { ok: true, plan };
+}
+
 // Every entry has a publish() now; what gates a platform is enabled(), which reads the
 // environment - a platform with no credentials answers "not available" and the app hides
-// it. Pinterest and LinkedIn are written but UNTESTED (no credentials, no review yet);
-// what each still needs externally is noted at its entry and in the block above so the
-// next session does not re-derive it, and does verify rather than trust.
+// it. A platform with `multiAccount: true` uses listAccounts() (an array of account ids)
+// and post-now publishes to each chosen one; the rest use the single accountFrom() path
+// unchanged, so converting platforms one at a time never touches the others.
 const PUBLISHERS = {
   tiktok: {
     label: 'TikTok',
@@ -4601,11 +4687,12 @@ const PUBLISHERS = {
   linkedin: {
     label: 'LinkedIn',
     kind: 'video',
-    // Needs: a LinkedIn developer app with the "Share on LinkedIn" / Community Management
-    // products, OAuth 2.0, and app review. Connect/publish are written (publishToLinkedIn)
-    // but UNTESTED until credentials exist - see the block above.
     enabled: () => liConfigured(),
-    accountFrom: (acc, uid) => (acc?.linkedin ? uid : null),
+    // MULTI-ACCOUNT (Pro 1 / Creator many). listAccounts returns the member ids from the
+    // connectedAccounts.linkedin array; post-now publishes to each chosen one. publish gets
+    // { account: memberId, uid } and looks the token up in linkedinTokens/{uid}.accounts.
+    multiAccount: true,
+    listAccounts: (acc) => accountsArray(acc, 'linkedin').map(a => a.accountId),
     notConnected: 'LinkedIn is no longer connected to this account.',
     publish: publishToLinkedIn,
   },
@@ -4665,12 +4752,29 @@ app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
     return res.status(503).json({ error: 'Could not read your connected accounts. Try again.' });
   }
 
+  // Optional per-platform account selection from the client: { linkedin: [id,…], … }.
+  // Absent (or empty) means "all connected accounts for that platform".
+  const chosenAccounts = (req.body && typeof req.body.accounts === 'object') ? req.body.accounts : {};
+
   const results = [];
   for (const [id, pub] of targets) {
-    const account = pub.accountFrom(accountDoc, uid);
-    if (!account) { results.push({ platform: id, ok: false, error: pub.notConnected }); continue; }
-    const r = await pub.publish({ account, videoUrl, caption, options: id === 'tiktok' ? tiktokOptions : undefined });
-    results.push({ platform: id, ...r });
+    if (pub.multiAccount) {
+      // Multi-account platform: publish to each chosen (or all) connected account.
+      const all = pub.listAccounts(accountDoc, uid);
+      const want = Array.isArray(chosenAccounts[id]) && chosenAccounts[id].length
+        ? all.filter(a => chosenAccounts[id].includes(a)) : all;
+      if (!want.length) { results.push({ platform: id, ok: false, error: pub.notConnected }); continue; }
+      for (const accId of want) {
+        const r = await pub.publish({ account: accId, uid, videoUrl, caption, options: id === 'tiktok' ? tiktokOptions : undefined });
+        results.push({ platform: id, accountId: accId, ...r });
+      }
+    } else {
+      // Single-account platform: unchanged path.
+      const account = pub.accountFrom(accountDoc, uid);
+      if (!account) { results.push({ platform: id, ok: false, error: pub.notConnected }); continue; }
+      const r = await pub.publish({ account, uid, videoUrl, caption, options: id === 'tiktok' ? tiktokOptions : undefined });
+      results.push({ platform: id, ...r });
+    }
   }
 
   // Recorded the same way a scheduled post is, so one Calendar shows both and neither
@@ -4747,10 +4851,21 @@ async function scheduledPostSweep() {
 
     const results = [];
     for (const [id, pub] of targets) {
-      const account = pub.accountFrom(accountDoc, p.userId);
-      if (!account) { results.push({ id, ok: false, error: pub.notConnected }); continue; }
-      const r = await pub.publish({ account, videoUrl: p.videoUrl, caption: p.caption });
-      results.push({ id, ...r });
+      if (pub.multiAccount) {
+        const all = pub.listAccounts(accountDoc, p.userId);
+        const want = Array.isArray(p.accounts?.[id]) && p.accounts[id].length
+          ? all.filter(a => p.accounts[id].includes(a)) : all;
+        if (!want.length) { results.push({ id, ok: false, error: pub.notConnected }); continue; }
+        for (const accId of want) {
+          const r = await pub.publish({ account: accId, uid: p.userId, videoUrl: p.videoUrl, caption: p.caption });
+          results.push({ id, ...r });
+        }
+      } else {
+        const account = pub.accountFrom(accountDoc, p.userId);
+        if (!account) { results.push({ id, ok: false, error: pub.notConnected }); continue; }
+        const r = await pub.publish({ account, uid: p.userId, videoUrl: p.videoUrl, caption: p.caption });
+        results.push({ id, ...r });
+      }
     }
     const failed = results.filter(r => !r.ok);
     if (failed.length === 0) {
