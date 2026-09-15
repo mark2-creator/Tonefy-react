@@ -4051,25 +4051,40 @@ async function getIgAccount(uid, igUserId) {
   } catch (e) { console.error('[ig] token read:', e.message); return null; }
 }
 
-// From a long-lived USER token, get the first Page and its Page token. Instagram is a
+// From a long-lived USER token, get EVERY Page this grant covers, each with its own Page
+// token. Meta's own permission dialog is where the user chooses which Pages to share, so
+// what comes back is exactly what they picked - taking only the first (which this did
+// until multi-account) silently dropped the rest of a deliberate choice. Instagram is a
 // separate connection now, so we no longer read a linked IG here.
-async function metaFetchPage(userToken) {
+async function metaFetchPages(userToken) {
   const r = await fetch(`${META_GRAPH}/me/accounts?fields=id,name,access_token&access_token=${encodeURIComponent(userToken)}`);
   const d = await r.json();
   if (d.error) throw new Error(d.error.message || 'Could not read your Pages.');
-  const page = (d.data || [])[0];
-  return page ? { pageId: page.id, pageName: page.name, pageToken: page.access_token } : null;
+  return (d.data || []).filter(p => p && p.id && p.access_token)
+    .map(p => ({ pageId: p.id, pageName: p.name, pageToken: p.access_token }));
 }
-async function getMetaAccount(uid) {
+
+// One Page's token record for this uid. Multi-account: Pages live under `.accounts[pageId]`;
+// tolerant of the old single flat shape so a connection made before this migration keeps
+// publishing. No pageId -> first Page.
+async function getMetaAccount(uid, pageId) {
   try {
     const snap = await adminDb.collection(META_TOKENS).doc(uid).get();
-    return snap.exists ? snap.data() : null;
+    if (!snap.exists) return null;
+    const d = snap.data();
+    if (d.accounts && typeof d.accounts === 'object') {
+      if (pageId) return d.accounts[pageId] ? { pageId, ...d.accounts[pageId] } : null;
+      const first = Object.keys(d.accounts)[0];
+      return first ? { pageId: first, ...d.accounts[first] } : null;
+    }
+    if (pageId && d.pageId && d.pageId !== pageId) return null;
+    return d.pageToken ? d : null;
   } catch (e) { console.error('[meta] token read:', e.message); return null; }
 }
 
 // Facebook Page video: file_url lets Graph fetch the (public, own-host) video from us.
-async function publishToFacebook({ account: uid, videoUrl, caption }) {
-  const acc = await getMetaAccount(uid);
+async function publishToFacebook({ account: pageId, uid, videoUrl, caption }) {
+  const acc = await getMetaAccount(uid, pageId);
   if (!acc?.pageId || !acc?.pageToken) return { ok: false, error: 'Facebook Page is not connected.' };
   try {
     const body = new URLSearchParams({ file_url: videoUrl, description: caption || '', access_token: acc.pageToken });
@@ -4129,13 +4144,27 @@ app.get('/facebook/callback', async (req, res) => {
     const llRes = await fetch(`${META_GRAPH}/oauth/access_token?grant_type=fb_exchange_token&client_id=${process.env.FACEBOOK_APP_ID}&client_secret=${process.env.FACEBOOK_APP_SECRET}&fb_exchange_token=${encodeURIComponent(tok.access_token)}`);
     const ll = await llRes.json();
     const userToken = ll.access_token || tok.access_token;
-    const page = await metaFetchPage(userToken);
-    if (!page) throw new Error('No Facebook Page was found on this account.');
-    await adminDb.collection(META_TOKENS).doc(st.uid).set({ userToken, ...page, updatedAt: new Date().toISOString() }, { merge: true });
-    await adminDb.collection('connectedAccounts').doc(st.uid).set({
-      facebook: { pageId: page.pageId, pageName: page.pageName, connectedAt: new Date().toISOString() },
-    }, { merge: true });
-    res.redirect(`${site}/facebook-success.html`);
+    const pages = await metaFetchPages(userToken);
+    if (!pages.length) return res.redirect(`${site}/facebook-success.html?facebook_error=no_page`);
+    // One grant can cover several Pages, so this adds them one at a time and stops at the
+    // plan's cap. Re-checking per Page rather than once for the batch is what makes a
+    // partial add correct: each append changes what the next check is measured against.
+    const added = [];
+    let capped = false;
+    for (const page of pages) {
+      const gate = await canAddPlatformAccount(st.uid, 'facebook', page.pageId);
+      if (!gate.ok) { capped = true; break; }
+      await adminDb.collection(META_TOKENS).doc(st.uid).set({
+        accounts: { [page.pageId]: { ...page, userToken, updatedAt: new Date().toISOString() } },
+      }, { merge: true });
+      await appendPlatformAccount(st.uid, 'facebook', { accountId: page.pageId, label: page.pageName });
+      added.push(page.pageName || page.pageId);
+    }
+    // Nothing added at all is a refusal worth naming; a partial add is a success with a note.
+    if (!added.length) return res.redirect(`${site}/facebook-success.html?facebook_error=account_limit`);
+    const q = new URLSearchParams({ accounts: added.join(', ') });
+    if (capped) q.set('notice', 'account_limit');
+    res.redirect(`${site}/facebook-success.html?${q.toString()}`);
   } catch (e) {
     console.error('[facebook] callback:', e.message);
     res.redirect(`${site}?facebook_error=server_error`);
@@ -4146,13 +4175,37 @@ app.get('/facebook/callback', async (req, res) => {
 app.post('/api/facebook/disconnect', verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
-    const acc = await getMetaAccount(uid);
-    if (acc?.userToken) {
-      try { await fetch(`${META_GRAPH}/me/permissions?access_token=${encodeURIComponent(acc.userToken)}`, { method: 'DELETE' }); }
+    const accountId = req.body?.accountId || null;
+    const ref = adminDb.collection(META_TOKENS).doc(uid);
+    const snap = await ref.get();
+    const stored = snap.exists ? snap.data() : {};
+    const map = (stored.accounts && typeof stored.accounts === 'object') ? stored.accounts : null;
+
+    // Revoking is per FACEBOOK USER, not per Page: DELETE /me/permissions drops the whole
+    // app grant, which would silently kill every other Page that came from it. So a single
+    // Page is only revoked once no remaining Page still relies on that same user token.
+    const revoke = async (userToken) => {
+      if (!userToken) return;
+      try { await fetch(`${META_GRAPH}/me/permissions?access_token=${encodeURIComponent(userToken)}`, { method: 'DELETE' }); }
       catch (e) { console.error('[facebook] revoke:', e.message); }
+    };
+
+    if (accountId && map) {
+      const gone = map[accountId];
+      const remaining = Object.entries(map).filter(([id]) => id !== accountId);
+      if (gone?.userToken && !remaining.some(([, a]) => a?.userToken === gone.userToken)) await revoke(gone.userToken);
+      try { await ref.set({ accounts: { [accountId]: FieldValue.delete() } }, { merge: true }); }
+      catch (e) { console.error('[meta] token delete:', e.message); }
+      const accSnap = await adminDb.collection('connectedAccounts').doc(uid).get();
+      const next = accountsArray(accSnap.exists ? accSnap.data() : {}, 'facebook').filter(a => a.accountId !== accountId);
+      await adminDb.collection('connectedAccounts').doc(uid).set({ facebook: next }, { merge: true });
+    } else {
+      // No accountId (or a pre-migration flat record): disconnect Facebook entirely.
+      const tokens = map ? [...new Set(Object.values(map).map(a => a?.userToken).filter(Boolean))] : [stored.userToken].filter(Boolean);
+      for (const t of tokens) await revoke(t);
+      try { await ref.delete(); } catch (e) { console.error('[meta] token delete:', e.message); }
+      await adminDb.collection('connectedAccounts').doc(uid).set({ facebook: FieldValue.delete() }, { merge: true });
     }
-    try { await adminDb.collection(META_TOKENS).doc(uid).delete(); } catch (e) { console.error('[meta] token delete:', e.message); }
-    await adminDb.collection('connectedAccounts').doc(uid).set({ facebook: FieldValue.delete() }, { merge: true });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
 });
@@ -4228,13 +4281,14 @@ app.post('/api/instagram/disconnect', verifyToken, async (req, res) => {
 // connectedAccounts directly, so a token we cleared server-side is reported as disconnected.
 app.get('/api/facebook/status', verifyToken, async (req, res) => {
   try {
-    const [tok, acc] = await Promise.all([
-      adminDb.collection(META_TOKENS).doc(req.user.uid).get(),
-      adminDb.collection('connectedAccounts').doc(req.user.uid).get(),
-    ]);
-    const connected = tok.exists && !!tok.data()?.pageToken;
-    const fb = acc.exists ? acc.data()?.facebook : null;
-    res.json({ connected, configured: fbConfigured(), pageName: connected ? (fb?.pageName || tok.data()?.pageName || null) : null });
+    const acc = await adminDb.collection('connectedAccounts').doc(req.user.uid).get();
+    const list = accountsArray(acc.exists ? acc.data() : {}, 'facebook');
+    res.json({
+      connected: list.length > 0,
+      configured: fbConfigured(),
+      accounts: list.map(a => ({ accountId: a.accountId, name: a.label })),
+      pageName: list[0]?.label || null, // back-compat for older app builds
+    });
   } catch (e) {
     console.error('[facebook] status failed:', e.message);
     res.status(500).json({ error: 'Could not read your Facebook connection.' });
@@ -4681,8 +4735,13 @@ const PUBLISHERS = {
     label: 'Facebook',
     kind: 'video',
     enabled: () => fbConfigured(),
-    // uid, not pageId: metaTokens is keyed by uid and holds the Page token.
-    accountFrom: (acc, uid) => (acc?.facebook?.pageId ? uid : null),
+    // MULTI-ACCOUNT (Pro 1 / Creator many). An "account" here is a PAGE - Meta forbids
+    // posting to a personal profile - and one OAuth grant can cover several, so this is
+    // the platform where a single connection legitimately adds more than one. listAccounts
+    // returns the page ids; publish gets { account: pageId, uid } and reads that Page's own
+    // token from metaTokens/{uid}.accounts.
+    multiAccount: true,
+    listAccounts: (acc) => accountsArray(acc, 'facebook').map(a => a.accountId),
     notConnected: 'Facebook is no longer connected to this account.',
     publish: publishToFacebook,
   },
