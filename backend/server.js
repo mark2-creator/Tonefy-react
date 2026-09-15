@@ -4570,10 +4570,14 @@ async function publishToLinkedIn({ account: memberId, uid, videoUrl, caption }) 
 }
 
 // ---- Multiple accounts per platform (Pro/Creator, added Sep 2026) ----
-// Free cannot post at all (gated in /api/post-now); Pro gets 1 account per platform;
-// Creator gets several. The cap is per-platform, so Creator could have 5 TikToks AND 5
-// Instagrams. Changeable here without touching logic.
-const ACCOUNT_CAPS = { free: 0, pro: 1, creator: 5 };
+// How many accounts per platform each plan may CONNECT. Free and Pro get 1 (a solo
+// creator's own account); Creator gets several (multi-brand / agency). POSTING is a
+// separate gate - free can connect but not post (enforced in /api/post-now), so the
+// account COUNT is the Pro-vs-Creator line and posting-ability is the free-vs-paid line.
+// Free is 1 (not 0) so a free user can still link an account and post once they upgrade,
+// matching the Terms and the other (non-multi) platforms that never gated connecting.
+// Per-platform, so Creator could have 5 TikToks AND 5 Instagrams. Changeable here.
+const ACCOUNT_CAPS = { free: 1, pro: 1, creator: 5 };
 function accountCap(plan) { return ACCOUNT_CAPS[plan] ?? 0; }
 
 // connectedAccounts/{uid}.{platform} is migrating from a single object to an ARRAY of
@@ -4615,9 +4619,9 @@ async function canAddPlatformAccount(uid, platform, newAccountId) {
   const cur = accountsArray(snap.exists ? snap.data() : {}, platform);
   if (cur.some(a => a.accountId === newAccountId)) return { ok: true, plan };
   if (cur.length >= accountCap(plan)) {
-    return { ok: false, plan, error: plan === 'free'
-      ? 'Posting to social media is available on the Pro and Creator plans.'
-      : `Your plan allows ${accountCap(plan)} ${platform} account${accountCap(plan) === 1 ? '' : 's'}. Multiple accounts per platform is a Creator feature.` };
+    // Connecting a first account is allowed on any plan; a SECOND per platform is the
+    // Creator perk. (Posting is gated separately in /api/post-now.)
+    return { ok: false, plan, error: `Multiple accounts per platform is a Creator feature. Your plan allows ${accountCap(plan)} ${platform} account${accountCap(plan) === 1 ? '' : 's'}.` };
   }
   return { ok: true, plan };
 }
