@@ -3869,6 +3869,36 @@ app.post('/api/account/delete', verifyToken, async (req, res) => {
     }
   });
 
+  // Meta, Instagram, Pinterest and LinkedIn all keep their tokens in Admin-SDK-only
+  // collections the client cannot reach, so nothing else can ever remove them - the same
+  // hole the YouTube step above was written to close, reopened once by each platform that
+  // landed after it. The privacy policy states that access tokens for EVERY connected
+  // platform are deleted when the account is deleted, so these are not optional.
+  //
+  // Facebook's grant is revoked at Meta as well, reusing the call its own disconnect
+  // makes. The other three are deleted, not revoked: their disconnect routes do not
+  // revoke either, and an untested revoke on a destructive path would be a worse trade
+  // than matching the behaviour the app already ships.
+  await step('metaTokens', async () => {
+    const snap = await adminDb.collection(META_TOKENS).doc(uid).get();
+    if (snap.exists) {
+      const d = snap.data() || {};
+      const map = (d.accounts && typeof d.accounts === 'object') ? d.accounts : null;
+      const tokens = map
+        ? [...new Set(Object.values(map).map(a => a?.userToken).filter(Boolean))]
+        : [d.userToken].filter(Boolean);
+      for (const t of tokens) {
+        try { await fetch(`${META_GRAPH}/me/permissions?access_token=${encodeURIComponent(t)}`, { method: 'DELETE' }); }
+        catch (e) { console.warn('[account-delete] facebook revoke:', e.message); }
+      }
+    }
+    await adminDb.collection(META_TOKENS).doc(uid).delete();
+  });
+
+  await step('igTokens', () => adminDb.collection(IG_TOKENS).doc(uid).delete());
+  await step('pinterestTokens', () => adminDb.collection(PIN_TOKENS).doc(uid).delete());
+  await step('linkedinTokens', () => adminDb.collection(LI_TOKENS).doc(uid).delete());
+
   await step('connectedAccounts', () =>
     adminDb.collection('connectedAccounts').doc(uid).delete());
 
