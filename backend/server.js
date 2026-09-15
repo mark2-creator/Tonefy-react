@@ -4034,9 +4034,21 @@ function metaOAuthDialogUrl(state) {
     + `&redirect_uri=${encodeURIComponent(process.env.FACEBOOK_REDIRECT_URI)}`
     + `&state=${encodeURIComponent(state)}&response_type=code&scope=${encodeURIComponent(FB_SCOPES)}`;
 }
-async function getIgAccount(uid) {
-  try { const s = await adminDb.collection(IG_TOKENS).doc(uid).get(); return s.exists ? s.data() : null; }
-  catch (e) { console.error('[ig] token read:', e.message); return null; }
+// One IG account's token record for this uid. Multi-account: accounts are stored under
+// `.accounts[igUserId]`; tolerant of the old single flat shape. No igUserId -> first account.
+async function getIgAccount(uid, igUserId) {
+  try {
+    const s = await adminDb.collection(IG_TOKENS).doc(uid).get();
+    if (!s.exists) return null;
+    const d = s.data();
+    if (d.accounts && typeof d.accounts === 'object') {
+      if (igUserId) return d.accounts[igUserId] ? { igUserId, ...d.accounts[igUserId] } : null;
+      const first = Object.keys(d.accounts)[0];
+      return first ? { igUserId: first, ...d.accounts[first] } : null;
+    }
+    if (igUserId && d.igUserId && d.igUserId !== igUserId) return null;
+    return d.token ? d : null;
+  } catch (e) { console.error('[ig] token read:', e.message); return null; }
 }
 
 // From a long-lived USER token, get the first Page and its Page token. Instagram is a
@@ -4071,8 +4083,8 @@ async function publishToFacebook({ account: uid, videoUrl, caption }) {
 // Instagram Reels via Instagram Login: create a media container, poll until Graph finishes
 // fetching/transcoding, then publish - on graph.instagram.com with the IG user token from
 // igTokens. IG requires the video at a public URL (ours qualifies).
-async function publishToInstagram({ account: uid, videoUrl, caption }) {
-  const acc = await getIgAccount(uid);
+async function publishToInstagram({ account: igUserId, uid, videoUrl, caption }) {
+  const acc = await getIgAccount(uid, igUserId);
   if (!acc?.igUserId || !acc?.token) return { ok: false, error: 'Instagram is not connected.' };
   try {
     const initBody = new URLSearchParams({ media_type: 'REELS', video_url: videoUrl, caption: caption || '', access_token: acc.token });
@@ -4183,8 +4195,12 @@ app.get('/instagram/callback', async (req, res) => {
       if (me.user_id) igUserId = String(me.user_id);
       username = me.username || null;
     } catch (e) { /* keep short.user_id; username is cosmetic */ }
-    await adminDb.collection(IG_TOKENS).doc(st.uid).set({ igUserId, token, username, updatedAt: new Date().toISOString() }, { merge: true });
-    await adminDb.collection('connectedAccounts').doc(st.uid).set({ instagram: { igUserId, username, connectedAt: new Date().toISOString() } }, { merge: true });
+    const gate = await canAddPlatformAccount(st.uid, 'instagram', igUserId);
+    if (!gate.ok) return res.redirect(`${site}/facebook-success.html?instagram_error=account_limit`);
+    await adminDb.collection(IG_TOKENS).doc(st.uid).set({
+      accounts: { [igUserId]: { igUserId, token, username, updatedAt: new Date().toISOString() } },
+    }, { merge: true });
+    await appendPlatformAccount(st.uid, 'instagram', { accountId: igUserId, label: username });
     res.redirect(`${site}/facebook-success.html`);
   } catch (e) { console.error('[instagram] callback:', e.message); res.redirect(`${site}?instagram_error=server_error`); }
 });
@@ -4192,8 +4208,17 @@ app.get('/instagram/callback', async (req, res) => {
 app.post('/api/instagram/disconnect', verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
-    try { await adminDb.collection(IG_TOKENS).doc(uid).delete(); } catch (e) { console.error('[ig] token delete:', e.message); }
-    await adminDb.collection('connectedAccounts').doc(uid).set({ instagram: FieldValue.delete() }, { merge: true });
+    const accountId = req.body?.accountId || null;
+    const ref = adminDb.collection(IG_TOKENS).doc(uid);
+    if (accountId) {
+      try { await ref.set({ accounts: { [accountId]: FieldValue.delete() } }, { merge: true }); } catch (e) { console.error('[ig] token delete:', e.message); }
+      const snap = await adminDb.collection('connectedAccounts').doc(uid).get();
+      const next = accountsArray(snap.exists ? snap.data() : {}, 'instagram').filter(a => a.accountId !== accountId);
+      await adminDb.collection('connectedAccounts').doc(uid).set({ instagram: next }, { merge: true });
+    } else {
+      try { await ref.delete(); } catch (e) { console.error('[ig] token delete:', e.message); }
+      await adminDb.collection('connectedAccounts').doc(uid).set({ instagram: FieldValue.delete() }, { merge: true });
+    }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
 });
@@ -4218,13 +4243,14 @@ app.get('/api/facebook/status', verifyToken, async (req, res) => {
 
 app.get('/api/instagram/status', verifyToken, async (req, res) => {
   try {
-    const [tok, acc] = await Promise.all([
-      adminDb.collection(IG_TOKENS).doc(req.user.uid).get(),
-      adminDb.collection('connectedAccounts').doc(req.user.uid).get(),
-    ]);
-    const connected = tok.exists && !!tok.data()?.igUserId && !!tok.data()?.token;
-    const ig = acc.exists ? acc.data()?.instagram : null;
-    res.json({ connected, configured: igConfigured(), username: connected ? (ig?.username || tok.data()?.username || null) : null });
+    const acc = await adminDb.collection('connectedAccounts').doc(req.user.uid).get();
+    const list = accountsArray(acc.exists ? acc.data() : {}, 'instagram');
+    res.json({
+      connected: list.length > 0,
+      configured: igConfigured(),
+      accounts: list.map(a => ({ accountId: a.accountId, name: a.label })),
+      username: list[0]?.label || null, // back-compat for older app builds
+    });
   } catch (e) {
     console.error('[instagram] status failed:', e.message);
     res.status(500).json({ error: 'Could not read your Instagram connection.' });
@@ -4665,7 +4691,8 @@ const PUBLISHERS = {
     label: 'Instagram',
     kind: 'video',
     enabled: () => igConfigured(),
-    accountFrom: (acc, uid) => (acc?.instagram?.igUserId ? uid : null),
+    multiAccount: true,
+    listAccounts: (acc) => accountsArray(acc, 'instagram').map(a => a.accountId),
     notConnected: 'Instagram is no longer connected to this account.',
     publish: publishToInstagram,
   },
