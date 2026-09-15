@@ -1421,7 +1421,7 @@ app.post("/api/send-verification-email", emailLimiter, async (req, res) => {
     if (!userRecord.email) return res.status(400).json({ error: "Account has no email" });
     const link = await getAuth().generateEmailVerificationLink(userRecord.email);
     await emailTransporter.sendMail({
-      from: `"Tonefy AI" <${process.env.EMAIL_USER}>`,
+      from: `"Tonefy AI" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
       to: userRecord.email,
       subject: "Verify your email for Tonefy AI",
       html: verifyEmailHtml(userRecord.displayName, link),
