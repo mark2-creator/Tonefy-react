@@ -1419,7 +1419,14 @@ app.post("/api/send-verification-email", emailLimiter, async (req, res) => {
   try {
     const userRecord = await getAuth().getUser(req.user.uid);
     if (!userRecord.email) return res.status(400).json({ error: "Account has no email" });
-    const link = await getAuth().generateEmailVerificationLink(userRecord.email);
+    // continueUrl -> after Firebase verifies, its page shows a "Continue" that lands on our
+    // branded verified.html, which deep-links back into the Tonefy app (tonefyai://). The
+    // domain is already an authorized domain. Without this the link dead-ends on Firebase's
+    // bare default page with no way back to the app.
+    const link = await getAuth().generateEmailVerificationLink(userRecord.email, {
+      url: 'https://tonefy-ai.fitlifesolutions.site/verified.html',
+      handleCodeInApp: false,
+    });
     await emailTransporter.sendMail({
       from: `"Tonefy AI" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
       to: userRecord.email,
