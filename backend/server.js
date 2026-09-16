@@ -4377,6 +4377,11 @@ app.get('/api/instagram/status', verifyToken, async (req, res) => {
 
 // ---- Pinterest (API v5) ----
 const PIN_TOKENS = 'pinterestTokens';
+// Key used when the username cannot be read at all - an account with no boards has no
+// owner to report. Such an account cannot be posted to either (publishToPinterest needs
+// a board), so this holds the connection until there IS a name, and the callback below
+// upgrades it in place rather than adding a second entry.
+const PIN_DEFAULT_ACCOUNT = 'default';
 const PIN_API = 'https://api.pinterest.com/v5';
 // boards:write is required to CREATE a pin, not only to edit boards - Pinterest's
 // POST /v5/pins rejects a token without it ("Missing: ['boards:write']"), found by a
@@ -4384,9 +4389,38 @@ const PIN_API = 'https://api.pinterest.com/v5';
 const PIN_SCOPES = ['boards:read', 'boards:write', 'pins:read', 'pins:write'].join(',');
 function pinConfigured() { return !!(process.env.PINTEREST_APP_ID && process.env.PINTEREST_APP_SECRET && process.env.PINTEREST_REDIRECT_URI); }
 function pinBasicAuth() { return 'Basic ' + Buffer.from(`${process.env.PINTEREST_APP_ID}:${process.env.PINTEREST_APP_SECRET}`).toString('base64'); }
-async function getPinAccount(uid) {
-  try { const s = await adminDb.collection(PIN_TOKENS).doc(uid).get(); return s.exists ? s.data() : null; }
-  catch (e) { console.error('[pinterest] token read:', e.message); return null; }
+// One Pinterest account's token record for this uid. Multi-account: accounts live under
+// `.accounts[accountId]`; tolerant of the old single flat shape. No accountId -> first.
+async function getPinAccount(uid, accountId) {
+  try {
+    const s = await adminDb.collection(PIN_TOKENS).doc(uid).get();
+    if (!s.exists) return null;
+    const d = s.data();
+    if (d.accounts && typeof d.accounts === 'object') {
+      if (accountId) return d.accounts[accountId] ? { accountId, ...d.accounts[accountId] } : null;
+      const first = Object.keys(d.accounts)[0];
+      return first ? { accountId: first, ...d.accounts[first] } : null;
+    }
+    if (accountId && d.username && d.username !== accountId) return null;
+    return d.token ? { accountId: d.username || PIN_DEFAULT_ACCOUNT, ...d } : null;
+  } catch (e) { console.error('[pinterest] token read:', e.message); return null; }
+}
+
+// Pinterest gives us no account id we can read. `/v5/user_account` needs the
+// `user_accounts:read` scope, which this app does not request - and adding a scope to an
+// app that is mid-review for Standard access, forcing every user to reconnect, buys less
+// than it costs. `/v5/boards` already carries `owner.username` under `boards:read`, which
+// we do hold, so the username comes from there. Verified against the live API.
+async function pinFetchUsername(token) {
+  const auth = { Authorization: 'Bearer ' + token };
+  try {
+    const me = await (await fetch(`${PIN_API}/user_account`, { headers: auth })).json();
+    if (me.username) return me.username;
+  } catch (e) { /* fall through - this is the call we do not have the scope for */ }
+  try {
+    const b = await (await fetch(`${PIN_API}/boards?page_size=1`, { headers: auth })).json();
+    return b.items?.[0]?.owner?.username || null;
+  } catch (e) { return null; }
 }
 // Pinterest access tokens expire; refresh with the stored refresh_token when they do, so a
 // post scheduled for tomorrow still has a live token. Same intent as YouTube's refresh.
@@ -4396,7 +4430,11 @@ async function pinValidToken(acc, uid) {
     const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: acc.refreshToken });
     const r = await (await fetch(`${PIN_API}/oauth/token`, { method: 'POST', headers: { Authorization: pinBasicAuth(), 'Content-Type': 'application/x-www-form-urlencoded' }, body })).json();
     if (!r.access_token) return acc.token;
-    await adminDb.collection(PIN_TOKENS).doc(uid).set({ token: r.access_token, expiresAt: r.expires_in ? Date.now() + r.expires_in * 1000 : null, updatedAt: new Date().toISOString() }, { merge: true });
+    // Written back into THIS account's entry, not the document root - the root is where
+    // the pre-migration record lived, and refreshing there would resurrect a flat token
+    // beside the map and leave two disagreeing copies.
+    const fresh = { token: r.access_token, expiresAt: r.expires_in ? Date.now() + r.expires_in * 1000 : null, updatedAt: new Date().toISOString() };
+    await adminDb.collection(PIN_TOKENS).doc(uid).set({ accounts: { [acc.accountId]: fresh } }, { merge: true });
     return r.access_token;
   } catch (e) { return acc.token; }
 }
@@ -4421,45 +4459,81 @@ app.get('/pinterest/callback', async (req, res) => {
     const body = new URLSearchParams({ grant_type: 'authorization_code', code: String(code), redirect_uri: process.env.PINTEREST_REDIRECT_URI });
     const tok = await (await fetch(`${PIN_API}/oauth/token`, { method: 'POST', headers: { Authorization: pinBasicAuth(), 'Content-Type': 'application/x-www-form-urlencoded' }, body })).json();
     if (!tok.access_token) throw new Error(tok.message || tok.error_description || 'Token exchange failed.');
-    let username = null;
-    try { const me = await (await fetch(`${PIN_API}/user_account`, { headers: { Authorization: 'Bearer ' + tok.access_token } })).json(); username = me.username || null; } catch (e) { /* display only */ }
+    const username = await pinFetchUsername(tok.access_token);
+    const accountId = username || PIN_DEFAULT_ACCOUNT;
+
+    // An account connected before its name could be read is held under PIN_DEFAULT_ACCOUNT.
+    // Once a name IS readable, that placeholder becomes this same account under its real
+    // key - so it is replaced, not counted as a second account the cap would then refuse.
+    if (username) {
+      const prior = await getPinAccount(st.uid, PIN_DEFAULT_ACCOUNT);
+      if (prior) {
+        await adminDb.collection(PIN_TOKENS).doc(st.uid).set({ accounts: { [PIN_DEFAULT_ACCOUNT]: FieldValue.delete() } }, { merge: true });
+        const snap = await adminDb.collection('connectedAccounts').doc(st.uid).get();
+        const rest = accountsArray(snap.exists ? snap.data() : {}, 'pinterest').filter(a => a.accountId !== PIN_DEFAULT_ACCOUNT);
+        await adminDb.collection('connectedAccounts').doc(st.uid).set({ pinterest: rest }, { merge: true });
+      }
+    }
+
+    const gate = await canAddPlatformAccount(st.uid, 'pinterest', accountId);
+    if (!gate.ok) return res.redirect(`${site}/pinterest-success.html?pinterest_error=account_limit`);
     await adminDb.collection(PIN_TOKENS).doc(st.uid).set({
-      token: tok.access_token,
-      refreshToken: tok.refresh_token || null,
-      expiresAt: tok.expires_in ? Date.now() + tok.expires_in * 1000 : null,
-      username, updatedAt: new Date().toISOString(),
+      accounts: {
+        [accountId]: {
+          accountId,
+          token: tok.access_token,
+          refreshToken: tok.refresh_token || null,
+          expiresAt: tok.expires_in ? Date.now() + tok.expires_in * 1000 : null,
+          username, updatedAt: new Date().toISOString(),
+        },
+      },
+      // Clear the pre-migration flat fields in the same write. Left behind they are a
+      // second copy of the token that nothing refreshes, and whichever reader reaches for
+      // the root gets a stale one.
+      token: FieldValue.delete(), refreshToken: FieldValue.delete(),
+      expiresAt: FieldValue.delete(), username: FieldValue.delete(),
     }, { merge: true });
-    await adminDb.collection('connectedAccounts').doc(st.uid).set({ pinterest: { username, connectedAt: new Date().toISOString() } }, { merge: true });
-    res.redirect(`${site}/pinterest-success.html`);
+    await appendPlatformAccount(st.uid, 'pinterest', { accountId, label: username });
+    res.redirect(`${site}/pinterest-success.html${username ? `?accounts=${encodeURIComponent('@' + username)}` : ''}`);
   } catch (e) { console.error('[pinterest] callback:', e.message); res.redirect(`${site}?pinterest_error=server_error`); }
 });
 
 app.post('/api/pinterest/disconnect', verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
-    try { await adminDb.collection(PIN_TOKENS).doc(uid).delete(); } catch (e) { console.error('[pinterest] token delete:', e.message); }
-    await adminDb.collection('connectedAccounts').doc(uid).set({ pinterest: FieldValue.delete() }, { merge: true });
+    const accountId = req.body?.accountId || null;
+    const ref = adminDb.collection(PIN_TOKENS).doc(uid);
+    if (accountId) {
+      try { await ref.set({ accounts: { [accountId]: FieldValue.delete() } }, { merge: true }); } catch (e) { console.error('[pinterest] token delete:', e.message); }
+      const snap = await adminDb.collection('connectedAccounts').doc(uid).get();
+      const next = accountsArray(snap.exists ? snap.data() : {}, 'pinterest').filter(a => a.accountId !== accountId);
+      await adminDb.collection('connectedAccounts').doc(uid).set({ pinterest: next }, { merge: true });
+    } else {
+      try { await ref.delete(); } catch (e) { console.error('[pinterest] token delete:', e.message); }
+      await adminDb.collection('connectedAccounts').doc(uid).set({ pinterest: FieldValue.delete() }, { merge: true });
+    }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
 });
 
 app.get('/api/pinterest/status', verifyToken, async (req, res) => {
   try {
-    const [tok, acc] = await Promise.all([
-      adminDb.collection(PIN_TOKENS).doc(req.user.uid).get(),
-      adminDb.collection('connectedAccounts').doc(req.user.uid).get(),
-    ]);
-    const connected = tok.exists && !!tok.data()?.token;
-    const pin = acc.exists ? acc.data()?.pinterest : null;
-    res.json({ connected, configured: pinConfigured(), username: connected ? (pin?.username || tok.data()?.username || null) : null });
+    const acc = await adminDb.collection('connectedAccounts').doc(req.user.uid).get();
+    const list = accountsArray(acc.exists ? acc.data() : {}, 'pinterest');
+    res.json({
+      connected: list.length > 0,
+      configured: pinConfigured(),
+      accounts: list.map(a => ({ accountId: a.accountId, name: a.label })),
+      username: list[0]?.label || null, // back-compat for older app builds
+    });
   } catch (e) { console.error('[pinterest] status failed:', e.message); res.status(500).json({ error: 'Could not read your Pinterest connection.' }); }
 });
 
 // UNTESTED - see the block header. Video pin: register media, upload the bytes to the
 // returned URL with Pinterest's own form fields, poll until processed, then create the pin
 // with a cover frame (video pins require cover_image_url).
-async function publishToPinterest({ account: uid, videoUrl, caption }) {
-  const acc = await getPinAccount(uid);
+async function publishToPinterest({ account: accountId, uid, videoUrl, caption }) {
+  const acc = await getPinAccount(uid, accountId);
   if (!acc?.token) return { ok: false, error: 'Pinterest is not connected.' };
   let coverPath = null;
   try {
@@ -4469,6 +4543,15 @@ async function publishToPinterest({ account: uid, videoUrl, caption }) {
     const boards = await (await fetch(`${PIN_API}/boards?page_size=1`, { headers: auth })).json();
     const board = boards.items?.[0];
     if (!board) return { ok: false, error: 'Create a board on Pinterest first, then try again.' };
+    // Pinterest refuses a video shorter than 4 seconds, and it refuses it LATE - the
+    // upload is accepted and processing reports a bare "failed" with no reason, which
+    // surfaced here as "Pinterest could not process the video" after a full upload. Found
+    // by testing with a 3.3s clip and again with an 8s one. Checked up front instead, so
+    // the user is told what is wrong rather than waiting for an opaque failure.
+    const srcForProbe = path.join(videosDir, path.basename(new URL(videoUrl).pathname));
+    const dur = await probeDurationSeconds(srcForProbe).catch(() => 0);
+    if (dur && dur < 4) return { ok: false, error: `Pinterest needs a video of at least 4 seconds - this one is ${dur.toFixed(1)}s.` };
+
     const reg = await (await fetch(`${PIN_API}/media`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify({ media_type: 'video' }) })).json();
     if (!reg.media_id || !reg.upload_url) return { ok: false, error: reg.message || 'Pinterest would not accept the upload.' };
     const videoRes = await fetch(videoUrl);
@@ -4698,7 +4781,7 @@ function accountsArray(accDoc, platform) {
   const v = accDoc?.[platform];
   if (Array.isArray(v)) return v.filter(a => a && a.accountId);
   if (v && typeof v === 'object') {
-    const id = v.accountId || v.memberId || v.openId || v.igUserId || v.pageId || v.channelId || v.userId || null;
+    const id = v.accountId || v.memberId || v.openId || v.igUserId || v.pageId || v.channelId || v.userId || v.username || null;
     if (!id) return [];
     return [{ accountId: id, label: v.label || v.name || v.username || v.channelTitle || v.pageName || v.displayName || null, connectedAt: v.connectedAt || null }];
   }
@@ -4816,7 +4899,10 @@ const PUBLISHERS = {
     // access (trial access cannot post to a real audience). Connect/publish are written
     // (publishToPinterest) but UNTESTED until credentials exist - see the block above.
     enabled: () => pinConfigured(),
-    accountFrom: (acc, uid) => (acc?.pinterest ? uid : null),
+    // MULTI-ACCOUNT (Pro 1 / Creator many), keyed by Pinterest username - see
+    // pinFetchUsername for why that is the identity available to us and not an id.
+    multiAccount: true,
+    listAccounts: (acc) => accountsArray(acc, 'pinterest').map(a => a.accountId),
     notConnected: 'Pinterest is no longer connected to this account.',
     publish: publishToPinterest,
   },
