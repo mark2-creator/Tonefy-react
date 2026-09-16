@@ -1498,6 +1498,11 @@ app.post("/api/verify-purchase", mediaProcLimiter, async (req, res) => {
       subscriptionProductId: productId,
       subscriptionPurchaseToken: purchaseToken,
       subscriptionBasePlanId: basePlanId,
+      // Cleared, or a resubscriber keeps 'expired' beside an active plan forever - and
+      // the app now READS this field to explain a lapse, so a stale one is a claim that
+      // the plan they just paid for has ended.
+      subscriptionStatus: 'active',
+      subscriptionEndedAt: FieldValue.delete(),
     }, { merge: true });
 
     // Google auto-refunds an unacknowledged purchase after 3 days - the
