@@ -3498,11 +3498,18 @@ app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
       return res.redirect(`https://tonefy-ai.fitlifesolutions.site?tiktok_error=${tokenData.error}`);
     }
 
-    const { access_token, open_id, refresh_token, expires_in } = tokenData;
+    const { access_token, open_id, refresh_token, expires_in, scope } = tokenData;
+
+    // What TikTok ACTUALLY granted, recorded rather than assumed. Approval of an app is
+    // not the same as approval of every scope it asked for, and `video.publish` is the one
+    // that decides whether a post goes out directly or lands as a draft. publishToTikTok
+    // tries direct and falls back either way, so this does not gate anything - it just
+    // means the answer is on record instead of being inferred from a post's outcome.
+    console.log(`[tiktok] connected ${open_id} with scopes: ${scope || '(none reported)'}`);
 
     // Store token, in memory AND on disk. The in-memory copy is only a cache now.
     tiktokTokens[open_id] = { access_token, refresh_token, expires_in, open_id };
-    await saveTikTokToken(open_id, { access_token, refresh_token, expires_in, open_id });
+    await saveTikTokToken(open_id, { access_token, refresh_token, expires_in, open_id, scope: scope || null });
     delete tiktokTokens[state];
 
     // Get user info
