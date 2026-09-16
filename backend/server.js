@@ -3458,7 +3458,8 @@ app.get('/tiktok/auth', tiktokLimiter, (req, res) => {
   // only `code` and `state` back from TikTok, so there is nowhere else to put it. It is
   // kept server-side against the state key rather than added to the OAuth request, which
   // means TikTok still sees exactly the same opaque state string it always did.
-  tiktokTokens[csrfState] = { codeVerifier, createdAt: Date.now(), from: req.query.from === 'app' ? 'app' : 'web' };
+  const adding = req.query.add === '1';
+  tiktokTokens[csrfState] = { codeVerifier, createdAt: Date.now(), from: req.query.from === 'app' ? 'app' : 'web', adding };
 
   let url = 'https://www.tiktok.com/v2/auth/authorize/';
   url += `?client_key=${TIKTOK_CLIENT_KEY}`;
@@ -3468,6 +3469,13 @@ app.get('/tiktok/auth', tiktokLimiter, (req, res) => {
   url += `&state=${csrfState}`;
   url += `&code_challenge=${codeChallenge}`;
   url += `&code_challenge_method=S256`;
+  // Adding a SECOND account has to show TikTok's authorisation page, because that page is
+  // the only place to switch accounts. TikTok's default skips it entirely for a valid
+  // session ("When set to 0, skips the authorization page for valid sessions"), so asking
+  // to add another account silently re-authorised the one already connected and came back
+  // announcing success. Left off for a first connect, where going straight through is the
+  // better experience and there is nothing to choose between.
+  if (adding) url += `&disable_auto_auth=1`;
 
   res.redirect(url);
 });
@@ -3550,7 +3558,7 @@ app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
     });
 
     // Redirect back to app with token info
-    res.redirect(`https://tonefy-ai.fitlifesolutions.site/tiktok-success.html?open_id=${open_id}&display_name=${encodeURIComponent(user.display_name || '')}&avatar=${encodeURIComponent(user.avatar_url || '')}&link=${encodeURIComponent(linkCode)}&from=${stored?.from === 'app' ? 'app' : 'web'}`);
+    res.redirect(`https://tonefy-ai.fitlifesolutions.site/tiktok-success.html?open_id=${open_id}&display_name=${encodeURIComponent(user.display_name || '')}&avatar=${encodeURIComponent(user.avatar_url || '')}&link=${encodeURIComponent(linkCode)}&from=${stored?.from === 'app' ? 'app' : 'web'}${stored?.adding ? '&add=1' : ''}`);
   } catch (err) {
     console.error('TikTok callback error:', err.message);
     res.redirect(`https://tonefy-ai.fitlifesolutions.site?tiktok_error=server_error`);
@@ -3582,6 +3590,14 @@ app.post('/api/tiktok/link', verifyToken, async (req, res) => {
     const gate = await canAddPlatformAccount(uid, 'tiktok', d.openId);
     if (!gate.ok) return res.status(403).json({ error: gate.error });
 
+    // Whether this is a genuinely new account or the same one again. appendPlatformAccount
+    // dedupes either way, so nothing breaks - but "Connected!" after someone asked to add
+    // ANOTHER account, having silently got the same one, is the app telling them something
+    // that is not true.
+    const before = await adminDb.collection('connectedAccounts').doc(uid).get();
+    const already = accountsArray(before.exists ? before.data() : {}, 'tiktok')
+      .some(a => a.accountId === d.openId);
+
     // The binding lives on the token document, which no client can reach.
     await adminDb.collection(TIKTOK_TOKENS).doc(d.openId).set({
       uid, displayName: d.displayName || null, avatar: d.avatar || null,
@@ -3589,7 +3605,7 @@ app.post('/api/tiktok/link', verifyToken, async (req, res) => {
     }, { merge: true });
     await appendPlatformAccount(uid, 'tiktok', { accountId: d.openId, label: d.displayName || null });
 
-    res.json({ ok: true, openId: d.openId, displayName: d.displayName || null });
+    res.json({ ok: true, openId: d.openId, displayName: d.displayName || null, alreadyConnected: already });
   } catch (e) {
     console.error('[tiktok] link failed:', e.message);
     res.status(500).json({ error: 'Could not finish connecting TikTok.' });
