@@ -5420,9 +5420,19 @@ app.post('/tiktok/disconnect', tiktokLimiter, verifyToken, async (req, res) => {
 // (this route is outside the /api prefix, like the other tiktok routes).
 app.get('/tiktok/creator-info', tiktokLimiter, verifyToken, async (req, res) => {
   try {
+    // connectedAccounts.tiktok is an ARRAY since TikTok went multi-account. Reading
+    // `.tiktok.openId` off it returns undefined, which this endpoint reported as "TikTok is
+    // not connected" - on a screen that was simultaneously showing "2 accounts". The
+    // posting path and the disconnect route were converted; this one was missed.
     const snap = await adminDb.collection('connectedAccounts').doc(req.user.uid).get();
-    const openId = snap.exists ? snap.data()?.tiktok?.openId : null;
-    if (!openId) return res.status(400).json({ error: 'TikTok is not connected.' });
+    const list = accountsArray(snap.exists ? snap.data() : {}, 'tiktok');
+    if (!list.length) return res.status(400).json({ error: 'TikTok is not connected.' });
+    // Settings are PER ACCOUNT - privacy options and whether comments are allowed differ
+    // between accounts - so the caller says which one it is asking about, and the answer
+    // names it. Defaulting to the first keeps older app builds working.
+    const asked = req.query.accountId;
+    const chosen = (asked && list.find(a => a.accountId === asked)) || list[0];
+    const openId = chosen.accountId;
     const token = await getTikTokToken(openId);
     if (!token) return res.status(400).json({ error: 'TikTok is not connected.' });
     const r = await fetch('https://open.tiktokapis.com/v2/post/publish/creator_info/query/', {
@@ -5435,7 +5445,11 @@ app.get('/tiktok/creator-info', tiktokLimiter, verifyToken, async (req, res) => 
     }
     const info = d.data || {};
     res.json({
-      nickname: info.creator_nickname || info.creator_username || 'Your TikTok',
+      // Which account these settings belong to, and what else could be chosen - so a sheet
+      // showing one account's rules can never be posting to a different one.
+      accountId: openId,
+      accounts: list.map(a => ({ accountId: a.accountId, name: a.label })),
+      nickname: info.creator_nickname || info.creator_username || chosen.label || 'Your TikTok',
       avatar: info.creator_avatar_url || null,
       privacyOptions: info.privacy_level_options || [],
       commentDisabled: !!info.comment_disabled,
