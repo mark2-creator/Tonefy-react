@@ -1835,16 +1835,77 @@ function playSaysEnded(sub) {
   return ENDED_STATES.has(state);
 }
 
+// What Play's answer means for one account, applied. Shared deliberately: the six-hourly
+// sweep and the push endpoint must never disagree about what "ended" means, and two
+// implementations of that drift the first time one of them gets a fix.
+//
+// It goes BOTH ways. Downgrade-only was a real gap: a subscription that goes ON_HOLD (a
+// failed payment) is downgraded, and when the user pays and Play RECOVERS it, nothing
+// looked at that account again - the sweep only reads plan in [pro, creator]. So a
+// recovered subscriber stayed on free forever. Restoring is the half that makes reacting
+// to a hold safe at all.
+async function applyPlayVerdict(uid, ref, v, sub) {
+  if (playSaysEnded(sub)) {
+    if (v.plan !== 'pro' && v.plan !== 'creator') return null;   // already taken back
+    // Credits are clamped rather than zeroed. Someone who paid for this cycle may have
+    // credits left, and taking those away as well would be punishing them for the
+    // subscription ending rather than simply ending it.
+    const freeCredits = tierConfig('free').creditsPerCycle;
+    const kept = Math.min(Number(v.creditsRemaining) || 0, freeCredits);
+    await ref.set({
+      plan: 'free',
+      creditsRemaining: kept,
+      subscriptionStatus: 'expired',
+      subscriptionEndedAt: new Date().toISOString(),
+      // Kept, not deleted: it is the evidence of what happened, and re-subscribing
+      // writes a new one anyway.
+      subscriptionLastState: sub.subscriptionState || 'unknown',
+    }, { merge: true });
+    console.log(`[SubSweep] ${uid}: ${v.plan} -> free (${sub.subscriptionState}), credits ${v.creditsRemaining} -> ${kept}`);
+    return 'downgraded';
+  }
+
+  // Play says this subscription is live again. Only restore what WE took away - a plan
+  // set by hand in the console has no expired marker and is none of Play's business.
+  const live = sub.subscriptionState === 'SUBSCRIPTION_STATE_ACTIVE'
+    || sub.subscriptionState === 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD';
+  if (!live || v.plan !== 'free' || v.subscriptionStatus !== 'expired') return null;
+
+  const basePlanId = sub.lineItems?.[0]?.offerDetails?.basePlanId || sub.lineItems?.[0]?.autoRenewingPlan?.basePlanId;
+  const plan = planFromBasePlanId(basePlanId);
+  if (!plan) return null;
+  // Credits go back to the tier's allowance, not left at the clamped free figure. This
+  // is only reachable after WE clamped them, and getting here at all means a real
+  // payment recovered at Play, so there is nothing to game.
+  await ref.set({
+    plan,
+    creditsRemaining: PLAN_CREDITS[plan],
+    subscriptionStatus: 'active',
+    subscriptionEndedAt: FieldValue.delete(),
+    subscriptionLastState: sub.subscriptionState,
+  }, { merge: true });
+  console.log(`[SubSweep] ${uid}: free -> ${plan} restored (${sub.subscriptionState})`);
+  return 'restored';
+}
+
 async function subscriptionSweep() {
-  let snap;
+  let docs = [];
   try {
-    snap = await adminDb.collection('users').where('plan', 'in', ['pro', 'creator']).get();
+    const [paid, lapsed] = await Promise.all([
+      adminDb.collection('users').where('plan', 'in', ['pro', 'creator']).get(),
+      // Accounts this sweep already took back. They are read again because a hold can
+      // RECOVER, and without this pass nothing would ever look at them - the paid query
+      // above cannot see a plan it has already set to free, so a recovered subscriber
+      // stayed on free forever.
+      adminDb.collection('users').where('subscriptionStatus', '==', 'expired').get(),
+    ]);
+    docs = [...paid.docs, ...lapsed.docs.filter(d => d.data()?.plan === 'free')];
   } catch (e) {
-    console.error('[SubSweep] could not read paid accounts:', e.message);
+    console.error('[SubSweep] could not read accounts:', e.message);
     return;
   }
 
-  for (const doc of snap.docs) {
+  for (const doc of docs) {
     const v = doc.data();
     // No token means nobody bought it - a comp account, or one set by hand in the
     // console. Those are deliberate and are not Play's to expire.
@@ -1867,29 +1928,102 @@ async function subscriptionSweep() {
       continue;
     }
 
-    if (!playSaysEnded(sub)) continue;
-
-    // Credits are clamped rather than zeroed. Someone who paid for this cycle may have
-    // credits left from it, and taking those away as well would be punishing them for
-    // the subscription ending rather than simply ending it.
-    const freeCredits = tierConfig('free').creditsPerCycle;
-    const kept = Math.min(Number(v.creditsRemaining) || 0, freeCredits);
     try {
-      await doc.ref.set({
-        plan: 'free',
-        creditsRemaining: kept,
-        subscriptionStatus: 'expired',
-        subscriptionEndedAt: new Date().toISOString(),
-        // Kept, not deleted: it is the evidence of what happened, and re-subscribing
-        // writes a new one anyway.
-        subscriptionLastState: sub.subscriptionState || 'unknown',
-      }, { merge: true });
-      console.log(`[SubSweep] ${doc.id}: ${v.plan} -> free (${sub.subscriptionState}), credits ${v.creditsRemaining} -> ${kept}`);
+      await applyPlayVerdict(doc.id, doc.ref, v, sub);
     } catch (e) {
-      console.error(`[SubSweep] ${doc.id}: could not downgrade -`, e.message);
+      console.error(`[SubSweep] ${doc.id}: could not apply Play's verdict -`, e.message);
     }
   }
 }
+
+// ===========================================================================
+// Real-time Developer Notifications from Google Play.
+//
+// Play does not POST here directly: it publishes into a Cloud Pub/Sub topic we own, and
+// Pub/Sub pushes to this URL. The queue is the point - it retries while this box is down,
+// so a deploy cannot lose a cancellation.
+//
+// OUTSIDE /api on purpose, like the OAuth callbacks: everything under /api is behind
+// verifyToken, and Pub/Sub has no Firebase token to present. It authenticates with a
+// shared secret in the query string instead (RTDN_VERIFY_TOKEN), compared in constant
+// time. Without that secret set, the route refuses everything rather than accepting
+// anonymous posts that move people's plans around.
+//
+// THE PAYLOAD IS NOT TRUSTED. Pub/Sub delivers at-least-once and out of order, so the
+// same message can arrive twice and a RENEWED can land after the EXPIRED that followed
+// it. Only the purchaseToken is read; the account's real state comes from asking Play,
+// through exactly the code the six-hourly sweep uses. That makes this endpoint a
+// TRIGGER for a check that already exists, not a second implementation of it - and it
+// makes replays harmless, because re-asking Play twice gives the same answer twice.
+app.post('/play-notifications', async (req, res) => {
+  const expected = process.env.RTDN_VERIFY_TOKEN || '';
+  const given = String(req.query.key || '');
+  const ok = expected.length > 0 && given.length === expected.length
+    && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+  if (!ok) return res.status(403).send('forbidden');
+
+  // ACK first, work after. Pub/Sub redelivers anything not answered quickly, and a Play
+  // lookup plus a Firestore write is slower than its ack deadline - so a slow-but-fine
+  // run would be redelivered as if it had failed. The work below is idempotent, and the
+  // sweep is the safety net for anything genuinely lost.
+  res.status(204).end();
+
+  try {
+    const raw = req.body?.message?.data;
+    if (!raw) return;
+    const payload = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
+
+    // Play Console's "Send test notification" button. Nothing to do but prove the wiring.
+    if (payload.testNotification) {
+      console.log('[RTDN] test notification received - the pipe works');
+      return;
+    }
+
+    // A voided purchase is a refund or chargeback: entitlement should stop now. It is
+    // the one case where waiting six hours is a real loss rather than a courtesy.
+    const token = payload.subscriptionNotification?.purchaseToken
+      || payload.voidedPurchaseNotification?.purchaseToken;
+    if (!token) return;
+
+    const snap = await adminDb.collection('users')
+      .where('subscriptionPurchaseToken', '==', token).limit(1).get();
+    if (snap.empty) {
+      // Normal, not an error: a purchase we never recorded, or a token replaced by a
+      // later one. Nothing of ours is entitled by it.
+      console.log('[RTDN] no account holds that purchase token');
+      return;
+    }
+    const doc = snap.docs[0];
+    if (isAdminUid(doc.id)) return;   // same carve-out the sweep makes
+
+    if (payload.voidedPurchaseNotification) {
+      // Play offers no subscriptionsv2 state for a void, so this is decided here rather
+      // than by asking: a refunded purchase entitles nothing, whatever its state says.
+      const v = doc.data();
+      if (v.plan === 'pro' || v.plan === 'creator') {
+        const kept = Math.min(Number(v.creditsRemaining) || 0, tierConfig('free').creditsPerCycle);
+        await doc.ref.set({
+          plan: 'free', creditsRemaining: kept,
+          subscriptionStatus: 'expired',
+          subscriptionEndedAt: new Date().toISOString(),
+          subscriptionLastState: 'VOIDED',
+        }, { merge: true });
+        console.log(`[RTDN] ${doc.id}: ${v.plan} -> free (purchase voided)`);
+      }
+      return;
+    }
+
+    const { data: sub } = await androidpublisher.purchases.subscriptionsv2.get({
+      packageName: PACKAGE_NAME, token,
+    });
+    const outcome = await applyPlayVerdict(doc.id, doc.ref, doc.data(), sub);
+    console.log(`[RTDN] ${doc.id}: ${sub.subscriptionState} -> ${outcome || 'no change'}`);
+  } catch (e) {
+    // Logged, not rethrown: the response has already gone, and the sweep will catch
+    // anything this missed within six hours.
+    console.error('[RTDN] handling failed:', e.message);
+  }
+});
 
 setInterval(() => {
   cleanupOldFiles(videosDir);
