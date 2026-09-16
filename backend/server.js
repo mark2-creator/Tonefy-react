@@ -3764,6 +3764,10 @@ async function publishToTikTok({
       source_info: sourceInfo,
     });
     if (direct.ok) return { ok: true, publishId: direct.publishId, mode: 'direct' };
+    // WHY it fell back. Discarding this made "it went to drafts again" undiagnosable
+    // without another round trip to a real device - and the reason is the whole question
+    // once video.publish has been granted.
+    console.warn(`[tiktok] direct post refused for ${openId}, falling back to draft: ${direct.error}`);
 
     // 2) INBOX (draft) fallback - the supported path for an unaudited app, and what the
     //    privacy policy/terms promise ("uploaded as drafts"). The video lands in the
@@ -5431,6 +5435,42 @@ app.get('/tiktok/creator-info', tiktokLimiter, verifyToken, async (req, res) => 
     // between accounts - so the caller says which one it is asking about, and the answer
     // names it. Defaulting to the first keeps older app builds working.
     const asked = req.query.accountId;
+
+    // "All accounts" asks every connected account and reports what is permitted on ALL of
+    // them: privacy levels are INTERSECTED and an interaction disabled anywhere is treated
+    // as disabled. Offering a level one account forbids would produce a post that fails
+    // halfway through the list, and showing rules that do not apply to a target is the
+    // thing TikTok's guidelines exist to prevent.
+    if (asked === 'all' && list.length > 1) {
+      const infos = [];
+      for (const a of list) {
+        const tok = await getTikTokToken(a.accountId);
+        if (!tok) continue;
+        const rr = await fetch('https://open.tiktokapis.com/v2/post/publish/creator_info/query/', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${tok.access_token}`, 'Content-Type': 'application/json; charset=UTF-8' },
+        });
+        const dd = await rr.json();
+        if (dd.error?.code !== 'ok') continue;
+        infos.push(dd.data || {});
+      }
+      if (!infos.length) return res.status(502).json({ error: 'Could not load your TikTok settings.' });
+      const intersect = infos
+        .map(i => i.privacy_level_options || [])
+        .reduce((acc, opts) => acc.filter(o => opts.includes(o)));
+      return res.json({
+        accountId: 'all',
+        accounts: list.map(a => ({ accountId: a.accountId, name: a.label })),
+        nickname: `All ${list.length} accounts`,
+        avatar: null,
+        privacyOptions: intersect,
+        commentDisabled: infos.some(i => i.comment_disabled),
+        duetDisabled: infos.some(i => i.duet_disabled),
+        stitchDisabled: infos.some(i => i.stitch_disabled),
+        maxDurationSec: Math.min(...infos.map(i => i.max_video_post_duration_sec || Infinity)),
+      });
+    }
+
     const chosen = (asked && list.find(a => a.accountId === asked)) || list[0];
     const openId = chosen.accountId;
     const token = await getTikTokToken(openId);
