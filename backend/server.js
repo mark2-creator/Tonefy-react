@@ -3451,8 +3451,14 @@ app.get('/tiktok/auth', tiktokLimiter, (req, res) => {
   const codeVerifier = crypto.randomBytes(32).toString('hex');
   const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
 
-  // Store verifier temporarily (in production use Redis/DB)
-  tiktokTokens[csrfState] = { codeVerifier, createdAt: Date.now() };
+  // Store verifier temporarily (in production use Redis/DB).
+  //
+  // `from` rides along so the success page knows whether to hand the user back to the
+  // APP or to the website. Both start the flow at this same URL, and the callback gets
+  // only `code` and `state` back from TikTok, so there is nowhere else to put it. It is
+  // kept server-side against the state key rather than added to the OAuth request, which
+  // means TikTok still sees exactly the same opaque state string it always did.
+  tiktokTokens[csrfState] = { codeVerifier, createdAt: Date.now(), from: req.query.from === 'app' ? 'app' : 'web' };
 
   let url = 'https://www.tiktok.com/v2/auth/authorize/';
   url += `?client_key=${TIKTOK_CLIENT_KEY}`;
@@ -3544,7 +3550,7 @@ app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
     });
 
     // Redirect back to app with token info
-    res.redirect(`https://tonefy-ai.fitlifesolutions.site/tiktok-success.html?open_id=${open_id}&display_name=${encodeURIComponent(user.display_name || '')}&avatar=${encodeURIComponent(user.avatar_url || '')}&link=${encodeURIComponent(linkCode)}`);
+    res.redirect(`https://tonefy-ai.fitlifesolutions.site/tiktok-success.html?open_id=${open_id}&display_name=${encodeURIComponent(user.display_name || '')}&avatar=${encodeURIComponent(user.avatar_url || '')}&link=${encodeURIComponent(linkCode)}&from=${stored?.from === 'app' ? 'app' : 'web'}`);
   } catch (err) {
     console.error('TikTok callback error:', err.message);
     res.redirect(`https://tonefy-ai.fitlifesolutions.site?tiktok_error=server_error`);
