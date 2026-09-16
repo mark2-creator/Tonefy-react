@@ -3271,6 +3271,10 @@ const tiktokTokens = {};
 // Firestore denies by default where no rule matches, so it is Admin-SDK-only by
 // construction rather than by a rule someone has to remember to keep.
 const TIKTOK_TOKENS = 'tiktokTokens';
+// Short-lived, single-use codes that bind a finished TikTok OAuth to a Firebase uid.
+// Admin-only by construction, like the token store: no security rule names it.
+const TIKTOK_LINK_CODES = 'tiktokLinkCodes';
+const TIKTOK_LINK_TTL_MS = 10 * 60 * 1000;
 
 async function saveTikTokToken(openId, data) {
   try {
@@ -3369,11 +3373,74 @@ app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
     const userData = await userRes.json();
     const user = userData.data?.user || {};
 
+    // A single-use code the success page trades for a server-written connection.
+    //
+    // The uid cannot come from here: TikTok's state carries only the PKCE verifier, and
+    // putting a uid in it would mean touching an OAuth flow that is under TikTok review.
+    // So the page - which DOES hold the user's Firebase session - presents this code and
+    // its own ID token to /api/tiktok/link, and the server binds the two. Nothing about
+    // the OAuth request, the redirect URI or the scopes changes; the query string on our
+    // own success page is ours.
+    // A code that is never presented is never consumed, so sweep the stale ones here -
+    // this is the only moment anything looks at that collection.
+    try {
+      const stale = await adminDb.collection(TIKTOK_LINK_CODES)
+        .where('createdAt', '<', Date.now() - TIKTOK_LINK_TTL_MS).limit(50).get();
+      for (const d of stale.docs) await d.ref.delete();
+    } catch (e) { console.warn('[tiktok] link code sweep:', e.message); }
+
+    const linkCode = crypto.randomBytes(24).toString('base64url');
+    await adminDb.collection(TIKTOK_LINK_CODES).doc(linkCode).set({
+      openId: open_id,
+      displayName: user.display_name || '',
+      avatar: user.avatar_url || '',
+      createdAt: Date.now(),
+    });
+
     // Redirect back to app with token info
-    res.redirect(`https://tonefy-ai.fitlifesolutions.site/tiktok-success.html?open_id=${open_id}&display_name=${encodeURIComponent(user.display_name || '')}&avatar=${encodeURIComponent(user.avatar_url || '')}`);
+    res.redirect(`https://tonefy-ai.fitlifesolutions.site/tiktok-success.html?open_id=${open_id}&display_name=${encodeURIComponent(user.display_name || '')}&avatar=${encodeURIComponent(user.avatar_url || '')}&link=${encodeURIComponent(linkCode)}`);
   } catch (err) {
     console.error('TikTok callback error:', err.message);
     res.redirect(`https://tonefy-ai.fitlifesolutions.site?tiktok_error=server_error`);
+  }
+});
+
+// Trade a single-use link code for a server-written connection.
+//
+// This is what makes the TikTok connection trustworthy: the record that says "this uid
+// owns this openId" is written HERE, from a verified Firebase token plus a code only our
+// own callback could have issued - not by the browser, which can write its own
+// connectedAccounts document and used to be believed about it.
+app.post('/api/tiktok/link', verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  const code = String(req.body?.code || '');
+  if (!code) return res.status(400).json({ error: 'Missing link code.' });
+  try {
+    const ref = adminDb.collection(TIKTOK_LINK_CODES).doc(code);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(400).json({ error: 'This connection link has already been used or has expired.' });
+    const d = snap.data();
+    // Single use, and consumed BEFORE anything else can fail - a code that survives a
+    // failed attempt is a code that can be replayed.
+    await ref.delete();
+    if (!d.createdAt || Date.now() - d.createdAt > TIKTOK_LINK_TTL_MS) {
+      return res.status(400).json({ error: 'This connection link has expired. Please connect again.' });
+    }
+
+    const gate = await canAddPlatformAccount(uid, 'tiktok', d.openId);
+    if (!gate.ok) return res.status(403).json({ error: gate.error });
+
+    // The binding lives on the token document, which no client can reach.
+    await adminDb.collection(TIKTOK_TOKENS).doc(d.openId).set({
+      uid, displayName: d.displayName || null, avatar: d.avatar || null,
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
+    await appendPlatformAccount(uid, 'tiktok', { accountId: d.openId, label: d.displayName || null });
+
+    res.json({ ok: true, openId: d.openId, displayName: d.displayName || null });
+  } catch (e) {
+    console.error('[tiktok] link failed:', e.message);
+    res.status(500).json({ error: 'Could not finish connecting TikTok.' });
   }
 });
 
@@ -3397,11 +3464,19 @@ app.get('/tiktok/user/:openId', tiktokLimiter, verifyToken, async (req, res) => 
 // connectedAccounts/{uid}.tiktok.openId is written when the account is linked, so it is
 // the record of who owns what. Checked against the VERIFIED uid from the token, never
 // anything in the body.
+// Reads the binding off the TOKEN document, which only this server writes.
+//
+// It used to read connectedAccounts/{uid}.tiktok.openId - and that document is written by
+// the CLIENT (tiktok-success.html), with a Firestore rule that lets any user write their
+// own. So the check was asking the caller whether the caller was allowed, and an openId is
+// not a secret: writing someone else's into your own record made every ownership check
+// pass, and getTikTokToken looks a token up by openId alone. Verified as reachable with a
+// real client-authenticated write before it was changed, not assumed from reading.
 async function tiktokOwnedBy(uid, openId) {
   if (!uid || !openId) return false;
   try {
-    const snap = await adminDb.collection('connectedAccounts').doc(uid).get();
-    return snap.exists && snap.data()?.tiktok?.openId === openId;
+    const snap = await adminDb.collection(TIKTOK_TOKENS).doc(openId).get();
+    return snap.exists && snap.data()?.uid === uid;
   } catch (e) {
     // A lookup failure must not become an authorisation. Unlike the plan checks, where
     // failing open costs a subscriber nothing, failing open here posts to a stranger's
@@ -3437,10 +3512,16 @@ function isOwnMediaUrl(u) {
 // Returns { ok, publishId } or { ok: false, error }. It never throws: the sweep records
 // the reason on the post rather than failing a whole pass over one bad item.
 async function publishToTikTok({
-  openId, videoUrl, title, privacyLevel = 'SELF_ONLY',
+  openId, uid, videoUrl, title, privacyLevel = 'SELF_ONLY',
   disableComment = false, disableDuet = false, disableStitch = false,
   brandContentToggle = false, brandOrganicToggle = false,
 }) {
+  // Checked HERE rather than in each route, because three paths reach TikTok - post-now,
+  // the scheduled sweep and the older post-video route - and a check that has to be
+  // repeated is a check one of them will eventually be written without.
+  if (uid && !(await tiktokOwnedBy(uid, openId))) {
+    return { ok: false, error: 'That TikTok account is not connected to this login.' };
+  }
   const token = await getTikTokToken(openId);
   if (!token) return { ok: false, error: 'TikTok not connected' };
   // TikTok forbids private branded content. Enforced in the UI too, but a client cannot be
@@ -3856,14 +3937,16 @@ app.post('/api/account/delete', verifyToken, async (req, res) => {
   });
 
   await step('tiktok', async () => {
-    let openId = null;
+    let openIds = [];
     try {
       const snap = await adminDb.collection('connectedAccounts').doc(uid).get();
-      openId = snap.exists ? snap.data()?.tiktok?.openId : null;
+      // An ARRAY since TikTok went multi-account; accountsArray also reads the old object,
+      // so an account connected before that still has its token removed.
+      openIds = accountsArray(snap.exists ? snap.data() : {}, 'tiktok').map(a => a.accountId);
     } catch (e) {
       console.warn('[account-delete] tiktok lookup:', e.message);
     }
-    if (openId) {
+    for (const openId of openIds) {
       await adminDb.collection(TIKTOK_TOKENS).doc(openId).delete();
       delete tiktokTokens[openId];   // the in-process cache, or it outlives the row
     }
@@ -4830,11 +4913,14 @@ const PUBLISHERS = {
     kind: 'video',
     enabled: () => !!(process.env.TIKTOK_CLIENT_KEY || process.env.TIKTOK_SANDBOX_CLIENT_KEY),
     // Where this platform's identity lives on connectedAccounts/{uid}.
-    accountFrom: (acc) => acc?.tiktok?.openId || null,
+    // MULTI-ACCOUNT (Pro 1 / Creator many), keyed by openId. TikTok's token store was
+    // already per-openId, so this was only ever about the "which accounts" pointer.
+    multiAccount: true,
+    listAccounts: (acc) => accountsArray(acc, 'tiktok').map(a => a.accountId),
     notConnected: 'TikTok is no longer connected to this account.',
-    publish: ({ account, videoUrl, caption, options }) =>
+    publish: ({ account, uid, videoUrl, caption, options }) =>
       publishToTikTok({
-        openId: account, videoUrl, title: caption,
+        openId: account, uid, videoUrl, title: caption,
         privacyLevel: options?.privacyLevel || 'SELF_ONLY',
         disableComment: options?.disableComment,
         disableDuet: options?.disableDuet,
@@ -5118,8 +5204,15 @@ app.post('/tiktok/disconnect', tiktokLimiter, verifyToken, async (req, res) => {
   try {
     const uid = req.user.uid;
     const snap = await adminDb.collection('connectedAccounts').doc(uid).get();
-    const openId = snap.exists ? snap.data()?.tiktok?.openId : null;
-    if (openId) {
+    const list = accountsArray(snap.exists ? snap.data() : {}, 'tiktok');
+    const asked = req.body?.accountId || null;
+    // Which accounts this call removes: the one named, or all of them.
+    const targets = asked ? list.filter(a => a.accountId === asked).map(a => a.accountId) : list.map(a => a.accountId);
+    for (const openId of targets) {
+      // Revoking is destructive and the openId reaching here came from a document the
+      // client can write, so it is checked against the server-written binding first.
+      // Without this, naming a stranger's openId would revoke THEIR TikTok token.
+      if (!(await tiktokOwnedBy(uid, openId))) { console.warn(`[tiktok] disconnect: ${uid} does not own ${openId}`); continue; }
       const tok = await getTikTokToken(openId);
       if (tok?.access_token) {
         try {
@@ -5137,7 +5230,12 @@ app.post('/tiktok/disconnect', tiktokLimiter, verifyToken, async (req, res) => {
       try { await adminDb.collection(TIKTOK_TOKENS).doc(openId).delete(); } catch (e) { console.error('[tiktok] token delete:', e.message); }
       delete tiktokTokens[openId]; // drop the in-memory cache too, or it serves a dead token
     }
-    await adminDb.collection('connectedAccounts').doc(uid).set({ tiktok: FieldValue.delete() }, { merge: true });
+    if (asked) {
+      const next = list.filter(a => a.accountId !== asked);
+      await adminDb.collection('connectedAccounts').doc(uid).set({ tiktok: next }, { merge: true });
+    } else {
+      await adminDb.collection('connectedAccounts').doc(uid).set({ tiktok: FieldValue.delete() }, { merge: true });
+    }
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message || 'Could not disconnect.' });
