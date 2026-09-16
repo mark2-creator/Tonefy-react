@@ -3490,7 +3490,11 @@ app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
 
   const stored = tiktokTokens[state];
   if (!stored) {
-    return res.status(400).json({ error: 'Invalid state' });
+    // Reached by going BACK to this URL after the flow already completed - the state is
+    // consumed on first use, so a revisit legitimately has nothing to match. It used to
+    // answer with bare JSON, which is an error page a user cannot act on. Send them to
+    // the same page every other outcome lands on.
+    return res.redirect('https://tonefy-ai.fitlifesolutions.site/tiktok-success.html?tiktok_error=expired_state&from=app');
   }
 
   try {
