@@ -851,13 +851,25 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
     const usersSnap = await adminDb.collection("users").get();
     const plans = { free: 0, pro: 0, creator: 0 };
     const countries = {};
+    const docIds = new Set();
     usersSnap.forEach(d => {
       const v = d.data();
+      docIds.add(d.id);
       const plan = v.plan || "free";
       if (plans[plan] === undefined) plans[plan] = 0;
       plans[plan] += 1;
       if (v.country) countries[v.country] = (countries[v.country] || 0) + 1;
     });
+
+    // An account with no users document is FREE - that is what getUserPlanData decides
+    // everywhere else, so the breakdown has to agree or it silently loses accounts. It
+    // used to count only documents, which is why Plans added up to fewer than the total.
+    const authIds = new Set(authUsers.map(u => u.uid));
+    const noDoc = authUsers.filter(u => !docIds.has(u.uid)).length;
+    plans.free += noDoc;
+    // And a document whose account is gone is not a person. Worth surfacing rather than
+    // quietly inflating a plan bucket.
+    const orphanDocs = usersSnap.docs.filter(d => !authIds.has(d.id)).length;
 
     const videosSnap = await adminDb.collection("userVideos").get();
     let bytes = 0, videos7 = 0, videos30 = 0;
@@ -921,6 +933,10 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
         signups30,
         signedIn7,
         plans,
+        // Accounts with no profile document of their own, counted as free above.
+        noProfileDoc: noDoc,
+        // Documents left behind by accounts that no longer exist.
+        orphanDocs,
         countries: Object.entries(countries).sort((a, b) => b[1] - a[1]).slice(0, 10),
       },
       videos: {
