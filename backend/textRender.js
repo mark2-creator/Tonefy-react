@@ -73,6 +73,22 @@ export function createTextRenderer({
     // Cached. A highlight caption measures the same line once per word in it, and
     // the same words again for every still of that phrase - all identical calls.
     const labelWidthCache = new Map();
+    // Everything ImageMagick is told to draw goes through here first.
+    //
+    // `label:` interprets percent escapes, so a caption containing %[fx:2*3] is EVALUATED
+    // and draws "6" - measured on this box, not assumed. Captions about discounts and
+    // percentages are ordinary content in this app, and any of them could come out mangled.
+    // Doubling the percent renders one literal percent, which is what the user typed.
+    //
+    // Backslash is ImageMagick's own escape introducer and is dropped, as it always was -
+    // the difference is that it now happens at the same boundary as the percent, so the
+    // string that gets MEASURED is byte-for-byte the string that gets DRAWN. It was only
+    // applied on the render side before, so a backslash already made the two disagree.
+    //
+    // (`label:@file` would read a file, but this box's ImageMagick policy refuses the @
+    // indirection outright - verified. Escaping here does not depend on that holding.)
+    const imText = (text) => String(text ?? '').replace(/\\/g, '').replace(/%/g, '%%');
+
     const labelWidth = async (fontPath, pointsize, kerning, text) => {
       const wkey = `${fontPath}|${pointsize}|${kerning}|${text}`;
       if (labelWidthCache.has(wkey)) return labelWidthCache.get(wkey);
@@ -81,7 +97,7 @@ export function createTextRenderer({
         ...(fontPath ? ['-font', fontPath] : []),
         '-pointsize', pointsize,
         ...(kerning != null ? ['-kerning', kerning] : []),
-        `label:${text}`, '-format', '%w', 'info:',
+        `label:${imText(text)}`, '-format', '%w', 'info:',
       ], { timeout: 15000 });
       const w = parseInt(String(out).trim(), 10) || 0;
       labelWidthCache.set(wkey, w);
@@ -243,10 +259,9 @@ export function createTextRenderer({
           )
         : wrapTextLinesServer(t.text, 4);
       const multilineText = lines.join('\n');
-      // Only the backslash needs removing (ImageMagick escape syntax). Quotes
-      // used to be rewritten to apostrophes to survive the shell; with execFile
-      // they render as the user typed them.
-      const safeText = multilineText.replace(/\\/g, '');
+      // Quotes used to be rewritten to apostrophes to survive the shell; with execFile
+      // they render as the user typed them. imText handles the rest - see its comment.
+      const safeText = multilineText;
 
       const base = path.join(uploadsDir, uniqueName('txtrender', 'png'));
       const maskPng = base.replace('.png', '_mask.png');
@@ -279,7 +294,7 @@ export function createTextRenderer({
         ...(spec && spec.lineSpacing
           ? ['-interline-spacing', (num(spec.lineSpacing) * sscale).toFixed(2)] : []),
         '-gravity', gravityArg,
-        `label:${safeText}`,
+        `label:${imText(safeText)}`,
         maskPng,
       ]).catch(e => { console.error('Text mask render error:', e.stderr?.slice(-500) || e.message); throw new Error('Text mask render failed'); });
 

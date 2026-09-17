@@ -2283,7 +2283,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const end = chunkTimings[i].end;
     const dur = end - start;
     const popEnd = start + Math.min(0.15, dur * 0.35); // 150ms pop
-    const text = (s.transform ? s.transform(chunk, i) : chunk).replace(/[}{]/g, '');
+    // Braces open an ASS override block, so they go - that is what stops a caption
+    // injecting its own styling tags. A NEWLINE is the other structural character here:
+    // an .ass file is line-based, one Dialogue event per line, so a literal newline in a
+    // caption would split the event and corrupt the file. ASS writes a hard line break as
+    // \N, which keeps what the user meant instead of discarding it.
+    const assSafe = (v) => String(v).replace(/[}{]/g, '').replace(/\r?\n/g, '\\N');
+    const text = assSafe(s.transform ? s.transform(chunk, i) : chunk);
     const mv = getMarginV(i); // position variation
     const pos = ''; // position override tag (empty = use style default)
 
@@ -2293,7 +2299,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       // the "follow the voice" behaviour the style promises rather than a
       // static phrase indistinguishable from a plain stroke style.
       const chunkWords = chunk.split(/\s+/).filter(Boolean);
-      const transformedWords = chunkWords.map((w, wi) => (s.transform ? s.transform(w, wi) : w).replace(/[}{]/g, ''));
+      const transformedWords = chunkWords.map((w, wi) => assSafe(s.transform ? s.transform(w, wi) : w));
       return chunkWordTimings[i].map((wt, wi) => {
         const runs = transformedWords.map((w, ti) =>
           ti === wi ? `{\\1c${hlActiveColour}}${w}{\\1c${hlBaseColour}}` : w
