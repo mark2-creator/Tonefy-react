@@ -6040,6 +6040,16 @@ const ALLOWED_FILTER_OPS = new Set([
 // renders without a deploy here - same arrangement as filters and transitions.
 const MOTION_ALLOWED = /^[A-Za-z0-9_=:.,+\-*/()'<>?%\s]+$/;
 
+// What a motion may actually DO: move the frame around. Everything the catalogue uses
+// (scale, crop, zoompan, rotate) plus the few neighbours a future motion would plausibly
+// want. Deliberately excludes anything that can open a file or a URL - movie, amovie,
+// subtitles, drawtext - which is the whole point of checking op names as well as
+// characters. Adding a motion that needs another op means adding it here, which is a
+// smaller cost than leaving the graph open.
+const MOTION_ALLOWED_OPS = new Set([
+  'scale', 'crop', 'zoompan', 'rotate', 'pad', 'setsar', 'format', 'fps', 'hflip', 'vflip',
+]);
+
 function safeMotionChain(spec, w, h, fps) {
   if (typeof spec !== 'string' || !spec.trim()) return null;
   if (spec.length > 600) return null;
@@ -6059,7 +6069,33 @@ function safeMotionChain(spec, w, h, fps) {
     .replaceAll('{W}', String(w))
     .replaceAll('{H}', String(h))
     .replaceAll('{FPS}', String(fps));
-  return MOTION_ALLOWED.test(filled) ? filled : null;
+  if (!MOTION_ALLOWED.test(filled)) return null;
+
+  // The character class alone is not enough, and this is the gap it left. A motion is
+  // legitimately full of commas - an expression like z='min(zoom+0.001,1.5)' needs them -
+  // so commas cannot simply be banned the way they are in the grade and transition lists.
+  // But a comma at the TOP level starts a new filter, so "crop=iw:ih,movie=http://..."
+  // passed the regex intact: movie= reads any file or URL the server can reach, which on
+  // this box means the other services on localhost.
+  //
+  // So the string is split on commas that are outside parentheses and outside quotes, and
+  // every segment has to name an op a motion could actually use. Geometry only - nothing
+  // that opens a file or a socket.
+  const segs = [];
+  let seg = '', depth = 0, quote = null;
+  for (const ch of filled) {
+    if (quote) { if (ch === quote) quote = null; seg += ch; continue; }
+    if (ch === "'") { quote = ch; seg += ch; continue; }
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    if (ch === ',' && depth === 0) { segs.push(seg); seg = ''; continue; }
+    seg += ch;
+  }
+  if (seg.trim()) segs.push(seg);
+  for (const part of segs) {
+    if (!MOTION_ALLOWED_OPS.has(part.split('=')[0].trim())) return null;
+  }
+  return filled;
 }
 
 // A transition recipe from the client: an xfade base plus fx fragments gated to the
@@ -6174,6 +6210,9 @@ function safeTransitionSpec(spec) {
   const fx = Array.isArray(spec.fx) ? spec.fx.filter(part => {
     const str = String(part);
     if (/[;"'`$\\\n\[\]]/.test(str)) return false;
+    // Same comma smuggle as the grade chain above, and the same reason it cannot be
+    // legitimate: fx is a list, so one entry is one filter.
+    if (str.includes(',')) return false;
     return ALLOWED_TRANSITION_FX_OPS.has(str.split('=')[0].trim());
   }) : [];
   return { base, fx };
@@ -6185,6 +6224,12 @@ function safeFilterChain(chain) {
     const str = String(part);
     // No shell metacharacters, no chaining out of the op, and a known op name.
     if (/[;"'`$\\\n]/.test(str)) return false;
+    // A COMMA chains filters in ffmpeg, and the op check below only reads as far as the
+    // first '='. Without this, "eq=brightness=0.1,movie=http://..." passes as "eq" and
+    // smuggles a second filter - movie= reads any file or URL the server can reach.
+    // The chain is already an ARRAY, so one element is one filter and a comma inside one
+    // is never legitimate.
+    if (str.includes(',')) return false;
     const op = str.split('=')[0].trim();
     return ALLOWED_FILTER_OPS.has(op);
   });
