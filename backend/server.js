@@ -5564,6 +5564,17 @@ app.post('/tiktok/post-video', tiktokLimiter, verifyToken, async (req, res) => {
     return res.status(400).json({ error: 'Only a video created in Tonefy can be posted.' });
   }
 
+  // Posting is a paid benefit, and this route was the one way round it. /api/post-now has
+  // charged for it since Sep 14; this older single-platform route never did, so anyone -
+  // and the WEBSITE, which still called this one - could post to TikTok on a free plan.
+  // Fails OPEN on a lookup error, matching post-now: a Firestore blip must not refuse a
+  // subscriber the thing they pay for.
+  let postingPlan = 'pro';
+  try { postingPlan = (await getUserPlanData(adminDb, req.user.uid)).plan; } catch (e) { /* fail open */ }
+  if (!isAdminUid(req.user.uid) && postingPlan !== 'pro' && postingPlan !== 'creator') {
+    return res.status(403).json({ error: 'Posting to social media is available on the Pro and Creator plans.' });
+  }
+
   const token = await getTikTokToken(openId);
   if (!token) return res.status(401).json({ error: 'TikTok not connected' });
 
