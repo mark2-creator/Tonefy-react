@@ -5440,6 +5440,36 @@ app.post('/tiktok/disconnect', tiktokLimiter, verifyToken, async (req, res) => {
   }
 });
 
+// Connection status, matching the shape the other five platforms return.
+//
+// TikTok was the one platform without this: both clients read connectedAccounts from
+// Firestore themselves, which is why the website and the app each had their own idea of
+// what "connected" means. One endpoint, one answer.
+app.get('/api/tiktok/status', verifyToken, async (req, res) => {
+  try {
+    const snap = await adminDb.collection('connectedAccounts').doc(req.user.uid).get();
+    const list = accountsArray(snap.exists ? snap.data() : {}, 'tiktok');
+    // The display label lives on connectedAccounts, but whether the connection WORKS is a
+    // question about the token, so an account whose token we no longer hold is reported as
+    // gone rather than shown as connected - the stale-badge failure this project keeps
+    // hitting.
+    const live = [];
+    for (const a of list) {
+      const tok = await getTikTokToken(a.accountId);
+      if (tok) live.push({ accountId: a.accountId, name: a.label || null });
+    }
+    res.json({
+      connected: live.length > 0,
+      configured: !!(TIKTOK_CLIENT_KEY && TIKTOK_CLIENT_SECRET),
+      accounts: live,
+      displayName: live[0]?.name || null,
+    });
+  } catch (e) {
+    console.error('[tiktok] status failed:', e.message);
+    res.status(500).json({ error: 'Could not read your TikTok connection.' });
+  }
+});
+
 // Creator info for the compliant Direct Post sheet. TikTok's UX guidelines REQUIRE the
 // app to fetch the creator's allowed privacy levels and interaction settings and have the
 // user choose before a direct post - this endpoint feeds that screen. verifyToken inline
