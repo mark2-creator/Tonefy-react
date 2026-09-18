@@ -150,6 +150,18 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
 
+// CORS first, before ANY route. Only the website's own origin is allowed: token auth
+// (no cookies) already meant a wildcard could not be used to ride a victim's session, but
+// restricting it is real hardening for anything unauthenticated a malicious page could
+// otherwise read cross-origin through a visitor's browser.
+//
+// It lives HERE rather than further down for a reason worth keeping: middleware applies
+// only to routes registered after it, so routes declared above it get no CORS headers at
+// all. They answer curl perfectly - curl does not enforce CORS - and fail in every
+// browser with "Failed to fetch", which names nothing. The admin endpoints spent their
+// first day in exactly that state.
+app.use(cors({ origin: "https://tonefy-ai.fitlifesolutions.site", methods: ["GET", "POST", "OPTIONS"] }));
+
 // Every limiter below shares this key. Two reasons it is not the default.
 //
 // 1. nginx in front of this app sets X-Real-IP but NOT X-Forwarded-For (see
@@ -1411,7 +1423,6 @@ app.use(express.urlencoded({ extended: true }));
 // to ride a victim's session, but restricting it is still real hardening
 // for anything unauthenticated a malicious page could otherwise read
 // cross-origin via a visitor's browser.
-app.use(cors({ origin: "https://tonefy-ai.fitlifesolutions.site", methods: ["GET", "POST", "OPTIONS"] }));
 app.use((req, res, next) => { console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`); next(); });
 // Global rate limit
 app.use(rateLimit({
