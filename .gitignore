@@ -12,3 +12,7 @@ backend/jobs.json
 # Recovery snapshots kept on disk, not in history
 *.bak_*
 backend/public/auth/
+
+# Python bytecode - regenerated on every run
+__pycache__/
+*.pyc
