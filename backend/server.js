@@ -313,13 +313,42 @@ function setCache(key, value) {
 // extraction and segment extraction with them, which is the whole Idea-to-Video flow.
 //
 // A list rather than a constant, tried in order. A retirement now costs the first
-// candidate rather than the feature. Verified against the live API on the day:
-//   openai/gpt-oss-120b  clean prose, valid JSON, ~950ms   <- first choice
-//   groq/compound-mini   clean prose, valid JSON, ~1500ms  <- slower, same quality
-// Two that were rejected, and why, so they are not tried again:
-//   openai/gpt-oss-20b   returns EMPTY content for these prompts
-//   qwen/qwen3.6-27b     emits <think> reasoning tags into the output
-const GROQ_MODELS = ['openai/gpt-oss-120b', 'groq/compound-mini'];
+// candidate rather than the feature. Re-measured against the live API Sep 24 2026:
+//   openai/gpt-oss-120b  clean prose, valid JSON   <- first choice
+//   openai/gpt-oss-20b   clean prose, valid JSON   <- verified on all four real prompts
+// Retired by Groq and removed: groq/compound-mini (404 model_not_found), and before it
+// llama-3.1-8b-instant / llama-3.3-70b-versatile.
+// Still rejected: qwen/qwen3.8-27b - it ignores REASONING_EFFORT below and starves on
+// the small budgets (empty at 80 and 400 tokens), which is the whole problem this list
+// just had.
+const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
+
+// THE gpt-oss MODELS ARE REASONING MODELS, AND max_tokens IS THE COMBINED BUDGET for
+// their private reasoning AND the answer. Reasoning is spent FIRST, so a budget that
+// looks generous for the answer can be consumed entirely before a single content token
+// is emitted - the reply comes back with finish_reason 'length' and content EMPTY.
+//
+// That is not a hypothesis. Measured on the real prompts at their real budgets, with
+// the default (medium) effort:
+//   keywords     max_tokens  80 -> 78 reasoning tokens, EMPTY
+//   tool lookup  max_tokens 120 -> 113 reasoning tokens, EMPTY
+//   segments     max_tokens 500 -> 498 reasoning tokens, EMPTY
+//   url -> script max_tokens 400 -> finish 'length', narration silently TRUNCATED
+//
+// So three features had been returning nothing from Groq and one was being cut off
+// mid-sentence. /api/extract-segments calls groqChat DIRECTLY rather than through
+// callLLM, so it has no Cloudflare fallback and simply failed; the others fell through
+// to Cloudflare on every single call, which works but is not what this list is for.
+//
+// 'low' is the fix rather than raising every budget: these prompts are lookups and
+// extractions, not problems that need deliberation. It cuts reasoning to 28-46 tokens
+// and every call then finishes with 'stop' and real content.
+//
+// This also corrects the note that used to sit above: openai/gpt-oss-20b was rejected on
+// Aug 17 2026 for "returning EMPTY content for these prompts". It does - at medium
+// effort, exactly like the 120b does. It was the budget, not the model, and that
+// misdiagnosis cost the list its only working fallback.
+const REASONING_EFFORT = 'low';
 
 // Only a missing/withdrawn model is worth trying the next candidate for. A bad request
 // or an auth failure will fail identically on every model, and retrying it just makes
@@ -333,10 +362,28 @@ async function groqChat({ messages, max_tokens = 400, temperature = 0.8 }) {
   let lastError;
   for (const model of GROQ_MODELS) {
     try {
-      const completion = await groq.chat.completions.create({ model, messages, max_tokens, temperature });
+      const body = { model, messages, max_tokens, temperature, reasoning_effort: REASONING_EFFORT };
+      let completion;
+      try {
+        completion = await groq.chat.completions.create(body);
+      } catch (e) {
+        // A model that does not take reasoning_effort answers 400 rather than ignoring
+        // it, and that is not a "model gone" error - it would be rethrown below and take
+        // the whole feature down. Retry once without the parameter so a future
+        // non-reasoning candidate still works.
+        if (!/reasoning_effort/i.test(String(e?.message || ''))) throw e;
+        console.warn(`[groq] ${model} rejected reasoning_effort, retrying without it`);
+        delete body.reasoning_effort;
+        completion = await groq.chat.completions.create(body);
+      }
       const text = completion.choices?.[0]?.message?.content?.trim();
       if (text) return text;
-      lastError = new Error(`${model} returned empty content`);
+      // Empty almost always means the reasoning budget ate the answer. Say so, because
+      // "returned empty content" on its own is what got blamed on the model last time.
+      const u = completion.usage;
+      lastError = new Error(`${model} returned empty content `
+        + `(finish=${completion.choices?.[0]?.finish_reason}, `
+        + `reasoning=${u?.completion_tokens_details?.reasoning_tokens ?? '?'}/${max_tokens} tokens)`);
     } catch (e) {
       lastError = e;
       if (!isModelGone(e)) throw e;
