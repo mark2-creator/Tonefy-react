@@ -3462,16 +3462,94 @@ async function saveTikTokToken(openId, data) {
   }
 }
 
+// A TikTok access token lives 24 HOURS; its refresh token lives a year. `expiresAt` has
+// been written by saveTikTokToken since the token store was built - with a comment saying
+// it exists "so a refresh can be attempted rather than the connection simply failing" -
+// and nothing ever read it. So a connection stopped working a day after it was made, and
+// the only cure was reconnecting by hand, while the badge still said Connected.
+//
+// Found live rather than by reading: the owner's stored token had expired 53 minutes
+// before a post was attempted and /v2/user/info/ answered `access_token_invalid`.
+//
+// TikTok ROTATES the refresh token on every refresh, so two concurrent refreshes race and
+// the loser persists a refresh token TikTok has already replaced - which would break the
+// connection permanently rather than for a day. One in-flight promise per account, shared
+// by every caller that arrives while it runs.
+const tiktokRefreshInFlight = new Map();
+
+// Refreshed a few minutes EARLY, because the alternative is a token that passes this
+// check and expires during the upload that follows - a video post takes real time.
+const TIKTOK_EXPIRY_SKEW_MS = 5 * 60 * 1000;
+
+async function refreshTikTokToken(openId, stored) {
+  if (tiktokRefreshInFlight.has(openId)) return tiktokRefreshInFlight.get(openId);
+  const p = (async () => {
+    if (!stored?.refresh_token) return null;
+    try {
+      const res = await fetch('https://open.tiktokapis.com/v2/oauth/token/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_key: TIKTOK_CLIENT_KEY,
+          client_secret: TIKTOK_CLIENT_SECRET,
+          grant_type: 'refresh_token',
+          refresh_token: stored.refresh_token,
+        }),
+      });
+      const t = await res.json();
+      if (!t.access_token) {
+        // The refresh token itself is dead (revoked, or a year old). The connection is
+        // genuinely gone and only a reconnect fixes it. Returning null rather than the
+        // expired record is what makes /api/tiktok/status report it as disconnected
+        // instead of showing a Connected badge over a token that cannot post.
+        console.warn(`[tiktok] refresh refused for ${openId}: ${t.error || 'no access_token'} ${t.error_description || ''}`);
+        return null;
+      }
+      const merged = {
+        ...stored,
+        access_token: t.access_token,
+        refresh_token: t.refresh_token || stored.refresh_token,
+        expires_in: t.expires_in,
+        scope: t.scope || stored.scope || null,
+      };
+      // Persist BEFORE caching, so a crash between the two leaves the durable copy
+      // correct rather than leaving a good token only in memory.
+      await saveTikTokToken(openId, merged);
+      merged.expiresAt = Date.now() + (Number(t.expires_in) || 86400) * 1000;
+      tiktokTokens[openId] = merged;
+      console.log(`[tiktok] refreshed token for ${openId}`);
+      return merged;
+    } catch (e) {
+      console.error('[tiktok] refresh failed:', e.message);
+      return null;
+    }
+  })().finally(() => tiktokRefreshInFlight.delete(openId));
+  tiktokRefreshInFlight.set(openId, p);
+  return p;
+}
+
+function tiktokTokenFresh(t) {
+  // No expiry recorded (a token stored before that field existed) is treated as fresh
+  // rather than forced through a refresh - it may well still work, and a refresh will
+  // happen the moment it does not.
+  return !!t?.access_token && (!t.expiresAt || t.expiresAt - TIKTOK_EXPIRY_SKEW_MS > Date.now());
+}
+
 async function getTikTokToken(openId) {
   if (!openId) return null;
   const cached = tiktokTokens[openId];
-  if (cached?.access_token) return cached;
+  if (tiktokTokenFresh(cached)) return cached;
   try {
+    // The cache can hold an EXPIRED token, so falling through to Firestore here is not
+    // redundant: the stored copy may already have been refreshed by another process.
     const snap = await adminDb.collection(TIKTOK_TOKENS).doc(openId).get();
     if (!snap.exists) return null;
     const t = snap.data();
-    tiktokTokens[openId] = t;      // cache, so a burst of calls hits Firestore once
-    return t;
+    if (tiktokTokenFresh(t)) {
+      tiktokTokens[openId] = t;    // cache, so a burst of calls hits Firestore once
+      return t;
+    }
+    return await refreshTikTokToken(openId, t);
   } catch (e) {
     console.error('[tiktok] token lookup failed:', e.message);
     return null;
