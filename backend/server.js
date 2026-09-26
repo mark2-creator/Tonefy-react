@@ -955,7 +955,7 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
     // because this is one API call per subscriber on every load.
     const MONTHLY_USD = { 'pro-monthly': 6.99, 'pro-yearly': 69.99 / 12, 'creator-monthly': 14.99, 'creator-yearly': 149.99 / 12 };
     const paidDocs = usersSnap.docs.filter(d => ['pro', 'creator'].includes(d.data().plan));
-    let paying = 0, testing = 0, manual = 0, lapsed = 0, mrr = 0;
+    let paying = 0, testing = 0, manual = 0, lapsed = 0, lapsedAdmin = 0, mrr = 0;
     for (const d of paidDocs.slice(0, 100)) {
       const x = d.data();
       if (!x.subscriptionPurchaseToken) { manual += 1; continue; }
@@ -965,7 +965,16 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
         });
         const active = sub.subscriptionState === 'SUBSCRIPTION_STATE_ACTIVE'
           || sub.subscriptionState === 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD';
-        if (!active) { lapsed += 1; continue; }
+        if (!active) {
+          // Split, because an ADMIN's lapse is expected and a real subscriber's is not.
+          // subscriptionSweep skips admins on purpose - their Creator comes from being an
+          // admin, not from a purchase - so an admin sits here permanently and harmlessly.
+          // A non-admin sitting here means the sweep has not caught it yet, or has failed,
+          // and that is worth alarming about. Reported apart so the screen can tell the
+          // truth instead of assuming which kind it is looking at.
+          if (ADMIN_UIDS.includes(d.id)) lapsedAdmin += 1; else lapsed += 1;
+          continue;
+        }
         if (sub.testPurchase) { testing += 1; continue; }
         paying += 1;
         mrr += MONTHLY_USD[x.subscriptionBasePlanId] || 0;
@@ -981,9 +990,12 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
         mrrUsd: Math.round(mrr * 100) / 100,
         testing,
         manual,
-        // Still marked paid in Firestore but no longer active at Play - nothing revokes
-        // these today, so they are worth seeing rather than quietly counting as paid.
+        // Still marked paid in Firestore but no longer active at Play. subscriptionSweep
+        // and the RTDN handler DO revoke these now (they did not when this was written),
+        // so a NON-admin here is either inside the six-hour window or a genuine fault.
         lapsed,
+        // Expected and permanent: the sweep exempts admins by design.
+        lapsedAdmin,
       },
       users: {
         total: authUsers.length,
