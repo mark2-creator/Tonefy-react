@@ -3919,7 +3919,12 @@ async function publishToTikTok({
     //    goes live automatically with no further change.
     const direct = await initAndUpload('https://open.tiktokapis.com/v2/post/publish/video/init/', {
       post_info: {
-        title: title || 'Created with Tonefy AI',
+        // No fallback. An empty caption used to become "Created with Tonefy AI",
+        // which published OUR name in the user's own video description because they
+        // had not written one - not a decision this app gets to make on someone's
+        // behalf. `undefined` is dropped by JSON.stringify, so TikTok simply receives
+        // a post with no description, which it accepts.
+        title: title || undefined,
         privacy_level: privacyLevel,
         disable_comment: !!disableComment,
         disable_duet: !!disableDuet,
@@ -5741,7 +5746,12 @@ app.post('/tiktok/post-video', tiktokLimiter, verifyToken, async (req, res) => {
       },
       body: JSON.stringify({
         post_info: {
-          title: title || 'Created with Tonefy AI',
+          // No fallback. An empty caption used to become "Created with Tonefy AI",
+        // which published OUR name in the user's own video description because they
+        // had not written one - not a decision this app gets to make on someone's
+        // behalf. `undefined` is dropped by JSON.stringify, so TikTok simply receives
+        // a post with no description, which it accepts.
+        title: title || undefined,
           privacy_level: privacyLevel,
           disable_duet: false,
           disable_comment: false,
