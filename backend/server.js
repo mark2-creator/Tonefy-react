@@ -2692,6 +2692,65 @@ app.post("/api/extract-keywords", scriptLimiter, async (req, res) => {
   }
 });
 
+// Writes a social caption with hashtags, for the user to EDIT before posting.
+//
+// Hashtags are what decide whether a TikTok post is found at all, and asking someone to
+// invent five on the spot is the step where posting stalls. This proposes them; the sheet
+// shows the result in an editable field, so nothing is published that the user has not
+// read. That distinction is the whole design - a caption written silently at post time
+// would be words they never chose (which is exactly what the old branding fallback was).
+//
+// `context` is whatever the app knows about the video: the generated idea or script for a
+// generated one, or whatever the user has typed so far. With nothing to go on the model
+// invents a subject, so an empty context is refused rather than answered.
+app.post("/api/caption-suggest", scriptLimiter, async (req, res) => {
+  const { context, platform = "tiktok" } = req.body || {};
+  const text = String(context || "").trim();
+  if (text.length < 3) {
+    return res.status(400).json({ error: "Tell us a few words about the video first." });
+  }
+  // Per-platform, because the conventions genuinely differ: TikTok rewards a hook and
+  // several hashtags, LinkedIn punishes both.
+  const style = {
+    tiktok: "one or two punchy sentences with a hook, then 4-6 popular but relevant hashtags",
+    instagram: "one or two lively sentences, then 5-8 relevant hashtags",
+    youtube: "a clear one-sentence description, then 3-5 relevant hashtags",
+    facebook: "two friendly sentences, then 2-3 hashtags",
+    pinterest: "one descriptive sentence naming what is shown, then 3-5 hashtags",
+    linkedin: "two professional sentences, no more than 3 hashtags",
+  }[platform] || "one or two sentences, then 3-5 relevant hashtags";
+  try {
+    const cacheKey = `cap:${platform}:${text.slice(0, 120)}`;
+    const cached = getCached(cacheKey);
+    if (cached) return res.json({ caption: cached });
+    const raw = await callLLM({
+      system:
+        `You write captions for short social videos. Write ${style}. ` +
+        "Return ONLY the caption itself - no preamble, no quotation marks, no labels, " +
+        "no options to choose between. Write in the first person as the creator. " +
+        "Never invent facts that are not in the description you are given.",
+      user: text.slice(0, 1200),
+      // Generous on purpose: these are REASONING models and max_tokens is the combined
+      // budget for the reasoning and the answer, so a tight cap returns empty content.
+      // See the reasoning-model bug pattern in CLAUDE.md.
+      max_tokens: 400,
+      temperature: 0.8,
+    });
+    // Models wrap an answer in quotes or a "Caption:" label however firmly asked not to.
+    const caption = String(raw || "")
+      .replace(/^\s*(caption|description)\s*:\s*/i, "")
+      .replace(/^["'\u201c\u2018]|["'\u201d\u2019]\s*$/g, "")
+      .trim()
+      .slice(0, 2200);
+    if (!caption) return res.status(502).json({ error: "Could not write a caption. Try again." });
+    setCache(cacheKey, caption);
+    res.json({ caption });
+  } catch (e) {
+    console.error("caption-suggest:", e.message);
+    res.status(502).json({ error: "Could not write a caption. Try again." });
+  }
+});
+
 app.post("/api/search-pexels-videos", pexelsLimiter, async (req, res) => {
   const { query, keywords } = req.body;
   if (!query && !keywords) return res.status(400).json({ error: "Query required" });
@@ -3919,12 +3978,13 @@ async function publishToTikTok({
     //    goes live automatically with no further change.
     const direct = await initAndUpload('https://open.tiktokapis.com/v2/post/publish/video/init/', {
       post_info: {
-        // No fallback. An empty caption used to become "Created with Tonefy AI",
-        // which published OUR name in the user's own video description because they
-        // had not written one - not a decision this app gets to make on someone's
-        // behalf. `undefined` is dropped by JSON.stringify, so TikTok simply receives
-        // a post with no description, which it accepts.
-        title: title || undefined,
+        // Fallback kept at the owner's decision (Sep 27 2026), as a safety net for
+        // someone who forgot a description rather than as the usual case: the sheet now
+        // writes one with AI and shows it for editing before Post, so an empty caption
+        // reaching here means the user cleared it AND declined to write one. Verified
+        // separately that TikTok accepts a post with no title at all, so this is a
+        // choice rather than a requirement.
+        title: title || 'Created with Tonefy AI',
         privacy_level: privacyLevel,
         disable_comment: !!disableComment,
         disable_duet: !!disableDuet,
@@ -5746,12 +5806,13 @@ app.post('/tiktok/post-video', tiktokLimiter, verifyToken, async (req, res) => {
       },
       body: JSON.stringify({
         post_info: {
-          // No fallback. An empty caption used to become "Created with Tonefy AI",
-        // which published OUR name in the user's own video description because they
-        // had not written one - not a decision this app gets to make on someone's
-        // behalf. `undefined` is dropped by JSON.stringify, so TikTok simply receives
-        // a post with no description, which it accepts.
-        title: title || undefined,
+          // Fallback kept at the owner's decision (Sep 27 2026), as a safety net for
+        // someone who forgot a description rather than as the usual case: the sheet now
+        // writes one with AI and shows it for editing before Post, so an empty caption
+        // reaching here means the user cleared it AND declined to write one. Verified
+        // separately that TikTok accepts a post with no title at all, so this is a
+        // choice rather than a requirement.
+        title: title || 'Created with Tonefy AI',
           privacy_level: privacyLevel,
           disable_duet: false,
           disable_comment: false,
