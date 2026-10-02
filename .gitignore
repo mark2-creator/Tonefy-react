@@ -16,3 +16,4 @@ backend/public/auth/
 # Python bytecode - regenerated on every run
 __pycache__/
 *.pyc
+backend/cache/

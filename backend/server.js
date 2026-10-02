@@ -7,6 +7,7 @@ import fs from "fs";
 import path from "path";
 import { exec, execFile } from "child_process";
 import { createTextRenderer } from "./textRender.js";
+import { startAiScenes, aiSceneStatus, sweepAiSceneCache } from "./aiScenes.js";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 dotenv.config();
@@ -569,6 +570,9 @@ function releaseVideoSlot() {
 
 const videosDir = path.join(__dirname, "public", "videos");
 const audiosDir = path.join(__dirname, "public", "audios");
+// fal-generated scene clips, reused across retries. Not public, and not under
+// videosDir, whose sweep decides by owner plan - these have no owner record.
+const aiSceneCacheDir = path.join(__dirname, "cache", "aiscenes");
 const uploadsDir = path.join(__dirname, "uploads");
 // Resolves a stored URL (e.g. "/uploads/abc.jpg" or "/music/track.mp3") back
 // to its real local file path. "/uploads/..." files live directly under
@@ -2115,6 +2119,7 @@ setInterval(() => {
   cleanupOldFiles(videosDir);
   cleanupOldFiles(audiosDir);
   cleanupUploads();
+  sweepAiSceneCache(aiSceneCacheDir);
   creditResetSweep();
 }, 10 * 60 * 1000);
 
@@ -3131,8 +3136,21 @@ app.post("/api/search-pexels-segment", pexelsLimiter, async (req, res) => {
   }
 });
 
+// What the generation screens need to draw the AI-scenes option honestly:
+// whether it exists at all (no FAL_KEY -> enabled:false), how many one video
+// may use, and how many are left this cycle.
+app.get("/api/ai-scenes/status", async (req, res) => {
+  try {
+    const { plan } = await getUserPlanData(adminDb, req.user.uid);
+    res.json({ plan, ...(await aiSceneStatus(adminDb, req.user.uid, plan)) });
+  } catch (e) {
+    console.error("ai-scenes status error:", e.message);
+    res.status(500).json({ error: "Could not read AI scene allowance" });
+  }
+});
+
 app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
-  const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, transition = "fade", transitionSpec = null, musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0 } = req.body || {};
+  const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, transition = "fade", transitionSpec = null, musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0, aiScenes = 0 } = req.body || {};
   const userId = req.user?.uid;
 
   // No voiceId param here - this endpoint consumes audio that was already
@@ -3215,13 +3233,26 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
     const [scaleW, scaleH] = frameSize(allowed.tier.maxResolution, aspectRatio);
     const scaleFilter = `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase,crop=${scaleW}:${scaleH}`;
 
+    // AI scenes start here, all at once, and are awaited per segment below -
+    // so the wait is the slowest clip, not the sum. Hook first: the first
+    // `granted` segments are generated, the rest are Pexels as always. Any
+    // one that fails resolves null and that segment takes the Pexels path.
+    const ai = await startAiScenes({
+      db: adminDb, uid: userId, plan: allowed.plan, segments, segDurations, aspectRatio,
+      requested: aiScenes, cacheDir: aiSceneCacheDir, downloadToFile, llm: groqChat,
+    });
+    if (ai.granted) updateJob(jobId, { progress: 10, message: `Generating ${ai.granted} AI scene${ai.granted === 1 ? '' : 's'}...` });
+
     const clipPaths = [];
+    let aiUsed = 0;
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
-      updateJob(jobId, { progress: 10 + Math.round((i / segments.length) * 30), message: `Fetching clip ${i + 1}/${segments.length}...` });
+      if (i >= ai.granted) updateJob(jobId, { progress: 10 + Math.round((i / segments.length) * 30), message: `Fetching clip ${i + 1}/${segments.length}...` });
 
+      const aiFile = await ai.clips[i];
+      if (aiFile) aiUsed++;
       let videoUrl = null;
-      try {
+      if (!aiFile) try {
         const r = await fetch(`https://api.pexels.com/videos/search?query=${encodeURIComponent(seg.keywords || 'background')}&per_page=1&orientation=${aspectRatio === '9:16' ? 'portrait' : aspectRatio === '1:1' ? 'square' : 'landscape'}`,
           { headers: { Authorization: PEXELS_API_KEY } });
         const d = await r.json();
@@ -3229,7 +3260,10 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
         if (vid) videoUrl = pickBestMp4(vid);
       } catch (e) { console.error("segment search error:", e.message); }
 
-      const rawPath = path.join(videosDir, uniqueName("seg-raw", "mp4"));
+      // An AI clip is read straight from the cache and must survive this
+      // segment (a retry reuses it), so only a downloaded Pexels file is ours
+      // to delete after trimming.
+      const rawPath = aiFile || path.join(videosDir, uniqueName("seg-raw", "mp4"));
       const trimmedPath = path.join(videosDir, uniqueName("seg", "mp4"));
 
       if (videoUrl) {
@@ -3250,7 +3284,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
             resolve();
           });
         }).catch(() => {});
-        fs.unlink(rawPath, () => {});
+        if (!aiFile) fs.unlink(rawPath, () => {});
       }
 
       if (!fs.existsSync(trimmedPath)) {
@@ -3448,6 +3482,9 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
 // transition exec handled per-branch above
     }
     clipPaths.forEach(p => fs.unlink(p, () => {}));
+    // Settles the allowance: scenes that fell back to Pexels are refunded.
+    await ai.done;
+    if (ai.granted) console.log(`[ai-scenes] job ${jobId}: ${aiUsed}/${ai.granted} AI scenes used`);
 
     // 5. Overlay audio + captions + watermark
     updateJob(jobId, { progress: 60, message: "Adding voiceover & captions..." });
@@ -3514,7 +3551,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
         .then(secs => deductCredits(adminDb, userId2, secs))
         .catch(e => console.error('Credit deduction failed:', e.message));
     }
-    updateJob(jobId, { status: "done", progress: 100, message: "Video ready!", videoUrl: `/videos/${videoFilename2}`, audioUrl: audioPublicUrl });
+    updateJob(jobId, { status: "done", progress: 100, message: "Video ready!", videoUrl: `/videos/${videoFilename2}`, audioUrl: audioPublicUrl, aiScenesUsed: aiUsed, aiScenesRequested: ai.granted });
   } catch (err) {
     console.error("idea-to-video-v2 error:", err.message);
     updateJob(jobId, { status: "failed", message: err.message });
