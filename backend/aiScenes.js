@@ -132,6 +132,10 @@ export async function aiSceneStatus(db, uid, plan) {
   const d = snap.exists ? snap.data() : {};
   const used = d.aiScenesCycle === d.creditsResetAt ? (Number(d.aiScenesUsed) || 0) : 0;
   return {
+    // available = the feature exists on this server at all; enabled = this
+    // account may use it. The app hides the row for the first and offers an
+    // upgrade for the second - two different things to tell a user.
+    available: aiScenesConfigured(),
     enabled: aiScenesConfigured() && limits.perCycle > 0,
     perVideo: limits.perVideo,
     perCycle: limits.perCycle,
