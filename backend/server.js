@@ -3136,6 +3136,30 @@ app.post("/api/search-pexels-segment", pexelsLimiter, async (req, res) => {
   }
 });
 
+// Mails the owner the first time a day's AI spend cap is hit (aiScenes.js makes
+// sure it is once per cap per day, restarts included). A cap tripping is either
+// real demand outgrowing the number or a bug spending money - both want a human.
+async function alertAiSpendCap({ which, cap, spent, day }) {
+  const to = process.env.AI_SCENE_ALERT_EMAIL || process.env.EMAIL_USER;
+  if (!emailTransporter || !to) { console.warn('[ai-scenes] cap hit but no email configured'); return; }
+  const window = which === 'hourly' ? 'hour' : 'day';
+  await emailTransporter.sendMail({
+    from: `"Tonefy AI" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
+    to,
+    subject: `Tonefy: AI scenes ${which} spend cap reached ($${cap})`,
+    text: [
+      `The ${which} AI scene spend cap of $${cap} was reached on ${day} (UTC), with about $${spent.toFixed(2)} spent this ${window}.`,
+      '',
+      `Until the ${window} rolls over, new AI scenes are not generated: those scenes use Pexels stock footage instead and are refunded to each user's allowance, so every video still finishes.`,
+      '',
+      'If this is real demand, raise AI_SCENE_DAILY_USD_CAP / AI_SCENE_HOURLY_USD_CAP in backend/.env and restart.',
+      'If it is not, check `pm2 logs tonefy-backend | grep ai-scenes` and the aiSpend collection in Firestore.',
+      'Either way, check the fal.ai balance.',
+    ].join('\n'),
+  });
+  console.log(`[ai-scenes] ${which} cap alert sent`);
+}
+
 // What the generation screens need to draw the AI-scenes option honestly:
 // whether it exists at all (no FAL_KEY -> enabled:false), how many one video
 // may use, and how many are left this cycle.
@@ -3240,6 +3264,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
     const ai = await startAiScenes({
       db: adminDb, uid: userId, plan: allowed.plan, segments, segDurations, aspectRatio,
       requested: aiScenes, cacheDir: aiSceneCacheDir, downloadToFile, llm: groqChat,
+      alert: alertAiSpendCap,
     });
     if (ai.granted) updateJob(jobId, { progress: 10, message: `Generating ${ai.granted} AI scene${ai.granted === 1 ? '' : 's'}...` });
 

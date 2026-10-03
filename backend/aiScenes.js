@@ -22,6 +22,7 @@ import fs from "fs";
 import path from "path";
 import { fal } from "@fal-ai/client";
 import { FieldValue } from "firebase-admin/firestore";
+import { isAdminUid } from "./tiers.js";
 
 // Read lazily, like tiers.js's adminUids(): ES imports evaluate before
 // server.js's dotenv call has populated process.env.
@@ -80,6 +81,20 @@ export const AI_SCENE_PLANS = {
   creator: { perCycle: 40, perVideo: 4 },
 };
 
+// A paid plan with no purchase behind it - set by hand for a reviewer or a test
+// account. Every one of those is real fal money for no revenue, so it gets a
+// taste rather than the plan's full allowance. Not zero: a reviewer on Creator
+// who finds the option locked would read it as broken. "Paid" means
+// subscriptionPurchaseToken, which only verify-purchase writes - the same test
+// the admin screen uses to label a plan 'purchase' vs 'manual'. Admins exempt.
+const UNPURCHASED_LIMITS = { perCycle: 3, perVideo: 1 };
+
+function limitsFor(uid, plan, userDoc) {
+  const base = AI_SCENE_PLANS[plan] || AI_SCENE_PLANS.free;
+  if (base.perCycle > 0 && !isAdminUid(uid) && !userDoc?.subscriptionPurchaseToken) return UNPURCHASED_LIMITS;
+  return base;
+}
+
 // Clip length. A segment is often 10-15s of narration; generating all of it
 // would double the cost for footage the viewer has stopped studying, so a
 // clip is capped and the existing segment pipeline loops it past the end,
@@ -102,22 +117,61 @@ function ensureFal() {
   if (key && falConfiguredWith !== key) { fal.config({ credentials: key }); falConfiguredWith = key; }
 }
 
-// ---- server-side daily spend cap -------------------------------------------
-// fal's dashboard limit is the real ceiling. This one exists so a bug (a retry
-// loop, a client hammering the endpoint) is stopped by THIS process within the
-// day, with a log line naming it, rather than discovered on an invoice.
-// In-memory: a restart resets it, which errs towards spending at most one
-// extra day's cap - acceptable for a guard behind a guard.
-let spend = { day: "", usd: 0 };
-function today() { return new Date().toISOString().slice(0, 10); }
-function capUsd() { return Number(env("AI_SCENE_DAILY_USD_CAP", "5")) || 0; }
-function reserveSpend(usd) {
-  if (spend.day !== today()) spend = { day: today(), usd: 0 };
-  if (spend.usd + usd > capUsd()) return false;
-  spend.usd += usd;
-  return true;
+// ---- server-wide spend caps -------------------------------------------------
+// The fal balance (no auto top-up) is the absolute ceiling. These exist so a bug -
+// a retry loop, a broken allowance, a client hammering the endpoint - is stopped
+// by THIS server within the hour, and the owner hears about it, rather than the
+// balance quietly emptying.
+//
+// In Firestore, not memory: the bugs most likely to overspend are also the ones
+// that crash the process, and pm2 restarts it - an in-memory counter would reset
+// to zero on every lap of a crash loop. aiSpend/{UTC day} holds the day's total
+// and a per-hour map. No security rule mentions aiSpend, so it is Admin-only.
+//
+// Reserved BEFORE calling fal, in a transaction, so parallel generations cannot
+// both slip under the cap. Fails CLOSED: if the spend record cannot be read, no
+// AI scene is generated - the user gets Pexels, which costs nothing.
+const dayCap = () => Number(env("AI_SCENE_DAILY_USD_CAP", "3")) || 0;
+const hourCap = () => Number(env("AI_SCENE_HOURLY_USD_CAP", "1")) || 0;
+
+async function reserveSpend(db, usd) {
+  const now = new Date();
+  const day = now.toISOString().slice(0, 10);
+  const hour = String(now.getUTCHours()).padStart(2, "0");
+  const ref = db.collection("aiSpend").doc(day);
+  const r = await db.runTransaction(async (tx) => {
+    const d = (await tx.get(ref)).data() || {};
+    const dayUsd = Number(d.usd) || 0;
+    const hourUsd = Number(d.hours?.[hour]) || 0;
+    if (dayUsd + usd > dayCap()) return { ok: false, which: "daily", cap: dayCap(), spent: dayUsd };
+    if (hourUsd + usd > hourCap()) return { ok: false, which: "hourly", cap: hourCap(), spent: hourUsd };
+    tx.set(ref, { usd: dayUsd + usd, hours: { [hour]: hourUsd + usd }, updatedAt: now.toISOString() }, { merge: true });
+    return { ok: true };
+  });
+  return { ...r, day, hour, ref };
 }
-function releaseSpend(usd) { if (spend.day === today()) spend.usd = Math.max(0, spend.usd - usd); }
+
+async function releaseSpend(resv, usd) {
+  await resv.ref.set({
+    usd: FieldValue.increment(-usd),
+    hours: { [resv.hour]: FieldValue.increment(-usd) },
+  }, { merge: true });
+}
+
+// One email per cap per day, however many requests hit it - the flag lives on the
+// same day doc, so a restart does not resend it either.
+async function alertCapOnce(db, resv, alert) {
+  if (!alert) return;
+  try {
+    const first = await db.runTransaction(async (tx) => {
+      const d = (await tx.get(resv.ref)).data() || {};
+      if (d.alerted?.[resv.which]) return false;
+      tx.set(resv.ref, { alerted: { [resv.which]: new Date().toISOString() } }, { merge: true });
+      return true;
+    });
+    if (first) await alert(resv);
+  } catch (e) { console.warn("[ai-scenes] cap alert failed:", e.message); }
+}
 
 // ---- per-user allowance ----------------------------------------------------
 // Tied to the CREDIT cycle by remembering which creditsResetAt the count
@@ -127,9 +181,9 @@ function releaseSpend(usd) { if (spend.day === today()) spend.usd = Math.max(0, 
 // That keeps this out of all four of those paths instead of adding to each.
 
 export async function aiSceneStatus(db, uid, plan) {
-  const limits = AI_SCENE_PLANS[plan] || AI_SCENE_PLANS.free;
   const snap = await db.collection("users").doc(uid).get();
   const d = snap.exists ? snap.data() : {};
+  const limits = limitsFor(uid, plan, d);
   const used = d.aiScenesCycle === d.creditsResetAt ? (Number(d.aiScenesUsed) || 0) : 0;
   return {
     // available = the feature exists on this server at all; enabled = this
@@ -145,11 +199,11 @@ export async function aiSceneStatus(db, uid, plan) {
 
 /** Atomically takes up to `want` scenes. Returns how many were granted. */
 async function reserveScenes(db, uid, plan, want) {
-  const limits = AI_SCENE_PLANS[plan] || AI_SCENE_PLANS.free;
   const ref = db.collection("users").doc(uid);
   return db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
     const d = snap.exists ? snap.data() : {};
+    const limits = limitsFor(uid, plan, d);
     const sameCycle = d.aiScenesCycle === d.creditsResetAt;
     const used = sameCycle ? (Number(d.aiScenesUsed) || 0) : 0;
     const grant = Math.max(0, Math.min(want, limits.perVideo, limits.perCycle - used));
@@ -209,7 +263,7 @@ export function sweepAiSceneCache(cacheDir) {
 }
 
 // ---- generation ------------------------------------------------------------
-async function generateOne({ model, prompt, aspectRatio, secs, cacheDir, downloadToFile, tag }) {
+async function generateOne({ db, model, prompt, aspectRatio, secs, cacheDir, downloadToFile, tag, alert }) {
   const spec = MODELS[model];
   const file = path.join(cacheDir, `${cacheKey(model, prompt, aspectRatio, secs)}.mp4`);
   if (fs.existsSync(file) && fs.statSync(file).size > 0) {
@@ -218,8 +272,12 @@ async function generateOne({ model, prompt, aspectRatio, secs, cacheDir, downloa
   }
 
   const usd = spec.usd(secs);
-  if (!reserveSpend(usd)) {
-    console.warn(`[ai-scenes] daily cap $${capUsd()} reached - ${tag} uses Pexels`);
+  let resv;
+  try { resv = await reserveSpend(db, usd); }
+  catch (e) { console.warn(`[ai-scenes] spend record unreadable, ${tag} uses Pexels:`, e.message); return null; }
+  if (!resv.ok) {
+    console.warn(`[ai-scenes] ${resv.which} cap $${resv.cap} reached ($${resv.spent.toFixed(2)} spent) - ${tag} uses Pexels`);
+    await alertCapOnce(db, resv, alert);
     return null;
   }
 
@@ -247,7 +305,7 @@ async function generateOne({ model, prompt, aspectRatio, secs, cacheDir, downloa
       fal.queue.cancel(model, { requestId }).catch(() => {});
     }
     // A job fal never ran costs nothing; anything that started may have.
-    if (!requestId) releaseSpend(usd);
+    if (!requestId) await releaseSpend(resv, usd).catch(() => {});
     const why = ctrl.signal.aborted ? `timed out after ${GEN_TIMEOUT_MS / 1000}s` : (e?.body?.detail ? JSON.stringify(e.body.detail).slice(0, 300) : e.message);
     console.warn(`[ai-scenes] ${tag} failed, falling back to Pexels: ${why}`);
     return null;
@@ -264,7 +322,7 @@ async function generateOne({ model, prompt, aspectRatio, secs, cacheDir, downloa
  * Generations run concurrently and the caller awaits each in turn, so the
  * wait is the slowest clip rather than the sum of them.
  */
-export async function startAiScenes({ db, uid, plan, segments, segDurations, aspectRatio, requested, cacheDir, downloadToFile, llm }) {
+export async function startAiScenes({ db, uid, plan, segments, segDurations, aspectRatio, requested, cacheDir, downloadToFile, llm, alert }) {
   const none = segments.map(() => Promise.resolve(null));
   const want = Math.min(Math.max(0, Math.floor(Number(requested) || 0)), segments.length);
   if (!want || !aiScenesConfigured() || !(AI_SCENE_PLANS[plan]?.perCycle > 0)) {
@@ -284,7 +342,7 @@ export async function startAiScenes({ db, uid, plan, segments, segDurations, asp
     if (i >= granted) return Promise.resolve(null);
     const secs = Math.min(MAX_SECS, Math.max(MIN_SECS, Math.ceil(segDurations[i] || MIN_SECS)));
     return shotPrompt(llm, seg)
-      .then(prompt => generateOne({ model, prompt, aspectRatio: ar, secs, cacheDir, downloadToFile, tag: `${uid.slice(0, 6)} scene ${i + 1}` }))
+      .then(prompt => generateOne({ db, model, prompt, aspectRatio: ar, secs, cacheDir, downloadToFile, alert, tag: `${uid.slice(0, 6)} scene ${i + 1}` }))
       .catch(() => null);
   });
 
