@@ -5112,10 +5112,52 @@ app.get('/api/pinterest/status', verifyToken, async (req, res) => {
   } catch (e) { console.error('[pinterest] status failed:', e.message); res.status(500).json({ error: 'Could not read your Pinterest connection.' }); }
 });
 
+// The boards of every connected Pinterest account, so the app can let the user choose
+// where a Pin goes. Per ACCOUNT, because a board id belongs to one account's token -
+// a second account cannot post to the first one's board. Capped at 250 per account:
+// a picker past that is a search problem, not a list.
+app.get('/api/pinterest/boards', verifyToken, async (req, res) => {
+  try {
+    const doc = await adminDb.collection('connectedAccounts').doc(req.user.uid).get();
+    const list = accountsArray(doc.exists ? doc.data() : {}, 'pinterest');
+    const out = [];
+    for (const a of list) {
+      const acc = await getPinAccount(req.user.uid, a.accountId);
+      if (!acc?.token) { out.push({ accountId: a.accountId, name: a.label, boards: [], error: 'Not connected' }); continue; }
+      const auth = { Authorization: 'Bearer ' + await pinValidToken(acc, req.user.uid) };
+      const boards = [];
+      let bookmark = null;
+      do {
+        const url = `${PIN_API}/boards?page_size=100${bookmark ? '&bookmark=' + encodeURIComponent(bookmark) : ''}`;
+        const j = await (await fetch(url, { headers: auth })).json();
+        for (const b of j.items || []) boards.push({ id: b.id, name: b.name, privacy: b.privacy });
+        bookmark = j.bookmark || null;
+      } while (bookmark && boards.length < 250);
+      out.push({ accountId: a.accountId, name: a.label, boards });
+    }
+    res.json({ accounts: out });
+  } catch (e) {
+    console.error('[pinterest] boards failed:', e.message);
+    res.status(500).json({ error: 'Could not load your Pinterest boards.' });
+  }
+});
+
+// { boards: { <accountId>: <boardId> } } from the client, reduced to what can be one.
+// Board ids are numeric strings; anything else is dropped rather than sent to Pinterest.
+function cleanPinterestOptions(raw) {
+  const boards = {};
+  if (raw && typeof raw.boards === 'object') {
+    for (const [acc, id] of Object.entries(raw.boards)) {
+      if (typeof acc === 'string' && /^\d{1,32}$/.test(String(id))) boards[acc] = String(id);
+    }
+  }
+  return { boards };
+}
+
 // UNTESTED - see the block header. Video pin: register media, upload the bytes to the
 // returned URL with Pinterest's own form fields, poll until processed, then create the pin
 // with a cover frame (video pins require cover_image_url).
-async function publishToPinterest({ account: accountId, uid, videoUrl, caption }) {
+async function publishToPinterest({ account: accountId, uid, videoUrl, caption, options }) {
   const acc = await getPinAccount(uid, accountId);
   if (!acc?.token) return { ok: false, error: 'Pinterest is not connected.' };
   let coverPath = null;
@@ -5123,9 +5165,22 @@ async function publishToPinterest({ account: accountId, uid, videoUrl, caption }
     if (!isOwnMediaUrl(videoUrl)) return { ok: false, error: 'The video must be on Tonefy to post it.' };
     const token = await pinValidToken(acc, uid);
     const auth = { Authorization: 'Bearer ' + token };
-    const boards = await (await fetch(`${PIN_API}/boards?page_size=1`, { headers: auth })).json();
-    const board = boards.items?.[0];
-    if (!board) return { ok: false, error: 'Create a board on Pinterest first, then try again.' };
+    // The user's chosen board when there is one (the app's board picker, Oct 3 2026), else
+    // the first board - which is all this ever did before, and what an older client or a
+    // post queued before the picker existed still gets. A chosen board is read back with
+    // THIS account's token, which proves it exists and is this account's; if it is gone we
+    // refuse rather than quietly posting somewhere the user did not pick.
+    let board;
+    const chosen = options?.boards?.[accountId];
+    if (chosen) {
+      const br = await fetch(`${PIN_API}/boards/${encodeURIComponent(chosen)}`, { headers: auth });
+      if (!br.ok) return { ok: false, error: 'The Pinterest board you chose is no longer available. Pick another board and try again.' };
+      board = await br.json();
+    } else {
+      const boards = await (await fetch(`${PIN_API}/boards?page_size=1`, { headers: auth })).json();
+      board = boards.items?.[0];
+    }
+    if (!board?.id) return { ok: false, error: 'Create a board on Pinterest first, then try again.' };
     // Pinterest refuses a video shorter than 4 seconds, and it refuses it LATE - the
     // upload is accepted and processing reports a bare "failed" with no reason, which
     // surfaced here as "Pinterest could not process the video" after a full upload. Found
@@ -5534,6 +5589,8 @@ app.get('/api/platforms', (req, res) => {
 app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
   const uid = req.user.uid;
   const { videoUrl, caption = '', platforms = [], tiktok: tiktokOptions } = req.body || {};
+  const pinterestOptions = cleanPinterestOptions(req.body?.pinterest);
+  const optionsFor = (id) => id === 'tiktok' ? tiktokOptions : id === 'pinterest' ? pinterestOptions : undefined;
   if (!videoUrl) return res.status(400).json({ error: 'videoUrl required' });
   if (!Array.isArray(platforms) || platforms.length === 0) {
     return res.status(400).json({ error: 'Choose at least one platform.' });
@@ -5577,14 +5634,14 @@ app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
         ? all.filter(a => chosenAccounts[id].includes(a)) : all;
       if (!want.length) { results.push({ platform: id, ok: false, error: pub.notConnected }); continue; }
       for (const accId of want) {
-        const r = await pub.publish({ account: accId, uid, videoUrl, caption, options: id === 'tiktok' ? tiktokOptions : undefined });
+        const r = await pub.publish({ account: accId, uid, videoUrl, caption, options: optionsFor(id) });
         results.push({ platform: id, accountId: accId, ...r });
       }
     } else {
       // Single-account platform: unchanged path.
       const account = pub.accountFrom(accountDoc, uid);
       if (!account) { results.push({ platform: id, ok: false, error: pub.notConnected }); continue; }
-      const r = await pub.publish({ account, uid, videoUrl, caption, options: id === 'tiktok' ? tiktokOptions : undefined });
+      const r = await pub.publish({ account, uid, videoUrl, caption, options: optionsFor(id) });
       results.push({ platform: id, ...r });
     }
   }
@@ -5669,7 +5726,9 @@ async function scheduledPostSweep() {
           ? all.filter(a => p.accounts[id].includes(a)) : all;
         if (!want.length) { results.push({ id, ok: false, error: pub.notConnected }); continue; }
         for (const accId of want) {
-          const r = await pub.publish({ account: accId, uid: p.userId, videoUrl: p.videoUrl, caption: p.caption });
+          // A queued post carries its board choice (written by the app's Save to queue).
+          const r = await pub.publish({ account: accId, uid: p.userId, videoUrl: p.videoUrl, caption: p.caption,
+            options: id === 'pinterest' ? cleanPinterestOptions(p.pinterest) : undefined });
           results.push({ id, ...r });
         }
       } else {
