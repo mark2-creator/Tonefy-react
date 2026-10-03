@@ -89,7 +89,14 @@ export const AI_SCENE_PLANS = {
 // the admin screen uses to label a plan 'purchase' vs 'manual'. Admins exempt.
 const UNPURCHASED_LIMITS = { perCycle: 3, perVideo: 1 };
 
+// The owner tests with this, so it is not rationed at all (owner, Oct 3 2026): no
+// monthly allowance and no server-wide caps. perVideo still has to be a number -
+// the app draws one chip per scene - and 6 covers every segment extract-segments
+// produces (3-5). The only ceiling left on an admin is the fal balance itself.
+const ADMIN_LIMITS = { perCycle: 1e9, perVideo: 6, unlimited: true };
+
 function limitsFor(uid, plan, userDoc) {
+  if (isAdminUid(uid)) return ADMIN_LIMITS;
   const base = AI_SCENE_PLANS[plan] || AI_SCENE_PLANS.free;
   if (base.perCycle > 0 && !isAdminUid(uid) && !userDoc?.subscriptionPurchaseToken) return UNPURCHASED_LIMITS;
   return base;
@@ -134,11 +141,17 @@ function ensureFal() {
 const dayCap = () => Number(env("AI_SCENE_DAILY_USD_CAP", "3")) || 0;
 const hourCap = () => Number(env("AI_SCENE_HOURLY_USD_CAP", "1")) || 0;
 
-async function reserveSpend(db, usd) {
+async function reserveSpend(db, usd, exempt = false) {
   const now = new Date();
   const day = now.toISOString().slice(0, 10);
   const hour = String(now.getUTCHours()).padStart(2, "0");
   const ref = db.collection("aiSpend").doc(day);
+  if (exempt) {
+    // Admin testing: recorded, never refused, and kept OUT of usd/hours so it
+    // cannot use up the budget the caps hold for paying users.
+    await ref.set({ adminUsd: FieldValue.increment(usd), updatedAt: now.toISOString() }, { merge: true });
+    return { ok: true, day, hour, ref, exempt: true };
+  }
   const r = await db.runTransaction(async (tx) => {
     const d = (await tx.get(ref)).data() || {};
     const dayUsd = Number(d.usd) || 0;
@@ -152,6 +165,7 @@ async function reserveSpend(db, usd) {
 }
 
 async function releaseSpend(resv, usd) {
+  if (resv.exempt) { await resv.ref.set({ adminUsd: FieldValue.increment(-usd) }, { merge: true }); return; }
   await resv.ref.set({
     usd: FieldValue.increment(-usd),
     hours: { [resv.hour]: FieldValue.increment(-usd) },
@@ -186,6 +200,7 @@ export async function aiSceneStatus(db, uid, plan) {
   const limits = limitsFor(uid, plan, d);
   const used = d.aiScenesCycle === d.creditsResetAt ? (Number(d.aiScenesUsed) || 0) : 0;
   return {
+    unlimited: !!limits.unlimited,
     // available = the feature exists on this server at all; enabled = this
     // account may use it. The app hides the row for the first and offers an
     // upgrade for the second - two different things to tell a user.
@@ -263,7 +278,7 @@ export function sweepAiSceneCache(cacheDir) {
 }
 
 // ---- generation ------------------------------------------------------------
-async function generateOne({ db, model, prompt, aspectRatio, secs, cacheDir, downloadToFile, tag, alert }) {
+async function generateOne({ db, model, prompt, aspectRatio, secs, cacheDir, downloadToFile, tag, alert, exempt }) {
   const spec = MODELS[model];
   const file = path.join(cacheDir, `${cacheKey(model, prompt, aspectRatio, secs)}.mp4`);
   if (fs.existsSync(file) && fs.statSync(file).size > 0) {
@@ -273,7 +288,7 @@ async function generateOne({ db, model, prompt, aspectRatio, secs, cacheDir, dow
 
   const usd = spec.usd(secs);
   let resv;
-  try { resv = await reserveSpend(db, usd); }
+  try { resv = await reserveSpend(db, usd, exempt); }
   catch (e) { console.warn(`[ai-scenes] spend record unreadable, ${tag} uses Pexels:`, e.message); return null; }
   if (!resv.ok) {
     console.warn(`[ai-scenes] ${resv.which} cap $${resv.cap} reached ($${resv.spent.toFixed(2)} spent) - ${tag} uses Pexels`);
@@ -342,7 +357,7 @@ export async function startAiScenes({ db, uid, plan, segments, segDurations, asp
     if (i >= granted) return Promise.resolve(null);
     const secs = Math.min(MAX_SECS, Math.max(MIN_SECS, Math.ceil(segDurations[i] || MIN_SECS)));
     return shotPrompt(llm, seg)
-      .then(prompt => generateOne({ db, model, prompt, aspectRatio: ar, secs, cacheDir, downloadToFile, alert, tag: `${uid.slice(0, 6)} scene ${i + 1}` }))
+      .then(prompt => generateOne({ db, model, prompt, aspectRatio: ar, secs, cacheDir, downloadToFile, alert, exempt: isAdminUid(uid), tag: `${uid.slice(0, 6)} scene ${i + 1}` }))
       .catch(() => null);
   });
 
