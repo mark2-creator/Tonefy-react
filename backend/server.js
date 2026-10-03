@@ -888,6 +888,12 @@ function requireAdmin(req, res, next) {
 // everyone including the admin, which is how this was caught. It failed closed, which is
 // the right direction to fail, but an admin endpoint should never be one edit away from
 // failing open.
+// An account created by Google's own pre-launch report robot (Firebase Test Lab), not a
+// person. One appears per uploaded build - see CLAUDE.md.
+function isTestDeviceUser(u) {
+  return /@cloudtestlabaccounts\.com$/i.test(u?.email || '');
+}
+
 app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (req, res) => {
   try {
     const now = Date.now();
@@ -905,6 +911,12 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
       authUsers.push(...page.users);
       pageToken = page.pageToken;
     } while (pageToken);
+    // Google's pre-launch report signs in on test phones with a fresh
+    // @cloudtestlabaccounts.com account for every uploaded build. Left in, each build
+    // adds a fake "new user" to every number on this screen. Counted, then excluded.
+    const testDeviceIds = new Set(authUsers.filter(isTestDeviceUser).map(u => u.uid));
+    const testDevices = testDeviceIds.size;
+    for (let i = authUsers.length - 1; i >= 0; i--) if (isTestDeviceUser(authUsers[i])) authUsers.splice(i, 1);
 
     const signups7 = authUsers.filter(u => Date.parse(u.metadata.creationTime) > since7).length;
     const signups30 = authUsers.filter(u => Date.parse(u.metadata.creationTime) > since30).length;
@@ -916,6 +928,8 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
     const countries = {};
     const docIds = new Set();
     usersSnap.forEach(d => {
+      // The robot gets a profile document too; it is neither a plan holder nor an orphan.
+      if (testDeviceIds.has(d.id)) return;
       const v = d.data();
       docIds.add(d.id);
       const plan = v.plan || "free";
@@ -932,7 +946,7 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
     plans.free += noDoc;
     // And a document whose account is gone is not a person. Worth surfacing rather than
     // quietly inflating a plan bucket.
-    const orphanDocs = usersSnap.docs.filter(d => !authIds.has(d.id)).length;
+    const orphanDocs = usersSnap.docs.filter(d => !authIds.has(d.id) && !testDeviceIds.has(d.id)).length;
 
     const videosSnap = await adminDb.collection("userVideos").get();
     let bytes = 0, videos7 = 0, videos30 = 0;
@@ -989,6 +1003,7 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
     }
 
     res.json({
+      testDevices,
       revenue: {
         paying,
         mrrUsd: Math.round(mrr * 100) / 100,
@@ -1074,6 +1089,7 @@ app.get("/api/admin/users", verifyToken, requireAdmin, mediaProcLimiter, async (
         uid: u.uid,
         email: u.email || null,
         name: u.displayName || null,
+        testDevice: isTestDeviceUser(u),
         verified: !!u.emailVerified,
         disabled: !!u.disabled,
         created: u.metadata.creationTime || null,
