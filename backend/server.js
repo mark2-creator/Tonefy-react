@@ -5161,8 +5161,11 @@ async function publishToPinterest({ account: accountId, uid, videoUrl, caption }
     const coverUrl = `https://api.fitlifesolutions.site/videos/${coverName}`;
     const pinBody = {
       board_id: board.id,
-      title: (caption || 'Tonefy video').slice(0, 100),
-      description: caption || '',
+      // No fallback title: an empty caption used to publish OUR words, "Tonefy video", on
+      // the user's own pin (Oct 3 2026). Both fields are optional to Pinterest, and
+      // JSON.stringify drops undefined, so an empty caption sends neither.
+      title: caption ? caption.slice(0, 100) : undefined,
+      description: caption || undefined,
       media_source: { source_type: 'video_id', media_id: reg.media_id, cover_image_url: coverUrl },
     };
     const pin = await (await fetch(`${PIN_API}/pins`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(pinBody) })).json();
@@ -5327,7 +5330,7 @@ async function publishToLinkedIn({ account: memberId, uid, videoUrl, caption }) 
         commentary: caption || '',
         visibility: 'PUBLIC',
         distribution: { feedDistribution: 'MAIN_FEED', targetEntities: [], thirdPartyDistributionChannels: [] },
-        content: { media: { id: value.video, title: (caption || 'Tonefy video').slice(0, 100) } },
+        content: { media: { id: value.video, ...(caption ? { title: caption.slice(0, 100) } : {}) } },  // never our words as their title
         lifecycleState: 'PUBLISHED',
         isReshareDisabledByAuthor: false,
       }),
