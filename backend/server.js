@@ -2149,6 +2149,17 @@ function buildCaptionFilter(script, audioDuration) {
   return filters.join(',');
 }
 function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestamps = null, captionMeta = null, videoWidth = 720, videoHeight = 1280) {
+  // The ASS canvas. Every size in this file - font sizes, outline, shadow, margins - is
+  // in pixels DESIGNED for a 720-wide portrait frame. Item 14 (Aug 11 2026) made the
+  // canvas the real output size to stop libass stretching it non-uniformly, which was
+  // right about the SHAPE but wrong about the SCALE: on a 1080x1920 export those same
+  // numbers became 2/3 size, so every Pro/Creator caption burned in at 2/3 of its design
+  // (measured Oct 3 2026: 34% of frame width vs 50% at 720p). Keep the real aspect ratio,
+  // at the 720-short-edge scale the numbers were written for; libass then scales the
+  // canvas up uniformly. 720x1280 is unchanged, so free-tier output is identical.
+  const shortEdge = Math.min(Number(videoWidth) || 720, Number(videoHeight) || 1280);
+  const playResX = Math.round((Number(videoWidth) || 720) * 720 / shortEdge);
+  const playResY = Math.round((Number(videoHeight) || 1280) * 720 / shortEdge);
   const words = script.replace(/[\n\r]+/g, ' ').trim().split(/\s+/).filter(Boolean);
   if (words.length === 0) return false;
 
@@ -2311,8 +2322,8 @@ function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestam
   // source that wasn't 720x1280 to begin with.
   const header = `[Script Info]
 ScriptType: v4.00+
-PlayResX: ${Math.round(videoWidth) || 720}
-PlayResY: ${Math.round(videoHeight) || 1280}
+PlayResX: ${playResX}
+PlayResY: ${playResY}
 Collisions: Normal
 WrapStyle: 1
 
