@@ -5142,6 +5142,56 @@ app.get('/api/pinterest/boards', verifyToken, async (req, res) => {
   }
 });
 
+// Create a board from inside the app (Oct 4 2026). A new Pinterest user often has NO
+// boards, and "go and make one on Pinterest, then come back" was a dead end for them.
+// boards:write is already in PIN_SCOPES, so this needs no new grant.
+app.post('/api/pinterest/boards', verifyToken, async (req, res) => {
+  const accountId = String(req.body?.accountId || '');
+  const name = String(req.body?.name || '').trim().slice(0, 50);
+  // PUBLIC only: creating a SECRET board needs boards:write_secret, which the app does not
+  // request - Pinterest answers "not permitted" (tested Oct 4 2026). Adding the scope would make
+  // every user reconnect; not worth it for this. Posting to an existing secret board still works.
+  const privacy = 'PUBLIC';
+  if (!name) return res.status(400).json({ error: 'Give the board a name.' });
+  try {
+    const acc = await getPinAccount(req.user.uid, accountId);
+    if (!acc?.token) return res.status(404).json({ error: 'That Pinterest account is not connected.' });
+    const auth = { Authorization: 'Bearer ' + await pinValidToken(acc, req.user.uid), 'Content-Type': 'application/json' };
+    const r = await fetch(`${PIN_API}/boards`, { method: 'POST', headers: auth, body: JSON.stringify({ name, privacy }) });
+    const b = await r.json();
+    if (!r.ok || !b.id) return res.status(r.status === 409 ? 409 : 400).json({ error: b.message || 'Pinterest would not create that board.' });
+    res.json({ id: b.id, name: b.name, privacy: b.privacy });
+  } catch (e) {
+    console.error('[pinterest] create board failed:', e.message);
+    res.status(500).json({ error: 'Could not create the board. Try again.' });
+  }
+});
+
+// Five candidate cover frames for a video pin. Made here rather than on the phone: the
+// server already has the file, and decoding a remote video on a budget Android phone is
+// slow and unreliable. Small JPEGs in /videos - the 72h sweep removes them (no owner record).
+app.get('/api/pinterest/cover-frames', verifyToken, async (req, res) => {
+  const videoUrl = String(req.query.videoUrl || '');
+  try {
+    if (!isOwnMediaUrl(videoUrl)) return res.status(400).json({ error: 'The video must be on Tonefy.' });
+    const src = path.join(videosDir, path.basename(new URL(videoUrl).pathname));
+    if (!fs.existsSync(src)) return res.status(404).json({ error: 'Video not found.' });
+    const dur = await probeDurationSeconds(src).catch(() => 0);
+    if (!dur) return res.status(400).json({ error: 'Could not read the video.' });
+    const frames = [];
+    for (const f of [0.05, 0.25, 0.5, 0.75, 0.95]) {
+      const seconds = Math.round(dur * f * 10) / 10;
+      const name = uniqueName('pincoverpick', 'jpg');
+      await run('ffmpeg', ['-y', '-ss', String(seconds), '-i', src, '-frames:v', '1', '-vf', 'scale=270:-2', '-q:v', '5', path.join(videosDir, name)], { timeout: 30000 });
+      frames.push({ seconds, url: `https://api.fitlifesolutions.site/videos/${name}` });
+    }
+    res.json({ duration: dur, frames });
+  } catch (e) {
+    console.error('[pinterest] cover frames failed:', e.message);
+    res.status(500).json({ error: 'Could not make cover options.' });
+  }
+});
+
 // { boards: { <accountId>: <boardId> } } from the client, reduced to what can be one.
 // Board ids are numeric strings; anything else is dropped rather than sent to Pinterest.
 function cleanPinterestOptions(raw) {
@@ -5151,7 +5201,12 @@ function cleanPinterestOptions(raw) {
       if (typeof acc === 'string' && /^\d{1,32}$/.test(String(id))) boards[acc] = String(id);
     }
   }
-  return { boards };
+  // Destination link (Oct 4 2026): on Pinterest the link is what sends people to the
+  // creator's site or shop. http(s) only; Pinterest itself refuses domains it calls spam.
+  let link;
+  try { const u = new URL(String(raw?.link || '')); if (/^https?:$/.test(u.protocol) && u.href.length <= 2048) link = u.href; } catch { /* no link */ }
+  const coverSeconds = Number.isFinite(Number(raw?.coverSeconds)) && Number(raw.coverSeconds) >= 0 ? Number(raw.coverSeconds) : undefined;
+  return { boards, link, coverSeconds };
 }
 
 // UNTESTED - see the block header. Video pin: register media, upload the bytes to the
@@ -5212,7 +5267,9 @@ async function publishToPinterest({ account: accountId, uid, videoUrl, caption, 
     const coverName = uniqueName('pincover', 'jpg');
     coverPath = path.join(videosDir, coverName);
     const srcPath = path.join(videosDir, path.basename(new URL(videoUrl).pathname));
-    try { await run('ffmpeg', ['-y', '-ss', '0', '-i', srcPath, '-frames:v', '1', coverPath], { timeout: 60000 }); } catch (e) { /* Pinterest may still accept without, or reject clearly */ }
+    // The user's chosen cover frame when given (clamped inside the video), else frame 0.
+    const coverAt = options?.coverSeconds !== undefined && dur ? Math.min(Math.max(0, options.coverSeconds), Math.max(0, dur - 0.1)) : 0;
+    try { await run('ffmpeg', ['-y', '-ss', String(coverAt), '-i', srcPath, '-frames:v', '1', coverPath], { timeout: 60000 }); } catch (e) { /* Pinterest may still accept without, or reject clearly */ }
     const coverUrl = `https://api.fitlifesolutions.site/videos/${coverName}`;
     const pinBody = {
       board_id: board.id,
@@ -5221,6 +5278,7 @@ async function publishToPinterest({ account: accountId, uid, videoUrl, caption, 
       // JSON.stringify drops undefined, so an empty caption sends neither.
       title: caption ? caption.slice(0, 100) : undefined,
       description: caption || undefined,
+      link: options?.link || undefined,
       media_source: { source_type: 'video_id', media_id: reg.media_id, cover_image_url: coverUrl },
     };
     const pin = await (await fetch(`${PIN_API}/pins`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(pinBody) })).json();
