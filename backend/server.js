@@ -6052,6 +6052,9 @@ app.get('/tiktok/creator-info', tiktokLimiter, verifyToken, async (req, res) => 
       accountId: openId,
       accounts: list.map(a => ({ accountId: a.accountId, name: a.label })),
       nickname: info.creator_nickname || info.creator_username || chosen.label || 'Your TikTok',
+      // The @handle, so the app can link to the profile after posting (a direct post's
+      // publish id is not a video id, so there is no per-video link to give).
+      username: info.creator_username || null,
       avatar: info.creator_avatar_url || null,
       privacyOptions: info.privacy_level_options || [],
       commentDisabled: !!info.comment_disabled,
