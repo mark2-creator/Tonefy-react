@@ -5873,7 +5873,10 @@ async function scheduledPostSweep() {
         for (const accId of want) {
           // A queued post carries its board choice (written by the app's Save to queue).
           const r = await pub.publish({ account: accId, uid: p.userId, videoUrl: p.videoUrl, caption: p.caption,
-            options: id === 'pinterest' ? cleanPinterestOptions(p.pinterest) : undefined });
+            // A queued post carries the TikTok sheet's choices (privacy, interactions,
+            // disclosure, caption) made when it was scheduled - without them TikTok defaults
+            // to SELF_ONLY and a scheduled post would go out visible to no one.
+            options: id === 'pinterest' ? cleanPinterestOptions(p.pinterest) : id === 'tiktok' ? (p.tiktok || undefined) : undefined });
           results.push({ id, ...r });
         }
       } else {
