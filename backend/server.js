@@ -28,6 +28,43 @@ import nodemailer from "nodemailer";
 let bucket, adminDb;
 
 // Save video locally and record metadata in Firestore (no Firebase Storage needed)
+// A small poster image beside each finished video, for My Videos (Oct 4 2026). The list
+// used to show a blank placeholder: the first version mounted a video player per card to get
+// a picture and froze the app. One ~30KB JPEG per video, made here where the file already is.
+// Named <video>.poster.jpg next to it; cleanupOldFiles deletes it with its video.
+const posterInFlight = new Map();
+function posterNameFor(filename) { return `${path.basename(filename)}.poster.jpg`; }
+async function ensurePoster(filename) {
+  const name = posterNameFor(filename);
+  const out = path.join(videosDir, name);
+  if (fs.existsSync(out)) return `/videos/${name}`;
+  const src = path.join(videosDir, path.basename(filename));
+  if (!fs.existsSync(src)) return null;
+  // One ffmpeg per file even if two requests ask at once.
+  if (!posterInFlight.has(name)) {
+    posterInFlight.set(name, (async () => {
+      const tmp = `${out}.tmp.jpg`;
+      try {
+        // 1s in skips the black first frame many videos open on; a clip shorter than that
+        // falls back to frame 0.
+        try { await run('ffmpeg', ['-y', '-ss', '1', '-i', src, '-frames:v', '1', '-vf', 'scale=360:-2', '-q:v', '6', tmp], { timeout: 30000 }); }
+        catch { await run('ffmpeg', ['-y', '-i', src, '-frames:v', '1', '-vf', 'scale=360:-2', '-q:v', '6', tmp], { timeout: 30000 }); }
+        if (!fs.existsSync(tmp) || !fs.statSync(tmp).size) {
+          await run('ffmpeg', ['-y', '-i', src, '-frames:v', '1', '-vf', 'scale=360:-2', '-q:v', '6', tmp], { timeout: 30000 });
+        }
+        fs.renameSync(tmp, out);   // atomic: a half-written poster is never served
+      } catch (e) {
+        fs.unlink(tmp, () => {});
+        console.warn('[poster] failed for', filename, e.message);
+      } finally {
+        posterInFlight.delete(name);
+      }
+    })());
+  }
+  await posterInFlight.get(name);
+  return fs.existsSync(out) ? `/videos/${name}` : null;
+}
+
 async function uploadVideoToFirebase(localPath, userId, metadata = {}) {
   try {
     const filename = path.basename(localPath);
@@ -43,6 +80,7 @@ async function uploadVideoToFirebase(localPath, userId, metadata = {}) {
       size: (await fs.promises.stat(localPath)).size
     });
     console.log('✅ Video saved locally and recorded in Firestore:', filename);
+    ensurePoster(filename).catch(() => {});
     return fullUrl;
   } catch (err) {
     console.error('Video save error:', err.message);
@@ -1787,6 +1825,12 @@ async function cleanupOldFiles(dir, maxAgeMs = FREE_RETENTION_MS) {
     for (const file of files) {
       const filePath = path.join(dir, file);
       try {
+        // A poster lives exactly as long as its video: kept while the .mp4 exists (paid
+        // videos stay 30 days, longer than the 72h age rule below), removed once it is gone.
+        if (dir === videosDir && file.endsWith('.poster.jpg')) {
+          if (!fs.existsSync(path.join(dir, file.slice(0, -'.poster.jpg'.length)))) await fs.promises.unlink(filePath);
+          continue;
+        }
         const stats = await fs.promises.stat(filePath);
         const ageMs = now - stats.mtimeMs;
         // Not even old enough for the free tier - never worth a Firestore
@@ -3186,6 +3230,44 @@ async function alertAiSpendCap({ which, cap, spent, day }) {
   });
   console.log(`[ai-scenes] ${which} cap alert sent`);
 }
+
+// A video's display title from a caption: the first line, hashtags removed, 60 characters.
+function titleFromCaption(caption) {
+  const first = String(caption || '').split('\n')[0] || '';
+  const whole = first.replace(/(^|\s)#[^\s#]+/g, ' ').replace(/\s+/g, ' ').trim();
+  // At a word boundary with an ellipsis, not mid-word.
+  const t = whole.length <= 60 ? whole : `${whole.slice(0, 59).replace(/\s+\S*$/, '')}\u2026`;
+  // The old record placeholder was once sent out AS a caption (before Sep 27) - never a title.
+  return ['uploaded media video', 'generated video'].includes(t.toLowerCase()) ? '' : t;
+}
+async function setVideoTitleFromCaption(uid, videoUrl, caption) {
+  const title = titleFromCaption(caption);
+  if (!title) return;
+  const filename = path.basename(new URL(videoUrl).pathname);
+  const snap = await adminDb.collection('userVideos').where('userId', '==', uid).where('filename', '==', filename).get();
+  for (const d of snap.docs) if (!d.data().title) await d.ref.set({ title }, { merge: true });
+}
+
+// Posters for My Videos. Only for the caller's OWN videos (checked against userVideos), and
+// at most 60 per call; anything missing is made now, three at a time, so older videos get
+// theirs on the first visit and every visit after is a cached image.
+app.post("/api/video-posters", verifyToken, async (req, res) => {
+  const wanted = (Array.isArray(req.body?.filenames) ? req.body.filenames : []).map(f => path.basename(String(f))).slice(0, 60);
+  if (!wanted.length) return res.json({ posters: {} });
+  try {
+    const snap = await adminDb.collection('userVideos').where('userId', '==', req.user.uid).get();
+    const mine = new Set(snap.docs.map(d => d.data().filename).filter(Boolean));
+    const posters = {};
+    await mapWithConcurrency(wanted.filter(f => mine.has(f)), 3, async (f) => {
+      const url = await ensurePoster(f).catch(() => null);
+      if (url) posters[f] = url;
+    });
+    res.json({ posters });
+  } catch (e) {
+    console.error('[poster] list failed:', e.message);
+    res.status(500).json({ error: 'Could not load thumbnails.' });
+  }
+});
 
 // What the generation screens need to draw the AI-scenes option honestly:
 // whether it exists at all (no FAL_KEY -> enabled:false), how many one video
@@ -5803,6 +5885,10 @@ app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
     console.error('[post-now] could not record:', e.message);
   }
 
+  // Name the video after the words it was posted with, if it has no name yet: editor exports
+  // are recorded as "Uploaded media video", which is what every such card in My Videos said.
+  if (results.some(r => r.ok)) setVideoTitleFromCaption(uid, videoUrl, caption).catch(() => {});
+
   // 207 when some succeeded and some did not, so the client can tell a total failure
   // from a partial one rather than treating both as "it failed".
   if (jobId) {
@@ -6315,6 +6401,7 @@ app.post('/api/edit-video', renderLimiter, async (req, res) => {
         size: fs.statSync(outputVideo).size,
         durationSeconds: actualDurationSeconds,
       });
+      ensurePoster(filename).catch(() => {});
       try { await deductCredits(adminDb, userId, actualDurationSeconds); }
       catch (e) { console.error('Credit deduction failed:', e.message); }
     }
@@ -7647,6 +7734,7 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
         size: fs.statSync(outputVideo).size,
         durationSeconds: actualDurationSeconds,
       });
+      ensurePoster(filename).catch(() => {});
       // Deducted from the REAL output, never the pre-flight estimate, and
       // only after the render actually succeeded - a failed render must not
       // cost anything.
