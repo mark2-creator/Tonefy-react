@@ -4527,7 +4527,7 @@ app.post('/api/account/delete', verifyToken, async (req, res) => {
 // private regardless of what is asked for. Asking for public before then produces a
 // video that silently is not, which reads as a bug. Once the audit passes, a post can
 // carry privacyStatus and this default stops mattering.
-async function publishToYouTube({ account: uid, videoUrl, caption, privacyStatus = 'private' }) {
+async function publishToYouTube({ account: uid, videoUrl, caption, options, privacyStatus = 'private' }) {
   if (!process.env.YOUTUBE_CLIENT_ID || !process.env.YOUTUBE_CLIENT_SECRET) {
     return { ok: false, error: 'YouTube is not configured on this server.' };
   }
@@ -4575,8 +4575,13 @@ async function publishToYouTube({ account: uid, videoUrl, caption, privacyStatus
   // for TikTok is routinely longer, so it becomes the description and the title is the
   // first line of it. Truncating silently at 100 would cut a sentence mid-word and put
   // the remainder nowhere.
-  const text = String(caption || '').trim();
-  const firstLine = (text.split('\n')[0] || 'Untitled').slice(0, 100).trim() || 'Untitled';
+  // YouTube rejects '<' and '>' anywhere in a title or description, so they are dropped
+  // rather than failing the upload. The app now sends its own title (options.title); the
+  // caption's first line is the fallback for older apps and queued posts.
+  const noAngles = (t) => String(t || '').replace(/[<>]/g, '');
+  const text = noAngles(caption).trim().slice(0, 5000);
+  const firstLine = noAngles(options?.title).trim().slice(0, 100)
+    || (text.split('\n')[0] || 'Untitled').slice(0, 100).trim() || 'Untitled';
 
   const auth = youtubeOAuthClient();
   auth.setCredentials({ access_token: tok.accessToken });
@@ -4587,7 +4592,8 @@ async function publishToYouTube({ account: uid, videoUrl, caption, privacyStatus
       part: ['snippet', 'status'],
       requestBody: {
         snippet: { title: firstLine, description: text },
-        status: { privacyStatus, selfDeclaredMadeForKids: false },
+        // The audience declaration YouTube requires of every upload, now the user's answer.
+        status: { privacyStatus, selfDeclaredMadeForKids: options?.madeForKids === true },
       },
       // A stream, not a buffer. A 1080p export is tens of megabytes and this box runs
       // five other services; reading one wholly into memory per upload is how a queue of
@@ -4596,7 +4602,9 @@ async function publishToYouTube({ account: uid, videoUrl, caption, privacyStatus
     });
     const id = r.data?.id;
     if (!id) return { ok: false, error: 'YouTube accepted the upload but returned no video id.' };
-    return { ok: true, publishId: id, url: `https://youtu.be/${id}` };
+    // Studio, not the watch page: while uploads are forced private only Studio shows it to
+    // its owner, and Studio is where its visibility is changed.
+    return { ok: true, publishId: id, url: `https://studio.youtube.com/video/${id}/edit` };
   } catch (e) {
     const g = e?.response?.data?.error;
     const reason = g?.errors?.[0]?.reason || '';
@@ -4704,7 +4712,7 @@ async function publishToFacebook({ account: pageId, uid, videoUrl, caption }) {
     const r = await fetch(`${META_GRAPH}/${acc.pageId}/videos`, { method: 'POST', body });
     const d = await r.json();
     if (d.error) return { ok: false, error: d.error.message || 'Facebook post failed.' };
-    return { ok: true, publishId: d.id };
+    return { ok: true, publishId: d.id, url: d.id ? `https://www.facebook.com/${d.id}` : undefined };
   } catch (e) { return { ok: false, error: e.message || 'Facebook post failed.' }; }
 }
 
@@ -4715,7 +4723,8 @@ async function publishToInstagram({ account: igUserId, uid, videoUrl, caption })
   const acc = await getIgAccount(uid, igUserId);
   if (!acc?.igUserId || !acc?.token) return { ok: false, error: 'Instagram is not connected.' };
   try {
-    const initBody = new URLSearchParams({ media_type: 'REELS', video_url: videoUrl, caption: caption || '', access_token: acc.token });
+    // 2,200 characters is Instagram's caption limit; the app warns about its 30-hashtag one.
+    const initBody = new URLSearchParams({ media_type: 'REELS', video_url: videoUrl, caption: (caption || '').slice(0, 2200), access_token: acc.token });
     const initData = await (await fetch(`${IG_GRAPH}/${acc.igUserId}/media`, { method: 'POST', body: initBody })).json();
     if (initData.error) return { ok: false, error: initData.error.message || 'Instagram upload failed.' };
     const creationId = initData.id;
@@ -4731,7 +4740,10 @@ async function publishToInstagram({ account: igUserId, uid, videoUrl, caption })
     const pubBody = new URLSearchParams({ creation_id: creationId, access_token: acc.token });
     const pubData = await (await fetch(`${IG_GRAPH}/${acc.igUserId}/media_publish`, { method: 'POST', body: pubBody })).json();
     if (pubData.error) return { ok: false, error: pubData.error.message || 'Instagram publish failed.' };
-    return { ok: true, publishId: pubData.id };
+    // The Reel's own address - one read, best effort; a post without it is still a success.
+    let url;
+    try { url = (await (await fetch(`${IG_GRAPH}/${pubData.id}?fields=permalink&access_token=${encodeURIComponent(acc.token)}`)).json()).permalink; } catch { /* no link */ }
+    return { ok: true, publishId: pubData.id, url };
   } catch (e) { return { ok: false, error: e.message || 'Instagram post failed.' }; }
 }
 
@@ -4739,6 +4751,8 @@ async function publishToInstagram({ account: igUserId, uid, videoUrl, caption })
 // token of ours, so the uid rides in the signed state). The app opens the returned authUrl.
 app.get('/api/facebook/connect', verifyToken, (req, res) => {
   if (!fbConfigured()) return res.status(503).json({ error: 'Facebook is not configured on this server yet.' });
+  // Refused here rather than sending someone to Meta's "app not active" page (dev mode).
+  if (!metaAvailableFor('facebook', req.user.uid)) return res.status(403).json({ error: META_SOON.facebook, comingSoon: true });
   const state = signState({ uid: req.user.uid, exp: Date.now() + 10 * 60 * 1000 });
   res.json({ authUrl: metaOAuthDialogUrl(state) });
 });
@@ -4826,6 +4840,7 @@ app.post('/api/facebook/disconnect', verifyToken, async (req, res) => {
 // ---- Instagram via Instagram Login (direct; no Facebook Page needed) ----
 app.get('/api/instagram/connect', verifyToken, (req, res) => {
   if (!igConfigured()) return res.status(503).json({ error: 'Instagram is not configured on this server yet.' });
+  if (!metaAvailableFor('instagram', req.user.uid)) return res.status(403).json({ error: META_SOON.instagram, comingSoon: true });
   const state = signState({ uid: req.user.uid, exp: Date.now() + 10 * 60 * 1000 });
   const authUrl = 'https://www.instagram.com/oauth/authorize'
     + `?client_id=${process.env.INSTAGRAM_APP_ID}&redirect_uri=${encodeURIComponent(process.env.INSTAGRAM_REDIRECT_URI)}`
@@ -4899,6 +4914,7 @@ app.get('/api/facebook/status', verifyToken, async (req, res) => {
     res.json({
       connected: list.length > 0,
       configured: fbConfigured(),
+      available: fbConfigured() && metaAvailableFor('facebook', req.user.uid),
       accounts: list.map(a => ({ accountId: a.accountId, name: a.label })),
       pageName: list[0]?.label || null, // back-compat for older app builds
     });
@@ -4915,6 +4931,7 @@ app.get('/api/instagram/status', verifyToken, async (req, res) => {
     res.json({
       connected: list.length > 0,
       configured: igConfigured(),
+      available: igConfigured() && metaAvailableFor('instagram', req.user.uid),
       accounts: list.map(a => ({ accountId: a.accountId, name: a.label })),
       username: list[0]?.label || null, // back-compat for older app builds
     });
@@ -5277,13 +5294,13 @@ async function publishToPinterest({ account: accountId, uid, videoUrl, caption, 
       // the user's own pin (Oct 3 2026). Both fields are optional to Pinterest, and
       // JSON.stringify drops undefined, so an empty caption sends neither.
       title: caption ? caption.slice(0, 100) : undefined,
-      description: caption || undefined,
+      description: caption ? caption.slice(0, 800) : undefined,   // Pinterest's description limit
       link: options?.link || undefined,
       media_source: { source_type: 'video_id', media_id: reg.media_id, cover_image_url: coverUrl },
     };
     const pin = await (await fetch(`${PIN_API}/pins`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(pinBody) })).json();
     if (!pin.id) return { ok: false, error: pin.message || 'Pinterest publish failed.' };
-    return { ok: true, publishId: pin.id };
+    return { ok: true, publishId: pin.id, url: pin.id ? `https://www.pinterest.com/pin/${pin.id}/` : undefined };
   } catch (e) {
     return { ok: false, error: e.message || 'Pinterest post failed.' };
   }
@@ -5440,7 +5457,11 @@ async function publishToLinkedIn({ account: memberId, uid, videoUrl, caption }) 
       method: 'POST', headers: restHeaders,
       body: JSON.stringify({
         author: owner,
-        commentary: caption || '',
+        // "Little text": these characters are syntax, and unescaped they cut the post off at
+        // the first one or get it refused - a caption with "(free)" ended there. Same rule as
+        // FitLife's li_escape, which has posted real updates. Hashtags therefore show as plain
+        // text rather than links; LinkedIn's {hashtag|...} template was not adopted untested.
+        commentary: String(caption || '').slice(0, 3000).replace(/([\\|{}@\[\]()<>#*_~])/g, '\\$1'),
         visibility: 'PUBLIC',
         distribution: { feedDistribution: 'MAIN_FEED', targetEntities: [], thirdPartyDistributionChannels: [] },
         content: { media: { id: value.video, ...(caption ? { title: caption.slice(0, 100) } : {}) } },  // never our words as their title
@@ -5455,7 +5476,7 @@ async function publishToLinkedIn({ account: memberId, uid, videoUrl, caption }) 
       try { const j = await postRes.json(); msg = j.message || msg; } catch (e) { /* no body */ }
       return { ok: false, error: msg };
     }
-    return { ok: true, publishId: postId };
+    return { ok: true, publishId: postId, url: postId ? `https://www.linkedin.com/feed/update/${postId}/` : undefined };
   } catch (e) {
     return { ok: false, error: e.message || 'LinkedIn post failed.' };
   }
@@ -5523,6 +5544,26 @@ async function canAddPlatformAccount(uid, platform, newAccountId) {
 // it. A platform with `multiAccount: true` uses listAccounts() (an array of account ids)
 // and post-now publishes to each chosen one; the rest use the single accountFrom() path
 // unchanged, so converting platforms one at a time never touches the others.
+// Meta is still in DEVELOPMENT MODE (Business Verification waits on a URSB registration), so
+// only the app's admins/testers can connect or post to Facebook and Instagram - a member of
+// the public tapping Connect lands on Meta's "app not active" error, which reads as Tonefy
+// being broken. Until META_LIVE=true in .env, both are "coming soon" for everyone else.
+const META_SOON = {
+  facebook: 'Facebook posting is coming soon.',
+  instagram: 'Instagram posting is coming soon.',
+};
+function metaAvailableFor(platform, uid) {
+  if (!META_SOON[platform]) return true;
+  return process.env.META_LIVE === 'true' || isAdminUid(uid);
+}
+
+// YouTube choices from the app: a real title (not just the caption's first line) and the
+// audience declaration YouTube requires of every upload.
+function cleanYouTubeOptions(raw) {
+  const title = typeof raw?.title === 'string' ? raw.title.trim().slice(0, 100) : undefined;
+  return { title: title || undefined, madeForKids: raw?.madeForKids === true };
+}
+
 const PUBLISHERS = {
   tiktok: {
     label: 'TikTok',
@@ -5536,7 +5577,9 @@ const PUBLISHERS = {
     notConnected: 'TikTok is no longer connected to this account.',
     publish: ({ account, uid, videoUrl, caption, options }) =>
       publishToTikTok({
-        openId: account, uid, videoUrl, title: caption,
+        // The TikTok sheet has its own caption field; Post Now sends it as options.caption so
+        // TikTok gets those words while the other platforms get the screen's caption.
+        openId: account, uid, videoUrl, title: (options?.caption ?? caption)?.slice(0, 2200),
         privacyLevel: options?.privacyLevel || 'SELF_ONLY',
         disableComment: options?.disableComment,
         disableDuet: options?.disableDuet,
@@ -5629,6 +5672,8 @@ app.get('/api/platforms', (req, res) => {
   res.json({
     platforms: Object.entries(PUBLISHERS).map(([id, p]) => ({
       id, label: p.label, kind: p.kind, enabled: p.enabled(),
+      // enabled = configured on the server; available = THIS user can actually use it.
+      available: p.enabled() && metaAvailableFor(id, req.user?.uid),
     })),
   });
 });
@@ -5648,7 +5693,8 @@ app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
   const uid = req.user.uid;
   const { videoUrl, caption = '', platforms = [], tiktok: tiktokOptions } = req.body || {};
   const pinterestOptions = cleanPinterestOptions(req.body?.pinterest);
-  const optionsFor = (id) => id === 'tiktok' ? tiktokOptions : id === 'pinterest' ? pinterestOptions : undefined;
+  const youtubeOptions = cleanYouTubeOptions(req.body?.youtube);
+  const optionsFor = (id) => id === 'tiktok' ? tiktokOptions : id === 'pinterest' ? pinterestOptions : id === 'youtube' ? youtubeOptions : undefined;
   if (!videoUrl) return res.status(400).json({ error: 'videoUrl required' });
   if (!Array.isArray(platforms) || platforms.length === 0) {
     return res.status(400).json({ error: 'Choose at least one platform.' });
@@ -5683,26 +5729,63 @@ app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
   // Absent (or empty) means "all connected accounts for that platform".
   const chosenAccounts = (req.body && typeof req.body.accounts === 'object') ? req.body.accounts : {};
 
-  const results = [];
+  // Every (platform, account) post this request will make, worked out BEFORE posting so the
+  // async mode can report "3 of 5" and which one is running. A platform with nothing to post
+  // to is a step that has already failed.
+  const steps = [];
   for (const [id, pub] of targets) {
+    if (!metaAvailableFor(id, uid)) { steps.push({ id, pub, done: { ok: false, error: META_SOON[id] } }); continue; }
     if (pub.multiAccount) {
       // Multi-account platform: publish to each chosen (or all) connected account.
       const all = pub.listAccounts(accountDoc, uid);
       const want = Array.isArray(chosenAccounts[id]) && chosenAccounts[id].length
         ? all.filter(a => chosenAccounts[id].includes(a)) : all;
-      if (!want.length) { results.push({ platform: id, ok: false, error: pub.notConnected }); continue; }
-      for (const accId of want) {
-        const r = await pub.publish({ account: accId, uid, videoUrl, caption, options: optionsFor(id) });
-        results.push({ platform: id, accountId: accId, ...r });
-      }
+      if (!want.length) { steps.push({ id, pub, done: { ok: false, error: pub.notConnected } }); continue; }
+      for (const accId of want) steps.push({ id, pub, account: accId, multi: true });
     } else {
-      // Single-account platform: unchanged path.
       const account = pub.accountFrom(accountDoc, uid);
-      if (!account) { results.push({ platform: id, ok: false, error: pub.notConnected }); continue; }
-      const r = await pub.publish({ account, uid, videoUrl, caption, options: optionsFor(id) });
-      results.push({ platform: id, ...r });
+      if (!account) { steps.push({ id, pub, done: { ok: false, error: pub.notConnected } }); continue; }
+      steps.push({ id, pub, account });
     }
   }
+  const board = steps.map(st => ({ platform: st.id, accountId: st.multi ? st.account : undefined, status: st.done ? 'failed' : 'waiting', error: st.done?.error }));
+
+  const results = [];
+  const runAll = async (report) => {
+    for (let i = 0; i < steps.length; i++) {
+      const st = steps[i];
+      if (st.done) { results.push({ platform: st.id, ...st.done }); continue; }
+      board[i].status = 'posting'; report(i);
+      let r;
+      try { r = await st.pub.publish({ account: st.account, uid, videoUrl, caption, options: optionsFor(st.id) }); }
+      catch (e) { r = { ok: false, error: e.message || 'The post failed.' }; }
+      results.push({ platform: st.id, ...(st.multi ? { accountId: st.account } : {}), ...r });
+      Object.assign(board[i], { status: r.ok ? 'posted' : 'failed', url: r.url, error: r.ok ? undefined : r.error });
+      report(i + 1);
+    }
+  };
+
+  // Async mode (app from Oct 4 2026): answer at once with a job id and post in the
+  // background, reporting each platform as it goes. Posting to six platforms can take
+  // minutes (Pinterest and Instagram each poll processing for up to ~2 min) - one silent
+  // spinner for that long, lost entirely if the user leaves, was the old experience.
+  // The result is still recorded below, so the Calendar shows it either way.
+  let jobId = null;
+  if (req.body?.async) {
+    jobId = createJob(uid);
+    res.json({ jobId });
+  }
+  const report = (n) => {
+    if (!jobId) return;
+    const running = board.find(b => b.status === 'posting');
+    updateJob(jobId, {
+      kind: 'post', posts: board,
+      progress: Math.round((n / Math.max(1, steps.length)) * 100),
+      message: running ? `Posting to ${PUBLISHERS[running.platform].label}...` : 'Posting...',
+    });
+  };
+  report(0);
+  await runAll(report);
 
   // Recorded the same way a scheduled post is, so one Calendar shows both and neither
   // route needs its own history.
@@ -5722,6 +5805,10 @@ app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
 
   // 207 when some succeeded and some did not, so the client can tell a total failure
   // from a partial one rather than treating both as "it failed".
+  if (jobId) {
+    updateJob(jobId, { status: 'done', progress: 100, message: 'Done', kind: 'post', posts: board, results });
+    return;
+  }
   const code = failed.length === 0 ? 200 : (failed.length === results.length ? 502 : 207);
   res.status(code).json({ ok: failed.length === 0, results });
 });
@@ -5792,7 +5879,8 @@ async function scheduledPostSweep() {
       } else {
         const account = pub.accountFrom(accountDoc, p.userId);
         if (!account) { results.push({ id, ok: false, error: pub.notConnected }); continue; }
-        const r = await pub.publish({ account, uid: p.userId, videoUrl: p.videoUrl, caption: p.caption });
+        const r = await pub.publish({ account, uid: p.userId, videoUrl: p.videoUrl, caption: p.caption,
+          options: id === 'youtube' ? cleanYouTubeOptions(p.youtube) : undefined });
         results.push({ id, ...r });
       }
     }
