@@ -21,6 +21,7 @@ import { initializeApp, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
 import { getFirestore as getAdminFirestore, FieldValue } from "firebase-admin/firestore";
+import { publicError } from "./publicError.js";
 import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, isAdminUid, FREE_RESET_MS } from "./tiers.js";
 import nodemailer from "nodemailer";
 
@@ -826,7 +827,7 @@ app.post("/api/audio-waveform", verifyToken, mediaProcLimiter, async (req, res) 
   } catch (e) {
     console.error("audio-waveform error:", e.message);
     const badInput = /Invalid media path|Not a stored media path|outside the allowed|unexpected characters/.test(e.message);
-    res.status(badInput ? 400 : 500).json({ error: e.message });
+    res.status(badInput ? 400 : 500).json({ error: publicError(e, 'Could not read this audio track.', 'audio-waveform') });
   } finally {
     if (pcmPath) { try { fs.unlinkSync(pcmPath); } catch (e) {} }
     // Only ours to delete if we downloaded it ourselves - resolveMediaPath's
@@ -867,7 +868,7 @@ app.post("/api/transcribe-voiceover", verifyToken, mediaProcLimiter, async (req,
     res.json({ words: wordTimestamps });
   } catch (e) {
     console.error("transcribe-voiceover error:", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: publicError(e, 'Could not make captions from this voiceover.', 'transcribe-voiceover') });
   }
 });
 
@@ -1523,7 +1524,7 @@ app.post("/api/translate-video", verifyToken, mediaProcLimiter, async (req, res)
     });
   } catch (e) {
     console.error("translate-video error:", e.message);
-    updateJob(jobId, { status: "error", error: e.message });
+    updateJob(jobId, { status: "error", error: publicError(e, 'Could not translate this clip. Please try again.', 'translate-video') });
   } finally {
     for (const f of scratch) { try { fs.unlinkSync(f); } catch (er) {} }
     releaseVideoSlot();
@@ -2603,7 +2604,7 @@ Video script:`
     res.json({ script, title, url });
   } catch (err) {
     console.error("extract-url error:", err.message);
-    res.status(500).json({ error: "Failed to process URL: " + err.message });
+    res.status(500).json({ error: publicError(err, 'Could not read that link. Please check it and try again.', 'extract-url') });
   }
 });
 
@@ -2935,14 +2936,16 @@ app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
     const voice = VOICES[resolveVoiceId(voiceId)] || VOICES["gtts-us"];
     const audioFilename = uniqueName("gtts", "mp3");
     const audioPath = path.join(audiosDir, audioFilename);
+    // execFile with an argument array, never a shell string. This was
+    // exec(`python3 ... ${JSON.stringify(text)}`): JSON quoting makes a double-quoted
+    // shell word, and sh still expands $(...) and backticks inside double quotes, so
+    // any signed-in user's voiceover text could run commands on this server. Found
+    // Oct 5 2026 from a log line where someone had posted a PNG as `text`.
     await new Promise((resolve, reject) => {
-      let cmd;
-      if (voice.engine === "gtts") {
-        cmd = `python3 /home/ahumuza/Tonefy-react/backend/gtts_generate.py ${JSON.stringify(text)} ${JSON.stringify(audioPath)} ${JSON.stringify(voice.tld)}`;
-      } else {
-        cmd = `python3 /home/ahumuza/Tonefy-react/backend/edge_tts_generate.py ${JSON.stringify(text)} ${JSON.stringify(audioPath)} ${JSON.stringify(voice.name)}`;
-      }
-      exec(cmd, (err) => err ? reject(err) : resolve());
+      const args = voice.engine === "gtts"
+        ? ["/home/ahumuza/Tonefy-react/backend/gtts_generate.py", text, audioPath, voice.tld]
+        : ["/home/ahumuza/Tonefy-react/backend/edge_tts_generate.py", text, audioPath, voice.name];
+      execFile("python3", args, { timeout: 120000 }, (err) => err ? reject(err) : resolve());
     });
 
     const filter = shapeFilter(rate, pitch);
@@ -3142,7 +3145,7 @@ app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
     updateJob(jobId, { status: "done", progress: 100, message: "Video ready!", videoUrl: `/videos/${videoFilename}`, audioUrl: audioPublicUrl });
   } catch (err) {
     console.error("idea-to-video error:", err.message);
-    updateJob(jobId, { status: "failed", message: err.message });
+    updateJob(jobId, { status: "failed", message: publicError(err, 'Your video could not be made. Please try again.', 'idea-to-video') });
   }
 });
 
@@ -3688,7 +3691,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
     updateJob(jobId, { status: "done", progress: 100, message: "Video ready!", videoUrl: `/videos/${videoFilename2}`, audioUrl: audioPublicUrl, aiScenesUsed: aiUsed, aiScenesRequested: ai.granted });
   } catch (err) {
     console.error("idea-to-video-v2 error:", err.message);
-    updateJob(jobId, { status: "failed", message: err.message });
+    updateJob(jobId, { status: "failed", message: publicError(err, 'Your video could not be made. Please try again.', 'idea-to-video-v2') });
   } finally {
     releaseVideoSlot();
   }
@@ -4121,7 +4124,7 @@ async function publishToTikTok({
       });
       const initData = await initRes.json();
       if (initData.error?.code !== 'ok') {
-        return { ok: false, error: initData.error?.message || 'Failed to init post' };
+        return { ok: false, error: publicError(initData.error?.message || '', 'TikTok would not start the post. Please try again.', 'tiktok') };
       }
       const put = await fetch(initData.data?.upload_url, {
         method: 'PUT',
@@ -4185,7 +4188,7 @@ async function publishToTikTok({
     if (!inbox.ok) return { ok: false, error: inbox.error || direct.error };
     return { ok: true, publishId: inbox.publishId, mode: 'draft', draft: true };
   } catch (e) {
-    return { ok: false, error: e.message || 'Upload failed' };
+    return { ok: false, error: publicError(e, 'The YouTube upload failed. Please try again.', 'youtube') };
   }
 }
 
@@ -4702,7 +4705,7 @@ async function publishToYouTube({ account: uid, videoUrl, caption, options, priv
       return { ok: false, error: 'YouTube rejected our access. Reconnect the account.' };
     }
     console.error('[youtube] upload failed:', g?.message || e.message);
-    return { ok: false, error: g?.message || 'The upload to YouTube failed.' };
+    return { ok: false, error: publicError(g?.message || '', 'The upload to YouTube failed.', 'youtube') };
   }
 }
 
@@ -4793,9 +4796,9 @@ async function publishToFacebook({ account: pageId, uid, videoUrl, caption }) {
     const body = new URLSearchParams({ file_url: videoUrl, description: caption || '', access_token: acc.pageToken });
     const r = await fetch(`${META_GRAPH}/${acc.pageId}/videos`, { method: 'POST', body });
     const d = await r.json();
-    if (d.error) return { ok: false, error: d.error.message || 'Facebook post failed.' };
+    if (d.error) return { ok: false, error: publicError(d.error, 'Facebook post failed.', 'facebook') };
     return { ok: true, publishId: d.id, url: d.id ? `https://www.facebook.com/${d.id}` : undefined };
-  } catch (e) { return { ok: false, error: e.message || 'Facebook post failed.' }; }
+  } catch (e) { return { ok: false, error: publicError(e, 'Facebook post failed.', 'facebook') }; }
 }
 
 // Instagram Reels via Instagram Login: create a media container, poll until Graph finishes
@@ -4808,7 +4811,7 @@ async function publishToInstagram({ account: igUserId, uid, videoUrl, caption })
     // 2,200 characters is Instagram's caption limit; the app warns about its 30-hashtag one.
     const initBody = new URLSearchParams({ media_type: 'REELS', video_url: videoUrl, caption: (caption || '').slice(0, 2200), access_token: acc.token });
     const initData = await (await fetch(`${IG_GRAPH}/${acc.igUserId}/media`, { method: 'POST', body: initBody })).json();
-    if (initData.error) return { ok: false, error: initData.error.message || 'Instagram upload failed.' };
+    if (initData.error) return { ok: false, error: publicError(initData.error, 'Instagram upload failed.', 'instagram') };
     const creationId = initData.id;
     let status = '';
     for (let i = 0; i < 30; i++) {
@@ -4821,12 +4824,12 @@ async function publishToInstagram({ account: igUserId, uid, videoUrl, caption })
     if (status !== 'FINISHED') return { ok: false, error: 'Instagram is still processing the video. Try again in a moment.' };
     const pubBody = new URLSearchParams({ creation_id: creationId, access_token: acc.token });
     const pubData = await (await fetch(`${IG_GRAPH}/${acc.igUserId}/media_publish`, { method: 'POST', body: pubBody })).json();
-    if (pubData.error) return { ok: false, error: pubData.error.message || 'Instagram publish failed.' };
+    if (pubData.error) return { ok: false, error: publicError(pubData.error, 'Instagram publish failed.', 'instagram') };
     // The Reel's own address - one read, best effort; a post without it is still a success.
     let url;
     try { url = (await (await fetch(`${IG_GRAPH}/${pubData.id}?fields=permalink&access_token=${encodeURIComponent(acc.token)}`)).json()).permalink; } catch { /* no link */ }
     return { ok: true, publishId: pubData.id, url };
-  } catch (e) { return { ok: false, error: e.message || 'Instagram post failed.' }; }
+  } catch (e) { return { ok: false, error: publicError(e, 'Instagram post failed.', 'instagram') }; }
 }
 
 // Start the connection (authenticated, like /api/youtube/connect - the callback carries no
@@ -4916,7 +4919,7 @@ app.post('/api/facebook/disconnect', verifyToken, async (req, res) => {
       await adminDb.collection('connectedAccounts').doc(uid).set({ facebook: FieldValue.delete() }, { merge: true });
     }
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
+  } catch (e) { res.status(500).json({ error: publicError(e, 'Could not disconnect.') }); }
 });
 
 // ---- Instagram via Instagram Login (direct; no Facebook Page needed) ----
@@ -4983,7 +4986,7 @@ app.post('/api/instagram/disconnect', verifyToken, async (req, res) => {
       await adminDb.collection('connectedAccounts').doc(uid).set({ instagram: FieldValue.delete() }, { merge: true });
     }
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
+  } catch (e) { res.status(500).json({ error: publicError(e, 'Could not disconnect.') }); }
 });
 
 // Authoritative connection status, like /api/youtube/status: the token lives server-side
@@ -5195,7 +5198,7 @@ app.post('/api/pinterest/disconnect', verifyToken, async (req, res) => {
       await adminDb.collection('connectedAccounts').doc(uid).set({ pinterest: FieldValue.delete() }, { merge: true });
     }
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
+  } catch (e) { res.status(500).json({ error: publicError(e, 'Could not disconnect.') }); }
 });
 
 app.get('/api/pinterest/status', verifyToken, async (req, res) => {
@@ -5345,7 +5348,7 @@ async function publishToPinterest({ account: accountId, uid, videoUrl, caption, 
     if (dur && dur < 4) return { ok: false, error: `Pinterest needs a video of at least 4 seconds - this one is ${dur.toFixed(1)}s.` };
 
     const reg = await (await fetch(`${PIN_API}/media`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify({ media_type: 'video' }) })).json();
-    if (!reg.media_id || !reg.upload_url) return { ok: false, error: reg.message || 'Pinterest would not accept the upload.' };
+    if (!reg.media_id || !reg.upload_url) return { ok: false, error: publicError(reg.message || '', 'Pinterest would not accept the upload.', 'pinterest') };
     const videoRes = await fetch(videoUrl);
     if (!videoRes.ok) return { ok: false, error: `Could not read the video (${videoRes.status}).` };
     const videoBuf = Buffer.from(await videoRes.arrayBuffer());
@@ -5381,10 +5384,10 @@ async function publishToPinterest({ account: accountId, uid, videoUrl, caption, 
       media_source: { source_type: 'video_id', media_id: reg.media_id, cover_image_url: coverUrl },
     };
     const pin = await (await fetch(`${PIN_API}/pins`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify(pinBody) })).json();
-    if (!pin.id) return { ok: false, error: pin.message || 'Pinterest publish failed.' };
+    if (!pin.id) return { ok: false, error: publicError(pin.message || '', 'Pinterest publish failed.', 'pinterest') };
     return { ok: true, publishId: pin.id, url: pin.id ? `https://www.pinterest.com/pin/${pin.id}/` : undefined };
   } catch (e) {
-    return { ok: false, error: e.message || 'Pinterest post failed.' };
+    return { ok: false, error: publicError(e, 'Pinterest post failed.', 'pinterest') };
   }
 }
 
@@ -5479,7 +5482,7 @@ app.post('/api/linkedin/disconnect', verifyToken, async (req, res) => {
       await adminDb.collection('connectedAccounts').doc(uid).set({ linkedin: FieldValue.delete() }, { merge: true });
     }
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message || 'Could not disconnect.' }); }
+  } catch (e) { res.status(500).json({ error: publicError(e, 'Could not disconnect.') }); }
 });
 
 app.get('/api/linkedin/status', verifyToken, async (req, res) => {
@@ -5520,7 +5523,7 @@ async function publishToLinkedIn({ account: memberId, uid, videoUrl, caption }) 
       body: JSON.stringify({ initializeUploadRequest: { owner, fileSizeBytes: videoBuf.length, uploadCaptions: false, uploadThumbnail: false } }),
     })).json();
     const value = init.value;
-    if (!value?.video || !Array.isArray(value.uploadInstructions)) return { ok: false, error: init.message || 'LinkedIn would not accept the upload.' };
+    if (!value?.video || !Array.isArray(value.uploadInstructions)) return { ok: false, error: publicError(init.message || '', 'LinkedIn would not accept the upload.', 'linkedin') };
     // 2) PUT each instructed byte range, collecting the returned ETags
     const partIds = [];
     for (const ins of value.uploadInstructions) {
@@ -5560,7 +5563,7 @@ async function publishToLinkedIn({ account: memberId, uid, videoUrl, caption }) 
     }
     return { ok: true, publishId: postId, url: postId ? `https://www.linkedin.com/feed/update/${postId}/` : undefined };
   } catch (e) {
-    return { ok: false, error: e.message || 'LinkedIn post failed.' };
+    return { ok: false, error: publicError(e, 'LinkedIn post failed.', 'linkedin') };
   }
 }
 
@@ -5840,7 +5843,7 @@ app.post('/api/post-now', verifyToken, mediaProcLimiter, async (req, res) => {
       board[i].status = 'posting'; report(i);
       let r;
       try { r = await st.pub.publish({ account: st.account, uid, videoUrl, caption, options: optionsFor(st.id) }); }
-      catch (e) { r = { ok: false, error: e.message || 'The post failed.' }; }
+      catch (e) { r = { ok: false, error: publicError(e, 'The post failed.', 'post') }; }
       results.push({ platform: st.id, ...(st.multi ? { accountId: st.account } : {}), ...r });
       Object.assign(board[i], { status: r.ok ? 'posted' : 'failed', url: r.url, error: r.ok ? undefined : r.error });
       report(i + 1);
@@ -6035,7 +6038,7 @@ app.post('/tiktok/disconnect', tiktokLimiter, verifyToken, async (req, res) => {
     }
     res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: e.message || 'Could not disconnect.' });
+    res.status(500).json({ error: publicError(e, 'Could not disconnect.') });
   }
 });
 
@@ -6152,7 +6155,7 @@ app.get('/tiktok/creator-info', tiktokLimiter, verifyToken, async (req, res) => 
       maxDurationSec: info.max_video_post_duration_sec || null,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message || 'Could not load your TikTok settings.' });
+    res.status(500).json({ error: publicError(e, 'Could not load your TikTok settings.', 'tiktok') });
   }
 });
 
@@ -6243,7 +6246,7 @@ app.post('/tiktok/post-video', tiktokLimiter, verifyToken, async (req, res) => {
     });
   } catch (err) {
     console.error('TikTok post error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: publicError(err, 'TikTok post failed. Please try again.', 'tiktok') });
   }
 });
 
@@ -6268,7 +6271,7 @@ app.get('/tiktok/post-status/:openId/:publishId', tiktokLimiter, verifyToken, as
     const data = await statusRes.json();
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: publicError(err, 'Could not remove the photo.', 'profile-photo') });
   }
 });
 
@@ -6409,7 +6412,7 @@ app.post('/api/edit-video', renderLimiter, async (req, res) => {
     updateJob(jobId, { status: 'done', progress: 100, videoUrl: localUrl, message: "Done!" });
   } catch (e) {
     console.error("Edit video error:", e.message);
-    updateJob(jobId, { status: 'error', error: e.message });
+    updateJob(jobId, { status: 'error', error: publicError(e, 'Your video could not be exported. Please try again.', 'edit-video') });
   } finally {
     releaseVideoSlot();
   }
@@ -6455,7 +6458,7 @@ const uploadFiles = (req, res, next) => {
     if (err.message === 'Unsupported file type') {
       return res.status(400).json({ error: 'Only image, video and audio files can be uploaded.' });
     }
-    return res.status(400).json({ error: err.message || 'Upload failed.' });
+    return res.status(400).json({ error: publicError(err, 'Upload failed. Please try again.', 'upload') });
   });
 };
 
@@ -6488,7 +6491,7 @@ app.post('/api/profile-photo', verifyToken, uploadLimiter, (req, res) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'That image is too large. Keep it under 8MB.' });
       if (err.message === 'not an image') return res.status(400).json({ error: 'Please choose an image.' });
-      return res.status(400).json({ error: err.message || 'Upload failed.' });
+      return res.status(400).json({ error: publicError(err, 'Upload failed. Please try again.', 'upload') });
     }
     if (!req.file) return res.status(400).json({ error: 'No image was uploaded.' });
 
@@ -6544,7 +6547,7 @@ app.post('/api/upload-media', uploadLimiter, uploadFiles, async (req, res) => {
     });
     res.json({ items: urls });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: publicError(e, 'Upload failed. Please try again.', 'upload-media') });
   }
 });
 
@@ -7744,7 +7747,7 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
     updateJob(jobId, { status: 'done', progress: 100, videoUrl: localUrl, message: "Done!" });
   } catch (e) {
     console.error("Media-to-video error:", e.message);
-    updateJob(jobId, { status: 'error', error: e.message });
+    updateJob(jobId, { status: 'error', error: publicError(e, 'Your video could not be made. Please try again.', 'media-to-video') });
   } finally {
     releaseVideoSlot();
   }
@@ -7766,7 +7769,7 @@ app.use((err, req, res, next) => {
       LIMIT_FILE_SIZE: 'One of those files is too large.',
       LIMIT_UNEXPECTED_FILE: 'Too many files in one upload.',
     };
-    return res.status(400).json({ error: known[err.code] || err.message });
+    return res.status(400).json({ error: known[err.code] || publicError(err, 'Upload failed. Please try again.', 'upload') });
   }
   res.status(500).json({ error: err?.message || 'Server error' });
 });
