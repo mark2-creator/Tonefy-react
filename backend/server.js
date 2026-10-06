@@ -1041,7 +1041,19 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
       }
     }
 
+    // First steps (see /api/funnel): of the accounts made since the funnel began, how
+    // many reached each step. Admins and Google's test device are left out - they are
+    // not the people this is about.
+    const funnelSnap = await adminDb.collection('funnel').get();
+    const funnel = { accounts: 0, steps: {} };
+    for (const d of funnelSnap.docs) {
+      if (ADMIN_UIDS.includes(d.id) || testDeviceIds.has(d.id)) continue;
+      funnel.accounts += 1;
+      for (const k of Object.keys(d.data()?.steps || {})) funnel.steps[k] = (funnel.steps[k] || 0) + 1;
+    }
+
     res.json({
+      funnel,
       testDevices,
       revenue: {
         paying,
@@ -1553,6 +1565,37 @@ app.use(rateLimit({
 
 // Protect all /api/* routes — TikTok OAuth routes stay public
 app.use("/api", verifyToken);
+
+// First steps a new user reaches (Oct 6 2026). Nine strangers installed after launch and
+// none finished a video, and there was no way to see where they stopped: the dashboard
+// reads Firestore directly, so a user who looked and left made no request at all. The
+// app now reports each step ONCE per account, the first time it happens, and the admin
+// stats count how many accounts reached each one.
+//
+// Only a fixed list of step names is accepted (the client is untrusted and this must
+// not become free-form storage), only the FIRST time is kept, and nothing about content
+// is stored - step name and time. The app sends nothing when the user has turned off
+// Settings -> Privacy -> diagnostics, and the privacy policy says so (section 2.2).
+// Deleted with the account (/api/account/delete).
+const FUNNEL_STEPS = new Set([
+  'dashboard', 'first_video_card', 'idea_example',
+  'open_idea', 'open_script', 'open_url', 'open_edit', 'open_record',
+  'script_made', 'voice_made', 'render_started', 'video_done', 'video_saved',
+]);
+app.post('/api/funnel', async (req, res) => {
+  const step = String(req.body?.step || '');
+  if (!FUNNEL_STEPS.has(step)) return res.status(400).json({ error: 'Unknown step.' });
+  try {
+    const ref = adminDb.collection('funnel').doc(req.user.uid);
+    const snap = await ref.get();
+    if (snap.exists && snap.data()?.steps?.[step]) return res.json({ ok: true, already: true });
+    await ref.set({ steps: { [step]: new Date().toISOString() }, updatedAt: new Date().toISOString() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[funnel]', e.message);
+    res.status(500).json({ error: 'Could not record that.' });
+  }
+});
 
 // Replaces the app's own sendEmailVerification() call - see verifyEmailHtml's
 // comment for why. uid/email come from the verified token, never the request
@@ -4588,6 +4631,7 @@ app.post('/api/account/delete', verifyToken, async (req, res) => {
   // Deleted here as well as by the client. The client deletes it first to satisfy its
   // own security rules, but a server that cannot guarantee this doc is gone cannot
   // promise the account is.
+  await step('funnel', () => adminDb.collection('funnel').doc(uid).delete());
   await step('users', () => adminDb.collection('users').doc(uid).delete());
 
   if (failed.length) {
