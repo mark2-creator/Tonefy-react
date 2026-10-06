@@ -22,6 +22,7 @@ import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
 import { getFirestore as getAdminFirestore, FieldValue } from "firebase-admin/firestore";
 import { publicError } from "./publicError.js";
+import { createNextDayEmail, verifyUnsubscribe, escapeHtml } from "./nextDayEmail.js";
 import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, isAdminUid, FREE_RESET_MS } from "./tiers.js";
 import nodemailer from "nodemailer";
 
@@ -154,7 +155,8 @@ function planFromBasePlanId(basePlanId) {
 const PLAN_CREDITS = { pro: 60, creator: 300 };
 
 function verifyEmailHtml(displayName, link) {
-  const greeting = displayName ? `Hi ${displayName},` : 'Hi,';
+  // Escaped: the display name is whatever the user typed into their profile.
+  const greeting = displayName ? `Hi ${escapeHtml(displayName)},` : 'Hi,';
   return `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px 24px; background-color: #ffffff;">
   <div style="text-align: center; margin-bottom: 28px;">
     <span style="font-size: 22px; font-weight: 700; color: #111111;">Tonefy <span style="color: #2ECC71;">AI</span></span>
@@ -1582,6 +1584,31 @@ const FUNNEL_STEPS = new Set([
   'open_idea', 'open_script', 'open_url', 'open_edit', 'open_record',
   'script_made', 'voice_made', 'render_started', 'video_done', 'video_saved',
 ]);
+// One-click unsubscribe from automated emails (nextDayEmail.js). Outside /api on purpose:
+// it is opened from an inbox with no login, and the signed token (HMAC of the uid with
+// EMAIL_LINK_SECRET) is what proves the link came from us for that account. GET is the
+// link in the email; POST is RFC 8058 one-click from Gmail's own unsubscribe button.
+async function handleUnsubscribe(req, res) {
+  const uid = String(req.query.u || '');
+  if (!verifyUnsubscribe(uid, req.query.t, process.env.EMAIL_LINK_SECRET)) {
+    return res.status(400).send(unsubscribePage('This link is not valid', 'It may have been copied incompletely. If you keep getting emails you did not want, reply to one of them and we will stop them.'));
+  }
+  try {
+    await adminDb.collection('emailPrefs').doc(uid).set({ optOut: true, optOutAt: new Date().toISOString() }, { merge: true });
+    res.send(unsubscribePage('You are unsubscribed', 'We will not send you reminder emails again. Emails you ask for, such as a password reset, still arrive.'));
+  } catch (e) {
+    console.error('[unsubscribe]', e.message);
+    res.status(500).send(unsubscribePage('Something went wrong', 'Please try the link again in a moment.'));
+  }
+}
+function unsubscribePage(title, body) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="robots" content="noindex, nofollow"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)} - Tonefy AI</title>
+<style>body{font-family:sans-serif;background:#0a0a0a;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:0 16px;box-sizing:border-box}.card{background:#1a1a1a;border-radius:16px;padding:32px 24px;max-width:340px;width:100%}h2{margin:0 0 10px;font-size:20px}p{color:#888;font-size:14px;line-height:1.5;margin:0}</style></head>
+<body><div class="card"><h2>${escapeHtml(title)}</h2><p>${escapeHtml(body)}</p></div></body></html>`;
+}
+app.get('/email/unsubscribe', handleUnsubscribe);
+app.post('/email/unsubscribe', handleUnsubscribe);
+
 app.post('/api/funnel', async (req, res) => {
   const step = String(req.body?.step || '');
   if (!FUNNEL_STEPS.has(step)) return res.status(400).json({ error: 'Unknown step.' });
@@ -4632,6 +4659,7 @@ app.post('/api/account/delete', verifyToken, async (req, res) => {
   // own security rules, but a server that cannot guarantee this doc is gone cannot
   // promise the account is.
   await step('funnel', () => adminDb.collection('funnel').doc(uid).delete());
+  await step('emailPrefs', () => adminDb.collection('emailPrefs').doc(uid).delete());
   await step('users', () => adminDb.collection('users').doc(uid).delete());
 
   if (failed.length) {
@@ -7817,5 +7845,17 @@ app.use((err, req, res, next) => {
   }
   res.status(500).json({ error: err?.message || 'Server error' });
 });
+
+// The one reminder email to new accounts that have not made a video (nextDayEmail.js).
+const nextDayEmail = createNextDayEmail({
+  getAuth, adminDb,
+  transporter: emailTransporter,
+  from: `"Tonefy AI" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
+  // "Just reply and we will help" in the email must reach a person.
+  replyTo: process.env.SUPPORT_EMAIL || 'ahumuzamark21213@gmail.com',
+  secret: process.env.EMAIL_LINK_SECRET,
+  isExcluded: (u) => ADMIN_UIDS.includes(u.uid) || isTestDeviceUser(u),
+});
+nextDayEmail.start();
 
 app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
