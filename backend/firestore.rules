@@ -1,0 +1,48 @@
+rules_version = '2';
+// Firestore security rules. Kept in this repo since Oct 8 2026; before that they existed
+// only in the Firebase console (last published Aug 11 2026).
+//
+// Oct 8 2026 fixes (found during the web-payments security review):
+//  - users/{uid} was fully client-writable, so anyone could set their own `plan` and
+//    `creditsRemaining` from the browser (the website's Firebase config is public). Clients
+//    may now only change profile fields; plan/credits/subscription/webPass fields are
+//    written by the server alone (the Admin SDK ignores these rules).
+//  - scheduledPosts could have `userId` changed on update, and the posting sweep uses that
+//    userId to pick whose connected accounts to post with. userId is now fixed at create.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /scheduledPosts/{postId} {
+      allow read, delete: if request.auth != null && request.auth.uid == resource.data.userId;
+      allow update: if request.auth != null && request.auth.uid == resource.data.userId
+        && request.resource.data.userId == resource.data.userId;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
+    }
+    match /connectedAccounts/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+    match /userVideos/{videoId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
+      allow delete: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+    match /users/{userId} {
+      function own() { return request.auth != null && request.auth.uid == userId; }
+      // What the app and website write themselves (ProfileGate, signup, posting sheets).
+      function profileFields() {
+        return ['fullName', 'firstName', 'lastName', 'email', 'country',
+                'youtubeMadeForKids', 'pinterestBoards'];
+      }
+      allow read: if own();
+      // Signup writes the starting free record (AuthScreen). Only ever free, <= 10 credits.
+      allow create: if own()
+        && request.resource.data.keys().hasOnly(profileFields().concat(
+             ['createdAt', 'plan', 'creditsRemaining', 'creditsResetAt', 'subscriptionStatus']))
+        && request.resource.data.get('plan', 'free') == 'free'
+        && request.resource.data.get('creditsRemaining', 0) is int
+        && request.resource.data.get('creditsRemaining', 0) <= 10
+        && request.resource.data.get('subscriptionStatus', null) == null;
+      allow update: if own()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(profileFields());
+    }
+  }
+}
