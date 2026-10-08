@@ -9,7 +9,7 @@ import { readFileSync } from 'fs';
 import { initializeApp, cert } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
-import { createWebPayments, currencyFor } from './webPayments.js';
+import { createWebPayments, regionFor, offerFor } from './webPayments.js';
 import { tierConfig, isAdminUid } from './tiers.js';
 
 const sa = JSON.parse(readFileSync(process.env.SA_PATH, 'utf8'));
@@ -26,7 +26,7 @@ const sr = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signI
 const H = { Authorization: `Bearer ${sr.idToken}`, 'content-type': 'application/json' };
 const API = 'https://api.fitlifesolutions.site';
 let r = await fetch(`${API}/api/web-pay/config`, { headers: H }); let j = await r.json();
-assert(r.status === 200 && j.enabled === false && j.passes.pro.amount === 30000 && j.plan === 'free', `live config off: ${JSON.stringify(j)}`);
+assert(r.status === 200 && j.enabled === false && j.passes.pro.display === '$8.25' && j.plan === 'free', `live config off: ${JSON.stringify(j)}`);
 r = await fetch(`${API}/api/web-pay/start`, { method: 'POST', headers: H, body: '{"plan":"pro"}' }); j = await r.json();
 assert(r.status === 503, `live start refused while off: ${r.status} ${j.error}`);
 
@@ -55,13 +55,15 @@ process.env.FLW_TEST_UIDS = `someone-else, ${uid}`;
 assert((await wp.config(uid)).enabled === true, 'test mode allows a listed tester');
 
 // currency: shillings + mobile money for Uganda only, dollars by card for everyone else
-assert(currencyFor({ country: 'Uganda' }, '') === 'UGX' && currencyFor({}, 'UG') === 'UGX'
-  && currencyFor({ country: 'Brazil' }, 'GB') === 'USD' && currencyFor({}, '') === 'USD', 'currency rule');
-assert((await wp.config(uid, 'GB')).currency === 'USD' && (await wp.config(uid, 'UG')).currency === 'UGX', 'config currency follows location');
+assert(regionFor({ country: 'Uganda' }, '') === 'UG' && regionFor({ country: 'Uganda' }, 'GH') === 'GH'
+  && regionFor({ country: 'United Kingdom' }, '') === 'GB' && regionFor({}, '') === '', 'region: location first, then profile');
+assert(offerFor('UG', 'pro').amount === 30000 && offerFor('GH', 'creator').display === 'GHS 200'
+  && offerFor('US', 'pro').amount === 13.99 && offerFor('KE', 'pro').display === '$8.25' && offerFor('', 'creator').options === 'card', 'offers follow Play prices');
+assert((await wp.config(uid, 'GB')).passes.pro.display === '$13.99' && (await wp.config(uid, 'UG')).passes.pro.currency === 'UGX', 'config price follows location');
 s = await wp.start(uid, 'pro', 'US');
 let usd = (await db.collection('webPayments').doc(s.txRef).get()).data();
 const usdBody = JSON.parse(lastStartBody);
-assert(usd.currency === 'USD' && usd.amount === 8.25 && usdBody.currency === 'USD' && usdBody.payment_options === 'card', `non-Ugandan: USD 8.25 card only (${usd.currency} ${usd.amount} ${usdBody.payment_options})`);
+assert(usd.currency === 'USD' && usd.amount === 13.99 && usdBody.currency === 'USD' && usdBody.payment_options === 'card', `US visitor: USD 13.99 card only (${usd.currency} ${usd.amount} ${usdBody.payment_options})`);
 fakeTx = { id: 554, tx_ref: s.txRef, status: 'successful', currency: 'UGX', amount: 30000 };
 let cu = await wp.confirm({ transactionId: 554, txRef: s.txRef, uid });
 assert(cu.status === 400, 'a USD checkout paid in UGX is refused');

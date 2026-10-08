@@ -1,5 +1,6 @@
 // Web payments through Flutterwave (Oct 8 2026): 30-day Pro / Creator passes bought on
-// the WEBSITE in Ugandan shillings, by card or MTN / Airtel mobile money.
+// the WEBSITE, at Play's price for the buyer's country, by mobile money where Flutterwave offers
+// it (see LOCAL) and by card everywhere.
 //
 // WHY A PASS, NOT A SUBSCRIPTION: mobile money cannot be charged automatically, and most
 // real users are Ugandan and pay by mobile money. A pass is paid once, lasts 30 days and
@@ -12,8 +13,8 @@
 // TRUST: nothing the browser or Flutterwave's redirect says is believed. A payment
 // grants a plan only after the server asks Flutterwave itself (GET
 // /v3/transactions/{id}/verify) and the answer matches what WE recorded when the
-// checkout started: our tx_ref, status successful, currency UGX, amount at least the
-// price. The webhook is only a trigger for that same check (its verif-hash header is
+// checkout started: our tx_ref, status successful, the recorded currency, amount at least
+// the recorded price. The webhook is only a trigger for that same check (its verif-hash header is
 // still compared, so strangers cannot make us call Flutterwave in a loop).
 //
 // ONCE ONLY: webPayments/{tx_ref} is created at checkout and flipped to 'granted' inside
@@ -32,28 +33,68 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // days are added after the old end, so nothing already paid for is lost.
 const RENEW_WINDOW_MS = 5 * DAY_MS;
 
-// Ugandans pay `amount` in UGX (mobile money or card); everyone else pays `usd` in USD by card
-// (owner, Oct 8: "shillings only for Ugandan users"). Flutterwave offers mobile money only in
-// UGX - a USD checkout is card only (tested Oct 8). See currencyFor(). UGX, whole shillings. Matches the Uganda Google Play prices (Pro $8.25, Creator
-// $17.69 at ~3,700 UGX/$, rounded down) so neither route is the cheaper one.
+// Prices follow Google Play's price for the buyer's country (owner, Oct 8), so the web is never
+// the cheaper or dearer route. Where Flutterwave can take MOBILE MONEY (or local bank transfer)
+// the pass is charged in that country's currency; everywhere else in US dollars by card, at
+// Play's doubled price in the 44 high-income markets (Oct 3 2026) and the base price elsewhere.
+// Probed Oct 8 on the TEST account: mobile money shows for UGX/RWF/GHS/ZMW; NGN shows bank
+// transfer + USSD; TZS and XOF/XAF show card only; KES fails to initialise at all. Add a country
+// to LOCAL only after a test checkout shows its method (docs/web-payments.md).
 export const PASSES = {
-  pro: { amount: 30000, usd: 8.25, label: 'Pro', credits: 60 },
-  creator: { amount: 65000, usd: 17.69, label: 'Creator', credits: 300 },
+  pro: { label: 'Pro', credits: 60 },
+  creator: { label: 'Creator', credits: 300 },
 };
+const LOCAL = {
+  //       currency  Pro      Creator  Flutterwave options                 how they pay
+  UG: { currency: 'UGX', pro: 30000, creator: 65000, options: 'mobilemoneyuganda,card', how: 'mobile money (MTN or Airtel) or a card' },
+  RW: { currency: 'RWF', pro: 10500, creator: 22500, options: 'mobilemoneyrwanda,card', how: 'mobile money (MTN or Airtel) or a card' },
+  GH: { currency: 'GHS', pro: 90, creator: 200, options: 'mobilemoneyghana,card', how: 'mobile money (MTN, Telecel or AirtelTigo) or a card' },
+  ZM: { currency: 'ZMW', pro: 170, creator: 360, options: 'mobilemoneyzambia,card', how: 'mobile money (MTN or Airtel) or a card' },
+  NG: { currency: 'NGN', pro: 10000, creator: 22000, options: 'banktransfer,ussd,card', how: 'bank transfer, USSD or a card' },
+};
+// Play's doubled-price markets (Oct 3 2026, ~/ytshots/play-subs-after-2026-10-03.json).
+const HIGH = new Set('AE AT AU BE BH CA CH CY CZ DE DK EE ES FI FR GB HK HR IE IL IS IT JP KR KW LI LT LU LV MO MT NL NO NZ OM PT QA SA SE SG SI SK TW US'.split(' '));
+const USD_HIGH = { pro: 13.99, creator: 29.99 };
+const USD_BASE = { pro: 8.25, creator: 17.69 };
+
+// Profile countries are stored as English names ("Uganda"); Cloudflare gives ISO codes.
+const NAME_TO_CODE = (() => {
+  const dn = new Intl.DisplayNames(['en'], { type: 'region' }); const m = {};
+  // Retired or non-country codes ICU still names (DD = East Germany would take "Germany").
+  const skip = new Set('AN BU CS DD DY EU EZ FX HV NH NT QO QU RH SU TP UK UN VD YD YU ZR'.split(' '));
+  for (let a = 65; a <= 90; a++) for (let b = 65; b <= 90; b++) {
+    const code = String.fromCharCode(a, b);
+    if (skip.has(code)) continue;
+    try { const n = dn.of(code); if (n && n !== code && !m[n.toLowerCase()]) m[n.toLowerCase()] = code; } catch { /* not a region */ }
+  }
+  return m;
+})();
+
+// Where the buyer is: Cloudflare's location (`loc` from the website's /cdn-cgi/trace) first,
+// else the profile country. Both are claims - someone on a VPN sees another country's price,
+// exactly as on Play. confirm() checks against what start() recorded, never against this.
+export function regionFor(user, loc) {
+  const l = String(loc || '').toUpperCase();
+  if (/^[A-Z]{2}$/.test(l) && l !== 'XX' && l !== 'T1') return l;
+  return NAME_TO_CODE[String(user?.country || '').trim().toLowerCase()] || '';
+}
+// What this buyer pays for a plan: { currency, amount, options, how, display }.
+export function offerFor(region, plan) {
+  const local = LOCAL[region];
+  if (local) {
+    const amount = local[plan];
+    return { currency: local.currency, amount, options: local.options, how: local.how,
+      display: `${local.currency} ${amount.toLocaleString('en-US')}` };
+  }
+  const amount = (HIGH.has(region) ? USD_HIGH : USD_BASE)[plan];
+  return { currency: 'USD', amount, options: 'card', how: 'a card', display: `$${amount.toFixed(2)}` };
+}
 
 function secret() { return process.env.FLW_SECRET_KEY || ''; }
 export function webPaymentsEnabled() { return !!secret(); }
 // A TEST key accepts Flutterwave's fake cards and numbers, so in test mode only the accounts
 // listed in FLW_TEST_UIDS may start a payment - otherwise anyone could get a real plan for
 // fake money. Grants need the pending record that start() writes, so gating start is enough.
-// Who pays in shillings: the profile says Uganda, or Cloudflare puts the visitor in Uganda
-// (`loc` from the website's /cdn-cgi/trace). Both are claims, but either answer is harmless:
-// the two prices are the same money, and confirm() checks against what start() recorded.
-export function currencyFor(user, loc) {
-  return /^uganda$/i.test(String(user?.country || '').trim()) || String(loc || '').toUpperCase() === 'UG' ? 'UGX' : 'USD';
-}
-function priceIn(pass, currency) { return currency === 'UGX' ? pass.amount : pass.usd; }
-
 function testMode() { return /_TEST/.test(secret()); }
 function canPay(uid) {
   if (!webPaymentsEnabled()) return false;
@@ -107,11 +148,15 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
   }
 
   async function config(uid, loc) {
-    const out = { enabled: uid ? canPay(uid) : webPaymentsEnabled() && !testMode(), currency: currencyFor(null, loc), days: PASS_DAYS,
-      passes: Object.fromEntries(Object.entries(PASSES).map(([k, v]) => [k, { amount: v.amount, usd: v.usd, label: v.label, credits: v.credits }])) };
+    const user = uid ? (await adminDb.collection('users').doc(uid).get()).data() || {} : {};
+    const region = regionFor(user, loc);
+    const out = { enabled: uid ? canPay(uid) : webPaymentsEnabled() && !testMode(), days: PASS_DAYS, region,
+      how: offerFor(region, 'pro').how,
+      passes: Object.fromEntries(Object.entries(PASSES).map(([k, v]) => {
+        const o = offerFor(region, k);
+        return [k, { label: v.label, credits: v.credits, currency: o.currency, amount: o.amount, display: o.display }];
+      })) };
     if (uid) {
-      const user = (await adminDb.collection('users').doc(uid).get()).data() || {};
-      out.currency = currencyFor(user, loc);
       out.plan = isAdminUid(uid) ? 'creator' : (user.plan || 'free');
       out.passUntil = user.webPassUntil || null;
       out.blocked = isAdminUid(uid) ? 'Admins are already on Creator.' : blockReason(user, Date.now());
@@ -133,8 +178,7 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
     if (!authUser.email) return { status: 400, error: 'Your account needs an email address to pay. Please sign in with email or Google.' };
 
     const txRef = `tfy-${uid.slice(0, 8)}-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
-    const currency = currencyFor(user, loc);
-    const amount = priceIn(pass, currency);
+    const { currency, amount, options } = offerFor(regionFor(user, loc), plan);
     await payments.doc(txRef).create({
       uid, plan, amount, currency, status: 'pending',
       createdAt: new Date().toISOString(),
@@ -146,7 +190,7 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
         amount,
         currency,
         redirect_url: `${SITE}/payment-done.html`,
-        payment_options: currency === 'UGX' ? 'mobilemoneyuganda,card' : 'card',
+        payment_options: options,
         customer: { email: authUser.email, name: authUser.displayName || undefined },
         customizations: {
           title: 'Tonefy AI',
