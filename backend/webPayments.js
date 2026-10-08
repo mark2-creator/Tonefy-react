@@ -41,6 +41,15 @@ export const PASSES = {
 
 function secret() { return process.env.FLW_SECRET_KEY || ''; }
 export function webPaymentsEnabled() { return !!secret(); }
+// A TEST key accepts Flutterwave's fake cards and numbers, so in test mode only the accounts
+// listed in FLW_TEST_UIDS may start a payment - otherwise anyone could get a real plan for
+// fake money. Grants need the pending record that start() writes, so gating start is enough.
+function testMode() { return /_TEST/.test(secret()); }
+function canPay(uid) {
+  if (!webPaymentsEnabled()) return false;
+  if (!testMode()) return true;
+  return (process.env.FLW_TEST_UIDS || '').split(',').map((x) => x.trim()).filter(Boolean).includes(uid);
+}
 
 async function flw(path, init = {}) {
   const res = await fetch(`${FLW_API}${path}`, {
@@ -88,7 +97,7 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
   }
 
   async function config(uid) {
-    const out = { enabled: webPaymentsEnabled(), currency: 'UGX', days: PASS_DAYS,
+    const out = { enabled: uid ? canPay(uid) : webPaymentsEnabled() && !testMode(), currency: 'UGX', days: PASS_DAYS,
       passes: Object.fromEntries(Object.entries(PASSES).map(([k, v]) => [k, { amount: v.amount, label: v.label, credits: v.credits }])) };
     if (uid) {
       const user = (await adminDb.collection('users').doc(uid).get()).data() || {};
@@ -101,7 +110,7 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
 
   // Creates the pending record and Flutterwave's hosted checkout link.
   async function start(uid, plan) {
-    if (!webPaymentsEnabled()) return { status: 503, error: 'Paying on the website is not available yet.' };
+    if (!canPay(uid)) return { status: 503, error: 'Paying on the website is not available yet.' };
     const pass = PASSES[plan];
     if (!pass) return { status: 400, error: 'Please choose Pro or Creator.' };
     if (isAdminUid(uid)) return { status: 409, error: 'Admins are already on Creator.' };

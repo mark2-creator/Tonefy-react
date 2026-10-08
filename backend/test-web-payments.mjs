@@ -46,7 +46,13 @@ globalThis.fetch = async (url, init) => {
 };
 const wp = createWebPayments({ adminDb: db, getAuth, isAdminUid, tierConfig });
 
+// test key + not on FLW_TEST_UIDS: refused before Flutterwave is called
+delete process.env.FLW_TEST_UIDS;
 let s = await wp.start(uid, 'pro');
+assert(s.status === 503 && (await wp.config(uid)).enabled === false, `test mode refuses unlisted accounts: ${s.status}`);
+process.env.FLW_TEST_UIDS = `someone-else, ${uid}`;
+assert((await wp.config(uid)).enabled === true, 'test mode allows a listed tester');
+s = await wp.start(uid, 'pro');
 assert(s.status === 200 && s.link.includes(s.txRef), 'start gives a checkout link');
 const ref = s.txRef;
 const pay = (await db.collection('webPayments').doc(ref).get()).data();
