@@ -23,6 +23,7 @@ import { getStorage } from "firebase-admin/storage";
 import { getFirestore as getAdminFirestore, FieldValue } from "firebase-admin/firestore";
 import { publicError } from "./publicError.js";
 import { createNextDayEmail, verifyUnsubscribe, escapeHtml } from "./nextDayEmail.js";
+import { createWebPayments } from "./webPayments.js";
 import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, isAdminUid, FREE_RESET_MS } from "./tiers.js";
 import nodemailer from "nodemailer";
 
@@ -1014,9 +1015,12 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
     // because this is one API call per subscriber on every load.
     const MONTHLY_USD = { 'pro-monthly': 6.99, 'pro-yearly': 69.99 / 12, 'creator-monthly': 14.99, 'creator-yearly': 149.99 / 12 };
     const paidDocs = usersSnap.docs.filter(d => ['pro', 'creator'].includes(d.data().plan));
-    let paying = 0, testing = 0, manual = 0, lapsed = 0, lapsedAdmin = 0, mrr = 0;
+    let paying = 0, testing = 0, manual = 0, lapsed = 0, lapsedAdmin = 0, mrr = 0, webPasses = 0;
     for (const d of paidDocs.slice(0, 100)) {
       const x = d.data();
+      // Website passes are real money too (Flutterwave, webPayments.js), counted apart
+      // because they are UGX and do not renew by themselves.
+      if (!x.subscriptionPurchaseToken && x.webPassStatus === 'active') { webPasses += 1; continue; }
       if (!x.subscriptionPurchaseToken) { manual += 1; continue; }
       try {
         const { data: sub } = await androidpublisher.purchases.subscriptionsv2.get({
@@ -1062,6 +1066,7 @@ app.get("/api/admin/stats", verifyToken, requireAdmin, mediaProcLimiter, async (
         mrrUsd: Math.round(mrr * 100) / 100,
         testing,
         manual,
+        webPasses,
         // Still marked paid in Firestore but no longer active at Play. subscriptionSweep
         // and the RTDN handler DO revoke these now (they did not when this was written),
         // so a NON-admin here is either inside the six-hour window or a genuine fault.
@@ -1154,7 +1159,7 @@ app.get("/api/admin/users", verifyToken, requireAdmin, mediaProcLimiter, async (
         // How they came to be on a paid plan, which is the difference between revenue
         // and someone I set by hand while testing.
         source: f.plan && f.plan !== 'free'
-          ? (f.subscriptionPurchaseToken ? 'purchase' : 'manual')
+          ? (f.subscriptionPurchaseToken ? 'purchase' : f.webPassStatus === 'active' ? 'web' : 'manual')
           : null,
         // No Firestore doc at all: predates the collection, or was half-deleted.
         orphan: !byUid.has(u.uid),
@@ -1978,6 +1983,38 @@ function cleanupUploads() {
   });
 }
 
+// Web passes paid through Flutterwave on the website - the whole design and why is in
+// webPayments.js. /api routes here are behind verifyToken (registered after it), so the
+// uid is always the signed-in account's own. The webhook is outside /api further down.
+const webPay = createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig });
+
+app.get("/api/web-pay/config", mediaProcLimiter, async (req, res) => {
+  try { res.json(await webPay.config(req.user.uid)); }
+  catch (e) { res.status(500).json({ error: publicError(e, 'Could not load the plans.', 'web-pay config') }); }
+});
+
+app.post("/api/web-pay/start", mediaProcLimiter, async (req, res) => {
+  try {
+    const out = await webPay.start(req.user.uid, String(req.body?.plan || ''));
+    if (out.status !== 200) return res.status(out.status).json({ error: out.error });
+    res.json({ link: out.link, txRef: out.txRef });
+  } catch (e) {
+    res.status(502).json({ error: publicError(e, 'The payment page could not be opened. Please try again in a moment.', 'web-pay start') });
+  }
+});
+
+app.post("/api/web-pay/confirm", mediaProcLimiter, async (req, res) => {
+  try {
+    const out = await webPay.confirm({
+      transactionId: req.body?.transactionId, txRef: req.body?.txRef, uid: req.user.uid,
+    });
+    if (out.error) return res.status(out.status).json({ error: out.error });
+    res.json(out);
+  } catch (e) {
+    res.status(502).json({ error: publicError(e, 'We could not check the payment just now. Please refresh this page in a minute.', 'web-pay confirm') });
+  }
+});
+
 // Monthly credit reset - resets creditsRemaining to the account's own tier
 // allocation once creditsResetAt has passed.
 //
@@ -2176,6 +2213,11 @@ async function subscriptionSweep() {
 // through exactly the code the six-hourly sweep uses. That makes this endpoint a
 // TRIGGER for a check that already exists, not a second implementation of it - and it
 // makes replays harmless, because re-asking Play twice gives the same answer twice.
+// Flutterwave's payment webhook. Outside /api for the same reason as the Play one below:
+// Flutterwave has no Firebase token. It proves itself with the secret hash we set in its
+// dashboard (FLW_WEBHOOK_HASH), and even then only triggers a verify-with-Flutterwave.
+app.post('/flw-webhook', (req, res) => webPay.webhook(req, res));
+
 app.post('/play-notifications', async (req, res) => {
   const expected = process.env.RTDN_VERIFY_TOKEN || '';
   const given = String(req.query.key || '');
@@ -2251,7 +2293,8 @@ setInterval(() => {
   cleanupOldFiles(audiosDir);
   cleanupUploads();
   sweepAiSceneCache(aiSceneCacheDir);
-  creditResetSweep();
+  // Pass expiry before the credit refill, so an ended pass is not refilled first.
+  webPay.expireSweep().finally(() => creditResetSweep());
 }, 10 * 60 * 1000);
 
 // Its own timer, six-hourly rather than ten-minutely: this one costs a Play API call per

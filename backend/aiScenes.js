@@ -98,7 +98,9 @@ const ADMIN_LIMITS = { perCycle: 1e9, perVideo: 6, unlimited: true };
 function limitsFor(uid, plan, userDoc) {
   if (isAdminUid(uid)) return ADMIN_LIMITS;
   const base = AI_SCENE_PLANS[plan] || AI_SCENE_PLANS.free;
-  if (base.perCycle > 0 && !isAdminUid(uid) && !userDoc?.subscriptionPurchaseToken) return UNPURCHASED_LIMITS;
+  // A web pass paid through Flutterwave is a real purchase too (webPayments.js).
+  const paid = userDoc?.subscriptionPurchaseToken || userDoc?.webPassStatus === 'active';
+  if (base.perCycle > 0 && !isAdminUid(uid) && !paid) return UNPURCHASED_LIMITS;
   return base;
 }
 
