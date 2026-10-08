@@ -5709,9 +5709,13 @@ const META_SOON = {
   facebook: 'Facebook posting is coming soon.',
   instagram: 'Instagram posting is coming soon.',
 };
+// META_REVIEWER_UIDS (comma-separated, .env): accounts Meta's App Review team signs in
+// with. Without it the reviewer would see "Coming soon" on the very feature under review
+// and reject the submission. Unlike ADMIN_UIDS it grants nothing else.
+const META_REVIEWER_UIDS = String(process.env.META_REVIEWER_UIDS || '').split(',').map(s => s.trim()).filter(Boolean);
 function metaAvailableFor(platform, uid) {
   if (!META_SOON[platform]) return true;
-  return process.env.META_LIVE === 'true' || isAdminUid(uid);
+  return process.env.META_LIVE === 'true' || isAdminUid(uid) || META_REVIEWER_UIDS.includes(uid);
 }
 
 // YouTube choices from the app: a real title (not just the caption's first line) and the
