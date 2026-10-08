@@ -32,11 +32,13 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // days are added after the old end, so nothing already paid for is lost.
 const RENEW_WINDOW_MS = 5 * DAY_MS;
 
-// UGX, whole shillings. Matches the Uganda Google Play prices (Pro $8.25, Creator
+// `usd` is only what the website SHOWS (owner, Oct 8: "$ for everyone, like Play"). The charge
+// stays UGX: with currency USD Flutterwave's checkout drops mobile money and offers card only
+// (tested Oct 8). UGX, whole shillings. Matches the Uganda Google Play prices (Pro $8.25, Creator
 // $17.69 at ~3,700 UGX/$, rounded down) so neither route is the cheaper one.
 export const PASSES = {
-  pro: { amount: 30000, label: 'Pro', credits: 60 },
-  creator: { amount: 65000, label: 'Creator', credits: 300 },
+  pro: { amount: 30000, usd: 8.25, label: 'Pro', credits: 60 },
+  creator: { amount: 65000, usd: 17.69, label: 'Creator', credits: 300 },
 };
 
 function secret() { return process.env.FLW_SECRET_KEY || ''; }
@@ -98,7 +100,7 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
 
   async function config(uid) {
     const out = { enabled: uid ? canPay(uid) : webPaymentsEnabled() && !testMode(), currency: 'UGX', days: PASS_DAYS,
-      passes: Object.fromEntries(Object.entries(PASSES).map(([k, v]) => [k, { amount: v.amount, label: v.label, credits: v.credits }])) };
+      passes: Object.fromEntries(Object.entries(PASSES).map(([k, v]) => [k, { amount: v.amount, usd: v.usd, label: v.label, credits: v.credits }])) };
     if (uid) {
       const user = (await adminDb.collection('users').doc(uid).get()).data() || {};
       out.plan = isAdminUid(uid) ? 'creator' : (user.plan || 'free');
