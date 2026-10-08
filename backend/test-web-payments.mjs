@@ -9,7 +9,7 @@ import { readFileSync } from 'fs';
 import { initializeApp, cert } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
-import { createWebPayments } from './webPayments.js';
+import { createWebPayments, currencyFor } from './webPayments.js';
 import { tierConfig, isAdminUid } from './tiers.js';
 
 const sa = JSON.parse(readFileSync(process.env.SA_PATH, 'utf8'));
@@ -33,11 +33,12 @@ assert(r.status === 503, `live start refused while off: ${r.status} ${j.error}`)
 // ---- logic with a fake Flutterwave
 process.env.FLW_SECRET_KEY = 'FLWSECK_TEST-fake';
 process.env.FLW_WEBHOOK_HASH = 'hash123';
-let fakeTx = null; const calls = [];
+let fakeTx = null; let lastStartBody = '{}'; const calls = [];
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url, init) => {
   if (!String(url).startsWith('https://api.flutterwave.com')) return realFetch(url, init);
   calls.push(String(url));
+  if (String(url).endsWith('/payments')) lastStartBody = init.body;
   if (String(url).endsWith('/payments')) {
     const b = JSON.parse(init.body);
     return new Response(JSON.stringify({ status: 'success', data: { link: 'https://checkout.flutterwave.com/x/' + b.tx_ref } }));
@@ -52,7 +53,22 @@ let s = await wp.start(uid, 'pro');
 assert(s.status === 503 && (await wp.config(uid)).enabled === false, `test mode refuses unlisted accounts: ${s.status}`);
 process.env.FLW_TEST_UIDS = `someone-else, ${uid}`;
 assert((await wp.config(uid)).enabled === true, 'test mode allows a listed tester');
-s = await wp.start(uid, 'pro');
+
+// currency: shillings + mobile money for Uganda only, dollars by card for everyone else
+assert(currencyFor({ country: 'Uganda' }, '') === 'UGX' && currencyFor({}, 'UG') === 'UGX'
+  && currencyFor({ country: 'Brazil' }, 'GB') === 'USD' && currencyFor({}, '') === 'USD', 'currency rule');
+assert((await wp.config(uid, 'GB')).currency === 'USD' && (await wp.config(uid, 'UG')).currency === 'UGX', 'config currency follows location');
+s = await wp.start(uid, 'pro', 'US');
+let usd = (await db.collection('webPayments').doc(s.txRef).get()).data();
+const usdBody = JSON.parse(lastStartBody);
+assert(usd.currency === 'USD' && usd.amount === 8.25 && usdBody.currency === 'USD' && usdBody.payment_options === 'card', `non-Ugandan: USD 8.25 card only (${usd.currency} ${usd.amount} ${usdBody.payment_options})`);
+fakeTx = { id: 554, tx_ref: s.txRef, status: 'successful', currency: 'UGX', amount: 30000 };
+let cu = await wp.confirm({ transactionId: 554, txRef: s.txRef, uid });
+assert(cu.status === 400, 'a USD checkout paid in UGX is refused');
+await db.collection('webPayments').doc(s.txRef).delete();
+
+s = await wp.start(uid, 'pro', 'UG');
+assert(JSON.parse(lastStartBody).payment_options === 'mobilemoneyuganda,card', 'Ugandan checkout offers mobile money');
 assert(s.status === 200 && s.link.includes(s.txRef), 'start gives a checkout link');
 const ref = s.txRef;
 const pay = (await db.collection('webPayments').doc(ref).get()).data();

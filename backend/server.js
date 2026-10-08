@@ -1989,13 +1989,13 @@ function cleanupUploads() {
 const webPay = createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig });
 
 app.get("/api/web-pay/config", mediaProcLimiter, async (req, res) => {
-  try { res.json(await webPay.config(req.user.uid)); }
+  try { res.json(await webPay.config(req.user.uid, String(req.query?.loc || '').slice(0, 2))); }
   catch (e) { res.status(500).json({ error: publicError(e, 'Could not load the plans.', 'web-pay config') }); }
 });
 
 app.post("/api/web-pay/start", mediaProcLimiter, async (req, res) => {
   try {
-    const out = await webPay.start(req.user.uid, String(req.body?.plan || ''));
+    const out = await webPay.start(req.user.uid, String(req.body?.plan || ''), String(req.body?.loc || '').slice(0, 2));
     if (out.status !== 200) return res.status(out.status).json({ error: out.error });
     res.json({ link: out.link, txRef: out.txRef });
   } catch (e) {

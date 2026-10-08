@@ -32,9 +32,9 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // days are added after the old end, so nothing already paid for is lost.
 const RENEW_WINDOW_MS = 5 * DAY_MS;
 
-// `usd` is only what the website SHOWS (owner, Oct 8: "$ for everyone, like Play"). The charge
-// stays UGX: with currency USD Flutterwave's checkout drops mobile money and offers card only
-// (tested Oct 8). UGX, whole shillings. Matches the Uganda Google Play prices (Pro $8.25, Creator
+// Ugandans pay `amount` in UGX (mobile money or card); everyone else pays `usd` in USD by card
+// (owner, Oct 8: "shillings only for Ugandan users"). Flutterwave offers mobile money only in
+// UGX - a USD checkout is card only (tested Oct 8). See currencyFor(). UGX, whole shillings. Matches the Uganda Google Play prices (Pro $8.25, Creator
 // $17.69 at ~3,700 UGX/$, rounded down) so neither route is the cheaper one.
 export const PASSES = {
   pro: { amount: 30000, usd: 8.25, label: 'Pro', credits: 60 },
@@ -46,6 +46,14 @@ export function webPaymentsEnabled() { return !!secret(); }
 // A TEST key accepts Flutterwave's fake cards and numbers, so in test mode only the accounts
 // listed in FLW_TEST_UIDS may start a payment - otherwise anyone could get a real plan for
 // fake money. Grants need the pending record that start() writes, so gating start is enough.
+// Who pays in shillings: the profile says Uganda, or Cloudflare puts the visitor in Uganda
+// (`loc` from the website's /cdn-cgi/trace). Both are claims, but either answer is harmless:
+// the two prices are the same money, and confirm() checks against what start() recorded.
+export function currencyFor(user, loc) {
+  return /^uganda$/i.test(String(user?.country || '').trim()) || String(loc || '').toUpperCase() === 'UG' ? 'UGX' : 'USD';
+}
+function priceIn(pass, currency) { return currency === 'UGX' ? pass.amount : pass.usd; }
+
 function testMode() { return /_TEST/.test(secret()); }
 function canPay(uid) {
   if (!webPaymentsEnabled()) return false;
@@ -98,11 +106,12 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
     return null;
   }
 
-  async function config(uid) {
-    const out = { enabled: uid ? canPay(uid) : webPaymentsEnabled() && !testMode(), currency: 'UGX', days: PASS_DAYS,
+  async function config(uid, loc) {
+    const out = { enabled: uid ? canPay(uid) : webPaymentsEnabled() && !testMode(), currency: currencyFor(null, loc), days: PASS_DAYS,
       passes: Object.fromEntries(Object.entries(PASSES).map(([k, v]) => [k, { amount: v.amount, usd: v.usd, label: v.label, credits: v.credits }])) };
     if (uid) {
       const user = (await adminDb.collection('users').doc(uid).get()).data() || {};
+      out.currency = currencyFor(user, loc);
       out.plan = isAdminUid(uid) ? 'creator' : (user.plan || 'free');
       out.passUntil = user.webPassUntil || null;
       out.blocked = isAdminUid(uid) ? 'Admins are already on Creator.' : blockReason(user, Date.now());
@@ -111,7 +120,7 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
   }
 
   // Creates the pending record and Flutterwave's hosted checkout link.
-  async function start(uid, plan) {
+  async function start(uid, plan, loc) {
     if (!canPay(uid)) return { status: 503, error: 'Paying on the website is not available yet.' };
     const pass = PASSES[plan];
     if (!pass) return { status: 400, error: 'Please choose Pro or Creator.' };
@@ -124,18 +133,20 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
     if (!authUser.email) return { status: 400, error: 'Your account needs an email address to pay. Please sign in with email or Google.' };
 
     const txRef = `tfy-${uid.slice(0, 8)}-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
+    const currency = currencyFor(user, loc);
+    const amount = priceIn(pass, currency);
     await payments.doc(txRef).create({
-      uid, plan, amount: pass.amount, currency: 'UGX', status: 'pending',
+      uid, plan, amount, currency, status: 'pending',
       createdAt: new Date().toISOString(),
     });
     const data = await flw('/payments', {
       method: 'POST',
       body: JSON.stringify({
         tx_ref: txRef,
-        amount: pass.amount,
-        currency: 'UGX',
+        amount,
+        currency,
         redirect_url: `${SITE}/payment-done.html`,
-        payment_options: 'mobilemoneyuganda,card',
+        payment_options: currency === 'UGX' ? 'mobilemoneyuganda,card' : 'card',
         customer: { email: authUser.email, name: authUser.displayName || undefined },
         customizations: {
           title: 'Tonefy AI',
@@ -180,10 +191,11 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
         t.set(payRef, { status: next, flwId: tx.id, checkedAt: new Date().toISOString() }, { merge: true });
         return { status: 200, granted: false, state: next };
       }
-      if (tx.currency !== 'UGX' || !(Number(tx.amount) >= p.amount)) {
+      const want = p.currency || 'UGX'; // records before Oct 8 evening carry no currency: all UGX
+      if (tx.currency !== want || !(Number(tx.amount) >= p.amount)) {
         t.set(payRef, { status: 'mismatch', flwId: tx.id, flwAmount: tx.amount, flwCurrency: tx.currency,
           checkedAt: new Date().toISOString() }, { merge: true });
-        console.error(`[web-pay] ${ref}: amount/currency mismatch ${tx.amount} ${tx.currency} vs ${p.amount} UGX`);
+        console.error(`[web-pay] ${ref}: amount/currency mismatch ${tx.amount} ${tx.currency} vs ${p.amount} ${want}`);
         return { status: 400, error: 'The amount paid does not match the price. Please contact us and we will sort it out.' };
       }
 
