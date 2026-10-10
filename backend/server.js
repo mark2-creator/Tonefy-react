@@ -3975,7 +3975,14 @@ app.get('/tiktok/auth', tiktokLimiter, (req, res) => {
   // kept server-side against the state key rather than added to the OAuth request, which
   // means TikTok still sees exactly the same opaque state string it always did.
   const adding = req.query.add === '1';
-  tiktokTokens[csrfState] = { codeVerifier, createdAt: Date.now(), from: req.query.from === 'app' ? 'app' : 'web', adding };
+  // `who` is a signed uid from /api/tiktok/connect (the app asks for it with its own ID
+  // token before opening this page). With it the CALLBACK links the account to that user,
+  // and the browser's own Firebase sign-in plays no part: on Oct 10 2026 the owner
+  // connected from the app while his phone browser was signed in to a DIFFERENT Tonefy
+  // account, and the success page linked TikTok to that one. Kept server-side next to the
+  // verifier, so TikTok sees the same request as before (the flow is under TikTok review).
+  const who = readState(String(req.query.who || ''));
+  tiktokTokens[csrfState] = { codeVerifier, createdAt: Date.now(), from: req.query.from === 'app' ? 'app' : 'web', adding, uid: who?.uid || null };
 
   let url = 'https://www.tiktok.com/v2/auth/authorize/';
   url += `?client_key=${TIKTOK_CLIENT_KEY}`;
@@ -4069,6 +4076,12 @@ app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
       for (const d of stale.docs) await d.ref.delete();
     } catch (e) { console.warn('[tiktok] link code sweep:', e.message); }
 
+    if (stored?.uid) {
+      const out = await linkTikTokAccount(stored.uid, { openId: open_id, displayName: user.display_name || '', avatar: user.avatar_url || '' });
+      const q = out.ok ? `linked=1${out.already ? '&already=1' : ''}` : `link_error=${encodeURIComponent(out.error)}`;
+      return res.redirect(`https://tonefy-ai.fitlifesolutions.site/tiktok-success.html?display_name=${encodeURIComponent(user.display_name || '')}&${q}&from=${stored.from === 'app' ? 'app' : 'web'}${stored.adding ? '&add=1' : ''}`);
+    }
+
     const linkCode = crypto.randomBytes(24).toString('base64url');
     await adminDb.collection(TIKTOK_LINK_CODES).doc(linkCode).set({
       openId: open_id,
@@ -4083,6 +4096,48 @@ app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
     console.error('TikTok callback error:', err.message);
     res.redirect(`https://tonefy-ai.fitlifesolutions.site?tiktok_error=server_error`);
   }
+});
+
+// Bind a TikTok account to a Tonefy user. Used by the callback (app flow, uid known from
+// /api/tiktok/connect) and by /api/tiktok/link (website flow, uid from the page's token).
+async function linkTikTokAccount(uid, d) {
+  const gate = await canAddPlatformAccount(uid, 'tiktok', d.openId);
+  if (!gate.ok) return { ok: false, error: gate.error };
+
+  // Whether this is a genuinely new account or the same one again. appendPlatformAccount
+  // dedupes either way, so nothing breaks - but "Connected!" after someone asked to add
+  // ANOTHER account, having silently got the same one, is the app telling them something
+  // that is not true.
+  const before = await adminDb.collection('connectedAccounts').doc(uid).get();
+  const already = accountsArray(before.exists ? before.data() : {}, 'tiktok')
+    .some(a => a.accountId === d.openId);
+
+  // A TikTok account belongs to ONE Tonefy user. If another user held it, drop it from
+  // their list, or they keep a "Connected" row whose posts the ownership check refuses.
+  const tokRef = adminDb.collection(TIKTOK_TOKENS).doc(d.openId);
+  const prevUid = (await tokRef.get()).data()?.uid;
+  if (prevUid && prevUid !== uid) {
+    const pref = adminDb.collection('connectedAccounts').doc(prevUid);
+    const psnap = await pref.get();
+    const left = accountsArray(psnap.exists ? psnap.data() : {}, 'tiktok').filter(a => a.accountId !== d.openId);
+    await pref.set({ tiktok: left }, { merge: true });
+  }
+
+  // The binding lives on the token document, which no client can reach.
+  await tokRef.set({
+    uid, displayName: d.displayName || null, avatar: d.avatar || null,
+    updatedAt: new Date().toISOString(),
+  }, { merge: true });
+  await appendPlatformAccount(uid, 'tiktok', { accountId: d.openId, label: d.displayName || null });
+  return { ok: true, already };
+}
+
+// The app's way in: returns the /tiktok/auth URL carrying a short-lived signed uid, so the
+// callback knows who is connecting (see /tiktok/auth). Inside /api, so verifyToken applies.
+app.get('/api/tiktok/connect', (req, res) => {
+  const who = signState({ uid: req.user.uid, exp: Date.now() + 10 * 60 * 1000 });
+  const add = req.query.add === '1' ? '&add=1' : '';
+  res.json({ url: `https://api.fitlifesolutions.site/tiktok/auth?from=app${add}&who=${encodeURIComponent(who)}` });
 });
 
 // Trade a single-use link code for a server-written connection.
@@ -4107,25 +4162,9 @@ app.post('/api/tiktok/link', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'This connection link has expired. Please connect again.' });
     }
 
-    const gate = await canAddPlatformAccount(uid, 'tiktok', d.openId);
-    if (!gate.ok) return res.status(403).json({ error: gate.error });
-
-    // Whether this is a genuinely new account or the same one again. appendPlatformAccount
-    // dedupes either way, so nothing breaks - but "Connected!" after someone asked to add
-    // ANOTHER account, having silently got the same one, is the app telling them something
-    // that is not true.
-    const before = await adminDb.collection('connectedAccounts').doc(uid).get();
-    const already = accountsArray(before.exists ? before.data() : {}, 'tiktok')
-      .some(a => a.accountId === d.openId);
-
-    // The binding lives on the token document, which no client can reach.
-    await adminDb.collection(TIKTOK_TOKENS).doc(d.openId).set({
-      uid, displayName: d.displayName || null, avatar: d.avatar || null,
-      updatedAt: new Date().toISOString(),
-    }, { merge: true });
-    await appendPlatformAccount(uid, 'tiktok', { accountId: d.openId, label: d.displayName || null });
-
-    res.json({ ok: true, openId: d.openId, displayName: d.displayName || null, alreadyConnected: already });
+    const out = await linkTikTokAccount(uid, d);
+    if (!out.ok) return res.status(403).json({ error: out.error });
+    res.json({ ok: true, openId: d.openId, displayName: d.displayName || null, alreadyConnected: out.already });
   } catch (e) {
     console.error('[tiktok] link failed:', e.message);
     res.status(500).json({ error: 'Could not finish connecting TikTok.' });
