@@ -3855,13 +3855,15 @@ const TIKTOK_LINK_TTL_MS = 10 * 60 * 1000;
 
 async function saveTikTokToken(openId, data) {
   try {
+    // merge: a reconnect must not wipe the server-written `uid` owner binding (and
+    // displayName/avatar) - linkTikTokAccount reads the previous owner from it.
     await adminDb.collection(TIKTOK_TOKENS).doc(openId).set({
       ...data,
       // When the access token stops working, so a refresh can be attempted rather than
       // the connection simply failing.
       expiresAt: Date.now() + (Number(data.expires_in) || 86400) * 1000,
       updatedAt: new Date().toISOString(),
-    });
+    }, { merge: true });
   } catch (e) {
     console.error('[tiktok] could not persist token:', e.message);
   }
@@ -4049,7 +4051,11 @@ app.get('/tiktok/callback', tiktokLimiter, async (req, res) => {
     console.log(`[tiktok] connected ${open_id} with scopes: ${scope || '(none reported)'}`);
 
     // Store token, in memory AND on disk. The in-memory copy is only a cache now.
-    tiktokTokens[open_id] = { access_token, refresh_token, expires_in, open_id };
+    // WITH expiresAt: a cached token without one counts as fresh forever (tiktokTokenFresh),
+    // so until Oct 11 2026 a fresh connection posted fine for 24h and then every call got
+    // "The access token is invalid" until a pm2 restart.
+    tiktokTokens[open_id] = { access_token, refresh_token, expires_in, open_id,
+      expiresAt: Date.now() + (Number(expires_in) || 86400) * 1000 };
     await saveTikTokToken(open_id, { access_token, refresh_token, expires_in, open_id, scope: scope || null });
     delete tiktokTokens[state];
 
@@ -6293,7 +6299,13 @@ app.get('/tiktok/creator-info', tiktokLimiter, verifyToken, async (req, res) => 
     });
     const d = await r.json();
     if (d.error?.code !== 'ok') {
-      return res.status(502).json({ error: d.error?.message || 'Could not load your TikTok settings.' });
+      console.warn(`[tiktok] creator_info for ${openId}: ${d.error?.code} ${d.error?.message || ''}`);
+      if (d.error?.code === 'access_token_invalid') {
+        // Expired or revoked: drop the cached copy so the next call re-reads/refreshes.
+        delete tiktokTokens[openId];
+        return res.status(401).json({ error: 'Your TikTok connection has expired. Please reconnect TikTok in Profile.' });
+      }
+      return res.status(502).json({ error: 'Could not load your TikTok settings. Please try again.' });
     }
     const info = d.data || {};
     res.json({
