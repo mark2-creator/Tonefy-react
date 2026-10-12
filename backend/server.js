@@ -1614,6 +1614,66 @@ function unsubscribePage(title, body) {
 app.get('/email/unsubscribe', handleUnsubscribe);
 app.post('/email/unsubscribe', handleUnsubscribe);
 
+// Reporting offensive AI-generated content (Google Play AI-Generated Content policy).
+// Play REMOVED the app Oct 12 2026 for lacking this: apps that generate content with AI
+// must let users report/flag offensive output without leaving the app. The app's
+// ReportContentSheet posts here from every AI result (videos, scripts, voiceovers).
+// Stored in Admin-only `contentReports` (no rule names it) and mailed to the owner, so a
+// report reaches a human; reviewed reports inform the prompt/content filters.
+const REPORT_REASONS = new Set(['sexual', 'violent', 'hateful', 'harassment', 'dangerous', 'misleading', 'copyright', 'other']);
+const REPORT_KINDS = new Set(['video', 'script', 'audio', 'caption', 'image', 'other']);
+const reportLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  max: 30,
+  message: { error: 'You have sent a lot of reports today. Please try again tomorrow.' },
+  keyGenerator: limitKey,
+  validate: { xForwardedForHeader: false }
+});
+app.post('/api/report-content', reportLimiter, async (req, res) => {
+  const b = req.body || {};
+  const reason = String(b.reason || '');
+  const kind = REPORT_KINDS.has(String(b.kind)) ? String(b.kind) : 'other';
+  if (!REPORT_REASONS.has(reason)) return res.status(400).json({ error: 'Please choose a reason.' });
+  const cut = (v, n) => (typeof v === 'string' ? v.slice(0, n) : null);
+  const report = {
+    uid: req.user.uid,
+    email: req.user.email || null,
+    kind, reason,
+    note: cut(b.note, 1000),
+    contentUrl: cut(b.contentUrl, 1000),
+    contentText: cut(b.contentText, 4000),
+    screen: cut(b.screen, 60),
+    status: 'open',
+    createdAt: new Date().toISOString(),
+  };
+  try {
+    const ref = await adminDb.collection('contentReports').add(report);
+    res.json({ ok: true, id: ref.id });
+    // After answering: a slow mail server must not make the user wait.
+    const to = process.env.REPORT_ALERT_EMAIL || process.env.AI_SCENE_ALERT_EMAIL || process.env.EMAIL_USER;
+    if (emailTransporter && to) {
+      emailTransporter.sendMail({
+        from: `"Tonefy AI" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
+        to,
+        subject: `Tonefy: content reported (${reason}, ${kind})`,
+        text: [
+          `A user reported AI-generated content in the app.`,
+          ``,
+          `Reason: ${reason}`, `Type: ${kind}`, `Screen: ${report.screen || '-'}`,
+          `Reporter: ${report.email || '-'} (${report.uid})`,
+          `Note: ${report.note || '-'}`,
+          `Content link: ${report.contentUrl || '-'}`,
+          report.contentText ? `Content text:\n${report.contentText}` : '',
+          ``, `Firestore: contentReports/${ref.id}`,
+        ].join('\n'),
+      }).catch(e => console.error('[report] email failed:', e.message));
+    }
+  } catch (e) {
+    console.error('[report] save failed:', e.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Could not send your report. Please try again.' });
+  }
+});
+
 app.post('/api/funnel', async (req, res) => {
   const step = String(req.body?.step || '');
   if (!FUNNEL_STEPS.has(step)) return res.status(400).json({ error: 'Unknown step.' });
@@ -4747,6 +4807,12 @@ app.post('/api/account/delete', verifyToken, async (req, res) => {
   // own security rules, but a server that cannot guarantee this doc is gone cannot
   // promise the account is.
   await step('funnel', () => adminDb.collection('funnel').doc(uid).delete());
+  // Reports this user SENT (they hold their email and uid). Kept-for-moderation copies of
+  // the reported content are not needed once the reporter is gone.
+  await step('contentReports', async () => {
+    const q = await adminDb.collection('contentReports').where('uid', '==', uid).get();
+    for (const d of q.docs) await d.ref.delete();
+  });
   await step('emailPrefs', () => adminDb.collection('emailPrefs').doc(uid).delete());
   await step('users', () => adminDb.collection('users').doc(uid).delete());
 
