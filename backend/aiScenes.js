@@ -60,6 +60,16 @@ const MODELS = {
     input: (prompt, aspectRatio) => ({ prompt, aspect_ratio: aspectRatio, resolution: "720p" }),
     usd: () => 0.08 * 5,
   },
+  // Google Gemini Omni Flash, through the Gemini API (not fal) - see generateGemini().
+  // Added Oct 17 2026 for the owner to compare with what he makes in Google Flow.
+  // ADMIN ONLY for now (AI_SCENE_ADMIN_MODEL); no plan pays for it yet. Billed at
+  // 5,792 output tokens per second of 720p at $17.50/M = ~$0.101/s. The model picks
+  // the clip length itself (3-10s) - there is no duration input - so the reservation
+  // assumes the worst case, 10s, rather than the length we ask for in the prompt.
+  "gemini-omni-1.1-flash": {
+    provider: "gemini",
+    usd: () => 10 * 5792 * 17.5 / 1e6,
+  },
   // $1.40 per 5s, $0.28 per second after. Premium - only if a plan pays for it.
   "fal-ai/kling-video/v2.1/master/text-to-video": {
     input: (prompt, aspectRatio, secs) => ({ prompt, aspect_ratio: aspectRatio, duration: secs > 5 ? "10" : "5" }),
@@ -115,9 +125,24 @@ export function aiScenesConfigured() {
   return !!env("FAL_KEY");
 }
 
+// Whether the account a model is billed to has a key on this server.
+function providerReady(id) {
+  return MODELS[id]?.provider === "gemini" ? !!env("GEMINI_API_KEY") : !!env("FAL_KEY");
+}
+
 function modelId() {
   const id = env("AI_SCENE_MODEL", AI_SCENE_DEFAULT_MODEL);
-  return MODELS[id] ? id : AI_SCENE_DEFAULT_MODEL;
+  return MODELS[id] && providerReady(id) ? id : AI_SCENE_DEFAULT_MODEL;
+}
+
+// The model for THIS call. Admins can be pointed at a different model
+// (AI_SCENE_ADMIN_MODEL, e.g. gemini-omni-1.1-flash) to try it on real videos
+// before any user sees it; everyone else always gets modelId(). Unset, unknown,
+// or missing its key -> the normal model, so a typo cannot reach a user.
+function modelFor(uid) {
+  const adminModel = env("AI_SCENE_ADMIN_MODEL", "");
+  if (adminModel && isAdminUid(uid) && MODELS[adminModel] && providerReady(adminModel)) return adminModel;
+  return modelId();
 }
 
 let falConfiguredWith = null;
@@ -142,12 +167,25 @@ function ensureFal() {
 // AI scene is generated - the user gets Pexels, which costs nothing.
 const dayCap = () => Number(env("AI_SCENE_DAILY_USD_CAP", "3")) || 0;
 const hourCap = () => Number(env("AI_SCENE_HOURLY_USD_CAP", "1")) || 0;
+// Admins are not capped (owner, Oct 3) - but Omni is ~5x the fal model and is billed
+// to a Google account with no prepaid ceiling, so its admin spend gets its own day cap.
+const omniCap = () => Number(env("OMNI_DAILY_USD_CAP", "3")) || 0;
 
-async function reserveSpend(db, usd, exempt = false) {
+async function reserveSpend(db, usd, exempt = false, provider = "fal") {
   const now = new Date();
   const day = now.toISOString().slice(0, 10);
   const hour = String(now.getUTCHours()).padStart(2, "0");
   const ref = db.collection("aiSpend").doc(day);
+  if (exempt && provider === "gemini") {
+    const r = await db.runTransaction(async (tx) => {
+      const d = (await tx.get(ref)).data() || {};
+      const spent = Number(d.omniUsd) || 0;
+      if (spent + usd > omniCap()) return { ok: false, which: "omni", cap: omniCap(), spent };
+      tx.set(ref, { omniUsd: spent + usd, adminUsd: (Number(d.adminUsd) || 0) + usd, updatedAt: now.toISOString() }, { merge: true });
+      return { ok: true };
+    });
+    return { ...r, day, hour, ref, exempt: true, omni: true };
+  }
   if (exempt) {
     // Admin testing: recorded, never refused, and kept OUT of usd/hours so it
     // cannot use up the budget the caps hold for paying users.
@@ -167,7 +205,10 @@ async function reserveSpend(db, usd, exempt = false) {
 }
 
 async function releaseSpend(resv, usd) {
-  if (resv.exempt) { await resv.ref.set({ adminUsd: FieldValue.increment(-usd) }, { merge: true }); return; }
+  if (resv.exempt) {
+    await resv.ref.set({ adminUsd: FieldValue.increment(-usd), ...(resv.omni ? { omniUsd: FieldValue.increment(-usd) } : {}) }, { merge: true });
+    return;
+  }
   await resv.ref.set({
     usd: FieldValue.increment(-usd),
     hours: { [resv.hour]: FieldValue.increment(-usd) },
@@ -290,12 +331,16 @@ async function generateOne({ db, model, prompt, aspectRatio, secs, cacheDir, dow
 
   const usd = spec.usd(secs);
   let resv;
-  try { resv = await reserveSpend(db, usd, exempt); }
+  try { resv = await reserveSpend(db, usd, exempt, spec.provider || "fal"); }
   catch (e) { console.warn(`[ai-scenes] spend record unreadable, ${tag} uses Pexels:`, e.message); return null; }
   if (!resv.ok) {
     console.warn(`[ai-scenes] ${resv.which} cap $${resv.cap} reached ($${resv.spent.toFixed(2)} spent) - ${tag} uses Pexels`);
     await alertCapOnce(db, resv, alert);
     return null;
+  }
+
+  if (spec.provider === "gemini") {
+    return generateGemini({ model, prompt, aspectRatio, secs, file, resv, usd, tag });
   }
 
   ensureFal();
@@ -331,6 +376,58 @@ async function generateOne({ db, model, prompt, aspectRatio, secs, cacheDir, dow
   }
 }
 
+// Gemini Omni Flash through the Interactions API, synchronous (store/background/stream
+// all false - Google's own advice for one-shot generation). The REST response carries
+// the mp4 base64-encoded in steps[].content[] (type "video"); interaction.output_video
+// is an SDK-only convenience. Same contract as the fal path: a file, or null.
+const GEMINI_TIMEOUT_MS = 300_000;
+async function generateGemini({ model, prompt, aspectRatio, secs, file, resv, usd, tag }) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
+  const t0 = Date.now();
+  let sent = false;
+  try {
+    // Omni makes 9:16 and 16:9 only; a square video takes the portrait clip and the
+    // render's scale+crop squares it, as it does any clip.
+    const ar = aspectRatio === "16:9" ? "16:9" : "9:16";
+    sent = true;
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": env("GEMINI_API_KEY") },
+      body: JSON.stringify({
+        model,
+        input: `A ${secs}-second shot. ${prompt} No dialogue.`,
+        response_format: { type: "video", aspect_ratio: ar, resolution: "720p" },
+        store: false, background: false, stream: false,
+      }),
+      signal: ctrl.signal,
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // A refused request (bad key, blocked prompt, no billing) generated nothing.
+      if (r.status >= 400 && r.status < 500) await releaseSpend(resv, usd).catch(() => {});
+      throw new Error(`HTTP ${r.status} ${JSON.stringify(body?.error || body).slice(0, 300)}`);
+    }
+    const video = (body.steps || [])
+      .filter(st => st.type === "model_output")
+      .flatMap(st => st.content || [])
+      .find(c => c.type === "video" && c.data);
+    if (!video) throw new Error(`no video in response (status ${body.status || "?"})`);
+    const tmp = `${file}.part`;
+    fs.writeFileSync(tmp, Buffer.from(video.data, "base64"));
+    fs.renameSync(tmp, file);
+    console.log(`[ai-scenes] ${tag} ${model} ~${secs}s reserved ~$${usd.toFixed(3)} in ${Math.round((Date.now() - t0) / 1000)}s`);
+    return { file, cached: false, usd };
+  } catch (e) {
+    if (!sent) await releaseSpend(resv, usd).catch(() => {});
+    const why = ctrl.signal.aborted ? `timed out after ${GEMINI_TIMEOUT_MS / 1000}s` : e.message;
+    console.warn(`[ai-scenes] ${tag} failed, falling back to Pexels: ${why}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Starts AI generation for up to `requested` scenes, hook first, and returns
  * one promise per segment: a local mp4 path, or null meaning "use Pexels".
@@ -351,8 +448,12 @@ export async function startAiScenes({ db, uid, plan, segments, segDurations, asp
   catch (e) { console.warn("[ai-scenes] reserve failed:", e.message); }
   if (!granted) return { clips: none, granted: 0, done: Promise.resolve() };
 
+  const model = modelFor(uid);
+  if (!providerReady(model)) {
+    await refundScenes(db, uid, granted).catch(() => {});
+    return { clips: none, granted: 0, done: Promise.resolve() };
+  }
   fs.mkdirSync(cacheDir, { recursive: true });
-  const model = modelId();
   const ar = ["9:16", "1:1", "16:9"].includes(aspectRatio) ? aspectRatio : "9:16";
 
   const clips = segments.map((seg, i) => {

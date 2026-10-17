@@ -3399,7 +3399,9 @@ async function alertAiSpendCap({ which, cap, spent, day }) {
       '',
       `Until the ${window} rolls over, new AI scenes are not generated: those scenes use Pexels stock footage instead and are refunded to each user's allowance, so every video still finishes.`,
       '',
-      'If this is real demand, raise AI_SCENE_DAILY_USD_CAP / AI_SCENE_HOURLY_USD_CAP in backend/.env and restart.',
+      which === 'omni'
+        ? 'This is the admin-only Gemini Omni Flash test cap: raise OMNI_DAILY_USD_CAP in backend/.env and restart if you want more today.'
+        : 'If this is real demand, raise AI_SCENE_DAILY_USD_CAP / AI_SCENE_HOURLY_USD_CAP in backend/.env and restart.',
       'If it is not, check `pm2 logs tonefy-backend | grep ai-scenes` and the aiSpend collection in Firestore.',
       'Either way, check the fal.ai balance.',
     ].join('\n'),
