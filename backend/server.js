@@ -2278,6 +2278,14 @@ async function subscriptionSweep() {
 // dashboard (FLW_WEBHOOK_HASH), and even then only triggers a verify-with-Flutterwave.
 app.post('/flw-webhook', (req, res) => webPay.webhook(req, res));
 
+// Plans and prices for a signed-out visitor of upgrade.html (a payment provider's reviewer
+// checks prices before signing up). Outside /api because there is no token; config(null)
+// returns only the price list for the visitor's country - nothing about any account.
+app.get('/web-pay/prices', mediaProcLimiter, async (req, res) => {
+  try { res.json(await webPay.config(null, String(req.query?.loc || '').slice(0, 2))); }
+  catch (e) { res.status(500).json({ error: publicError(e, 'Could not load the plans.', 'web-pay prices') }); }
+});
+
 app.post('/play-notifications', async (req, res) => {
   const expected = process.env.RTDN_VERIFY_TOKEN || '';
   const given = String(req.query.key || '');
