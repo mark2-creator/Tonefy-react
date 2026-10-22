@@ -5002,8 +5002,26 @@ async function metaFetchPages(userToken) {
   const r = await fetch(`${META_GRAPH}/me/accounts?fields=id,name,access_token&access_token=${encodeURIComponent(userToken)}`);
   const d = await r.json();
   if (d.error) throw new Error(d.error.message || 'Could not read your Pages.');
-  return (d.data || []).filter(p => p && p.id && p.access_token)
+  const pages = (d.data || []).filter(p => p && p.id && p.access_token)
     .map(p => ({ pageId: p.id, pageName: p.name, pageToken: p.access_token }));
+  if (pages.length) return pages;
+  // /me/accounts leaves out Pages the person reaches through a business portfolio (Oct 22
+  // 2026: the owner's Page after Business Verification came back empty though he ticked it).
+  // The grant still names them: debug_token's granular_scopes lists the Page ids each
+  // permission covers, and each Page's own token is then read directly. Same permissions.
+  const dbg = await (await fetch(`${META_GRAPH}/debug_token?input_token=${encodeURIComponent(userToken)}`
+    + `&access_token=${encodeURIComponent(`${process.env.FACEBOOK_APP_ID}|${process.env.FACEBOOK_APP_SECRET}`)}`)).json();
+  const ids = new Set();
+  for (const g of dbg?.data?.granular_scopes || []) {
+    if (['pages_show_list', 'pages_manage_posts'].includes(g.scope)) (g.target_ids || []).forEach(id => ids.add(String(id)));
+  }
+  console.log(`[facebook] /me/accounts empty; grant names ${ids.size} Page(s)`);
+  for (const id of ids) {
+    const p = await (await fetch(`${META_GRAPH}/${encodeURIComponent(id)}?fields=id,name,access_token&access_token=${encodeURIComponent(userToken)}`)).json();
+    if (p?.id && p.access_token) pages.push({ pageId: p.id, pageName: p.name, pageToken: p.access_token });
+    else console.error('[facebook] page read:', id, p?.error?.message || 'no access token');
+  }
+  return pages;
 }
 
 // One Page's token record for this uid. Multi-account: Pages live under `.accounts[pageId]`;
