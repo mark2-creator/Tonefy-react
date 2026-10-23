@@ -4843,12 +4843,12 @@ app.post('/api/account/delete', verifyToken, async (req, res) => {
 // already on this box - the sweep has just checked isOwnMediaUrl - so a round trip
 // through nginx to read our own disk would be pure waste on a VPS that is also encoding.
 //
-// Uploads PRIVATE by default, and that is not timidity: until the Cloud project passes
-// Google's YouTube API Services audit, every video uploaded through the API is forced to
-// private regardless of what is asked for. Asking for public before then produces a
-// video that silently is not, which reads as a bug. Once the audit passes, a post can
-// carry privacyStatus and this default stops mattering.
-async function publishToYouTube({ account: uid, videoUrl, caption, options, privacyStatus = 'private' }) {
+// Visibility is the user's choice (options.privacy: public | unlisted | private) since the
+// YouTube API Services audit was APPROVED on Oct 22 2026 (before it, Google forced every
+// API upload to private). A request without a choice - an app build or a queued post from
+// before the choice existed, whose screen promised "private" - still uploads private.
+async function publishToYouTube({ account: uid, videoUrl, caption, options }) {
+  const privacyStatus = options?.privacy || 'private';
   if (!process.env.YOUTUBE_CLIENT_ID || !process.env.YOUTUBE_CLIENT_SECRET) {
     return { ok: false, error: 'YouTube is not configured on this server.' };
   }
@@ -4923,9 +4923,9 @@ async function publishToYouTube({ account: uid, videoUrl, caption, options, priv
     });
     const id = r.data?.id;
     if (!id) return { ok: false, error: 'YouTube accepted the upload but returned no video id.' };
-    // Studio, not the watch page: while uploads are forced private only Studio shows it to
-    // its owner, and Studio is where its visibility is changed.
-    return { ok: true, publishId: id, url: `https://studio.youtube.com/video/${id}/edit` };
+    // A private video is visible only to its owner, in Studio; anything else gets its watch link.
+    const url = privacyStatus === 'private' ? `https://studio.youtube.com/video/${id}/edit` : `https://youtu.be/${id}`;
+    return { ok: true, publishId: id, url };
   } catch (e) {
     const g = e?.response?.data?.error;
     const reason = g?.errors?.[0]?.reason || '';
@@ -5904,7 +5904,8 @@ function metaAvailableFor(platform, uid) {
 // audience declaration YouTube requires of every upload.
 function cleanYouTubeOptions(raw) {
   const title = typeof raw?.title === 'string' ? raw.title.trim().slice(0, 100) : undefined;
-  return { title: title || undefined, madeForKids: raw?.madeForKids === true };
+  const privacy = ['public', 'unlisted', 'private'].includes(raw?.privacy) ? raw.privacy : undefined;
+  return { title: title || undefined, madeForKids: raw?.madeForKids === true, privacy };
 }
 
 const PUBLISHERS = {
@@ -5966,10 +5967,9 @@ const PUBLISHERS = {
     // Two things that decide whether this is worth doing, both external to the code:
     //   - videos.insert costs 1,600 quota units against a default 10,000/day, so it is
     //     about SIX uploads a day until a quota increase is granted.
-    //   - youtube.upload is a SENSITIVE scope, so the OAuth consent screen needs Google
-    //     verification, and until the API project passes that audit every video uploaded
-    //     through the API is LOCKED TO PRIVATE and cannot be made public. That reads
-    //     exactly like a bug in the app if nobody knows it.
+    //   - youtube.upload is a SENSITIVE scope (OAuth verification passed Oct 4 2026), and
+    //     API uploads were LOCKED TO PRIVATE until the API Services audit, APPROVED Oct 22
+    //     2026 (public uploads allowed, videos.insert quota 200/day for 6 months).
     enabled: () => !!(process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET),
     // The uid, not the channelId. youtubeTokens is keyed by uid, and channels.list can
     // legitimately fail under youtube.upload alone - so a perfectly working connection
