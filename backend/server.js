@@ -24,6 +24,7 @@ import { getFirestore as getAdminFirestore, FieldValue } from "firebase-admin/fi
 import { publicError } from "./publicError.js";
 import { createContentSafety, isRefusal, REFUSAL_MESSAGE } from "./contentSafety.js";
 import { safeFetch, readTextCapped, isUnsafeUrlError } from "./safeFetch.js";
+import { createApiKeys, MAX_ACTIVE_KEYS } from "./apiKeys.js";
 import { createNextDayEmail, verifyUnsubscribe, escapeHtml } from "./nextDayEmail.js";
 import { createWebPayments } from "./webPayments.js";
 import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, isAdminUid, FREE_RESET_MS } from "./tiers.js";
@@ -1554,7 +1555,7 @@ app.post("/api/translate-video", verifyToken, mediaProcLimiter, async (req, res)
     updateJob(jobId, { progress: 80, message: `Speaking ${lang.label}...` });
     const outName = uniqueName("translated", "mp3");
     const outPath = path.join(audiosDir, outName);
-    await run("python3", ["/home/ahumuza/Tonefy-react/backend/edge_tts_generate.py", translated, outPath, lang.voice], { timeout: 300000 });
+    await run(EDGE_PYTHON, ["/home/ahumuza/Tonefy-react/backend/edge_tts_generate.py", translated, outPath, lang.voice], { timeout: 300000 });
 
     const spokenSeconds = await probeDurationSeconds(outPath).catch(() => 0);
     updateJob(jobId, {
@@ -3387,7 +3388,7 @@ async function synthesizeVoiceover({ text, uid = null, voiceId = "gtts-us", rate
       const args = voice.engine === "gtts"
         ? ["/home/ahumuza/Tonefy-react/backend/gtts_generate.py", text, audioPath, voice.tld]
         : ["/home/ahumuza/Tonefy-react/backend/edge_tts_generate.py", text, audioPath, voice.name];
-      execFile("python3", args, { timeout: 120000 }, (err) => err ? reject(err) : resolve());
+      execFile(voice.engine === "gtts" ? "python3" : EDGE_PYTHON, args, { timeout: 120000 }, (err) => err ? reject(err) : resolve());
     });
 
     const filter = shapeFilter(rate, pitch);
@@ -3735,6 +3736,161 @@ app.post("/api/video-posters", verifyToken, async (req, res) => {
 // What the generation screens need to draw the AI-scenes option honestly:
 // whether it exists at all (no FAL_KEY -> enabled:false), how many one video
 // may use, and how many are left this cycle.
+// Edge voices run from their own virtualenv (backend/.venv-tts, edge-tts pinned there).
+// Microsoft changes what its endpoint accepts and old edge-tts versions start getting 403:
+// 7.2.8 did on Oct 24 2026 and EVERY paid voice failed. The system Python refuses pip
+// (PEP 668), so the fix is a venv, upgraded with:
+//   backend/.venv-tts/bin/pip install -U edge-tts
+// Falls back to system python3 if the venv is missing.
+const EDGE_PYTHON = fs.existsSync(path.join(__dirname, ".venv-tts/bin/python"))
+  ? path.join(__dirname, ".venv-tts/bin/python") : "python3";
+
+// ===== Tonefy API (Oct 24 2026) =====
+// Pro/Creator customers make videos from their own code: POST /v1/videos with an idea or a
+// script, then poll GET /v1/videos/:id. The SAME pipeline as the app - safety screening,
+// script, voice, scenes, startV2Render - and the same credits. No posting in v1. Keys are
+// made on the website Profile (/api/api-keys, Firebase-authenticated); /v1 is outside
+// /api, so verifyToken never sees it - v1Auth below is its only gate.
+const apiKeys = createApiKeys({ db: adminDb, FieldValue });
+const planHasApi = (plan) => plan === 'pro' || plan === 'creator';
+const API_PLAN_MESSAGE = 'The Tonefy API is part of the Pro and Creator plans.';
+
+app.get("/api/api-keys", async (req, res) => {
+  try {
+    const { plan } = await getUserPlanData(adminDb, req.user.uid);
+    res.json({ keys: await apiKeys.list(req.user.uid), planAllowed: planHasApi(plan), maxKeys: MAX_ACTIVE_KEYS });
+  } catch (e) {
+    console.error('[api-keys] list:', e.message);
+    res.status(500).json({ error: 'Could not load your API keys. Please try again.' });
+  }
+});
+app.post("/api/api-keys", async (req, res) => {
+  try {
+    const { plan } = await getUserPlanData(adminDb, req.user.uid);
+    if (!planHasApi(plan)) return res.status(403).json({ error: API_PLAN_MESSAGE, code: 'plan_required' });
+    const made = await apiKeys.create(req.user.uid, req.body?.name);
+    console.log(`[api-keys] created ${made.prefix}... for ${req.user.uid}`);
+    res.json(made);
+  } catch (e) {
+    if (e.publicMessage) return res.status(e.status).json({ error: e.publicMessage, code: e.code });
+    console.error('[api-keys] create:', e.message);
+    res.status(500).json({ error: 'Could not make a key. Please try again.' });
+  }
+});
+app.post("/api/api-keys/revoke", async (req, res) => {
+  try {
+    if (!(await apiKeys.revoke(req.user.uid, req.body?.id))) return res.status(404).json({ error: 'That key was not found.' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[api-keys] revoke:', e.message);
+    res.status(500).json({ error: 'Could not revoke the key. Please try again.' });
+  }
+});
+
+const v1Error = (res, status, code, message) => res.status(status).json({ error: { code, message } });
+
+// Key -> account -> plan, on every request: a plan that lapsed stops its keys working.
+async function v1Auth(req, res, next) {
+  try {
+    const m = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization || ''));
+    const who = m ? await apiKeys.authenticate(m[1]) : null;
+    if (!who) return v1Error(res, 401, 'invalid_key', 'Missing or invalid API key. Send it as: Authorization: Bearer <key>.');
+    const planData = await getUserPlanData(adminDb, who.uid);
+    if (!planHasApi(planData.plan)) return v1Error(res, 403, 'plan_required', API_PLAN_MESSAGE);
+    req.api = { ...who, ...planData };
+    next();
+  } catch (e) {
+    console.error('[v1] auth:', e.message);
+    v1Error(res, 500, 'server_error', 'Something went wrong on our side. Please try again.');
+  }
+}
+const v1Limiter = rateLimit({
+  windowMs: 60 * 1000, max: 60, keyGenerator: (req) => `k:${req.api?.keyId}`,
+  validate: { xForwardedForHeader: false },
+  handler: (req, res) => v1Error(res, 429, 'rate_limited', 'Too many requests. Please slow down - the limit is 60 a minute.'),
+});
+// Same budget as the app's own generation limit, per ACCOUNT (all its keys together).
+const v1CreateLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 20, keyGenerator: (req) => `u:${req.api?.uid}`,
+  validate: { xForwardedForHeader: false },
+  handler: (req, res) => v1Error(res, 429, 'rate_limited', 'Video limit reached: 20 an hour per account.'),
+});
+
+const V1_ASPECTS = ['9:16', '1:1', '16:9'];
+function v1Video(id, job) {
+  const status = job.status === 'done' ? 'done' : (job.status === 'failed' || job.status === 'error') ? 'failed' : 'processing';
+  return {
+    id, status,
+    progress: Math.max(0, Math.min(100, Number(job.progress) || 0)),
+    message: status === 'failed' ? friendlyJobText(job) : (job.message || ''),
+    video_url: status === 'done' && job.videoUrl ? `https://api.fitlifesolutions.site${job.videoUrl}` : null,
+    script: job.apiScript || null,
+  };
+}
+// Job messages are already written for users (publicError); `error` is the fallback field.
+const friendlyJobText = (job) => job.message && job.message !== 'Starting...' ? job.message : (job.error || 'The video could not be made.');
+
+app.get('/v1/me', v1Auth, v1Limiter, (req, res) => {
+  res.json({ plan: req.api.plan, credits_remaining: Number(req.api.creditsRemaining) || 0, credits_reset_at: req.api.creditsResetAt || null });
+});
+
+app.post('/v1/videos', v1Auth, v1Limiter, v1CreateLimiter, async (req, res) => {
+  const b = req.body || {};
+  const idea = typeof b.idea === 'string' ? b.idea.trim() : '';
+  const script = typeof b.script === 'string' ? b.script.trim() : '';
+  if (!!idea === !!script) return v1Error(res, 400, 'invalid_request', 'Send exactly one of "idea" (we write the script) or "script" (your own words).');
+  if (idea.length > 500) return v1Error(res, 400, 'invalid_request', '"idea" can be at most 500 characters.');
+  if (script.length > 6000) return v1Error(res, 400, 'invalid_request', '"script" can be at most 6000 characters.');
+  const aspectRatio = b.aspect_ratio === undefined ? '9:16' : b.aspect_ratio;
+  if (!V1_ASPECTS.includes(aspectRatio)) return v1Error(res, 400, 'invalid_request', `"aspect_ratio" must be one of ${V1_ASPECTS.join(', ')}.`);
+  const voiceId = b.voice === undefined ? 'gtts-us' : String(b.voice);
+  if (!VOICES[voiceId]) return v1Error(res, 400, 'invalid_request', `Unknown "voice". See the voice list in the API docs.`);
+  const captionStyle = b.caption_style === undefined ? 'classic' : String(b.caption_style);
+  const musicTrack = b.music === undefined ? undefined : String(b.music);
+  const uid = req.api.uid;
+
+  // Refused now, not as a failed job: the caller's own text is screened before anything
+  // is spent, exactly as in the app.
+  const verdict = await safety.screen(idea || script, { uid, route: 'v1-videos' });
+  if (!verdict.ok) return v1Error(res, 422, 'content_blocked', verdict.message);
+  const pre = await checkRenderAllowed(adminDb, uid, { requestedDurationSeconds: 0 });
+  if (!pre.ok) return v1Error(res, pre.status, 'not_allowed', pre.error);
+
+  const jobId = createJob(uid);
+  updateJob(jobId, { apiKeyId: req.api.keyId, message: idea ? 'Writing the script...' : 'Recording the voiceover...' });
+  res.status(202).json(v1Video(jobId, jobs.get(jobId)));
+
+  // The rest runs in the job; GET /v1/videos/:id reports it.
+  (async () => {
+    try {
+      const text = idea ? (await generateScriptText({ prompt: idea, uid })).script : script;
+      updateJob(jobId, { apiScript: text, progress: 3, message: 'Recording the voiceover...' });
+      const { audioUrl } = await synthesizeVoiceover({ text, uid, voiceId });
+      updateJob(jobId, { progress: 6, message: 'Planning the scenes...' });
+      const segments = await splitIntoSegments({ text, uid });
+      await startV2Render(uid, { voiceover: text, segments, audioUrl, aspectRatio, captionStyle, musicTrack, aiScenes: 0 }, { jobId });
+    } catch (e) {
+      const message = e.publicMessage || publicError(e, 'Your video could not be made. Please try again.', 'v1-videos');
+      if (!e.publicMessage) console.error('[v1] pipeline:', e.message);
+      updateJob(jobId, { status: 'failed', message });
+    }
+  })();
+});
+
+// The ids POST /v1/videos accepts as "voice", from the same voices.json the app uses.
+app.get('/v1/voices', v1Auth, v1Limiter, (req, res) => {
+  res.json({ voices: Object.entries(VOICES).map(([id, v]) => ({ id, name: v.label || id, language: v.engine === 'edge' ? String(v.name || '').split('-').slice(0, 2).join('-') : `en (${v.tld || 'com'})` })) });
+});
+
+app.get('/v1/videos/:id', v1Auth, v1Limiter, (req, res) => {
+  const job = jobs.get(req.params.id);
+  // Same 404 for missing and not-yours, as /api/job does.
+  if (!job || job.userId !== req.api.uid) return v1Error(res, 404, 'not_found', 'No video with that id on this account.');
+  res.json(v1Video(req.params.id, job));
+});
+
+app.use('/v1', (req, res) => v1Error(res, 404, 'not_found', 'Unknown endpoint. See https://tonefy-ai.fitlifesolutions.site/api-docs.html'));
+
 app.get("/api/ai-scenes/status", async (req, res) => {
   try {
     const { plan } = await getUserPlanData(adminDb, req.user.uid);
@@ -3749,7 +3905,7 @@ app.get("/api/ai-scenes/status", async (req, res) => {
 // one implementation: startV2Render checks everything that can be refused up front
 // (plan, credits, safety, caption style - thrown as publicFail) and starts the job;
 // runV2Render is the render itself, reporting through the job.
-async function startV2Render(userId, body) {
+async function startV2Render(userId, body, { jobId: existingJobId = null } = {}) {
   const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, transition = "fade", transitionSpec = null, musicTrack = "mixkit-deep-meditation-109", videoSpeed: rawVideoSpeed = 1.0, aiScenes = 0 } = body || {};
   // A NUMBER in atempo's range, never the raw body value: it is interpolated into the
   // shell string of the final ffmpeg exec below, so "1$(cmd)" was command injection for
@@ -3784,7 +3940,9 @@ async function startV2Render(userId, body) {
     throw publicFail(403, 'plan_required', `The "${captionStyle}" caption style is available on the Pro and Creator plans.`);
   }
 
-  const jobId = createJob(userId);
+  // The public API makes its job before the script and voice exist, so the caller has
+  // one id from the first step to the finished file.
+  const jobId = existingJobId || createJob(userId);
   runV2Render(jobId, userId, allowed, { voiceover, segments, providedAudioUrl, aspectRatio, captionStyle, captionMeta, transition, transitionSpec, musicTrack, videoSpeed, aiScenes })
     .catch(e => console.error('runV2Render crashed:', e.message));
   return jobId;
@@ -5072,6 +5230,8 @@ app.post('/api/account/delete', verifyToken, async (req, res) => {
     const q = await adminDb.collection('contentReports').where('uid', '==', uid).get();
     for (const d of q.docs) await d.ref.delete();
   });
+  // API keys (apiKeys.js) - revoked ones too: they still name this account.
+  await step('apiKeys', () => apiKeys.purge(uid));
   // Content-safety block records (contentSafety.js): the excerpt is this user's text.
   await step('safetyBlocks', async () => {
     const q = await adminDb.collection('safetyBlocks').where('uid', '==', uid).get();
