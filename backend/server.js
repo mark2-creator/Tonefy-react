@@ -3662,7 +3662,12 @@ app.get("/api/ai-scenes/status", async (req, res) => {
 });
 
 app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
-  const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, transition = "fade", transitionSpec = null, musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0, aiScenes = 0 } = req.body || {};
+  const { voiceover = "", segments = [], audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, transition = "fade", transitionSpec = null, musicTrack = "mixkit-deep-meditation-109", videoSpeed: rawVideoSpeed = 1.0, aiScenes = 0 } = req.body || {};
+  // A NUMBER in atempo's range, never the raw body value: it is interpolated into the
+  // shell string of the final ffmpeg exec below, so "1$(cmd)" was command injection for
+  // any signed-in user (automated review, Oct 24 2026). Also keeps setpts/atempo sane.
+  const speedNum = Number(rawVideoSpeed);
+  const videoSpeed = Number.isFinite(speedNum) && speedNum >= 0.5 && speedNum <= 2 ? speedNum : 1.0;
   const userId = req.user?.uid;
 
   // No voiceId param here - this endpoint consumes audio that was already
