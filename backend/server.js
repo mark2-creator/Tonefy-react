@@ -5,7 +5,7 @@ import fetch from "node-fetch";
 import * as cheerio from "cheerio";
 import fs from "fs";
 import path from "path";
-import { exec, execFile } from "child_process";
+import { execFile } from "child_process";
 import { createTextRenderer } from "./textRender.js";
 import { startAiScenes, aiSceneStatus, sweepAiSceneCache } from "./aiScenes.js";
 import { fileURLToPath } from "url";
@@ -779,7 +779,7 @@ app.get("/api/music-tracks", mediaProcLimiter, (req, res) => {
 app.use("/uploads", express.static(uploadsDir, { maxAge: "30d" }));
 app.use("/auth", express.static(path.join(__dirname, "public", "auth")));
 
-exec("ffmpeg -version", (err, stdout) => {
+execFile("ffmpeg", ["-version"], (err, stdout) => {
   if (err) console.error("FFmpeg missing");
   else console.log("FFmpeg found:", stdout.split("\n")[0]);
 });
@@ -1833,6 +1833,24 @@ function run(bin, args, opts = {}) {
     });
   });
 }
+
+// ffmpeg/ffprobe with an ARGUMENT ARRAY - never a shell string. Every render used to be
+// exec(`ffmpeg ... "${x}"`), so any request value that reached the string could run
+// commands (videoSpeed did until Oct 24 2026). With execFile there is no shell: a value
+// is one argument whatever characters it holds. Filters keep their own ffmpeg-level
+// quoting ('...'); only the shell layer is gone. maxBuffer is raised because ffmpeg
+// writes progress to stderr and a long render can pass execFile's 1 MB default.
+// `tag` labels the stderr tail in the log when it fails.
+function ffmpegRun(args, { timeout = 180000, tag = 'ffmpeg', bin = 'ffmpeg' } = {}) {
+  return run(bin, args, { timeout, maxBuffer: 64 * 1024 * 1024 }).catch((err) => {
+    console.error(`${tag} error:`, String(err.stderr || err.message).slice(-500));
+    throw err;
+  });
+}
+async function ffprobeOut(args) {
+  try { return String(await run('ffprobe', args, { timeout: 30000 })).trim(); } catch (e) { return ''; }
+}
+const probeDurationArgs = (f) => ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f];
 
 // N workers pulling from a shared index, rather than one item at a time - for
 // a highlight-style caption's one-still-per-word rendering, where a normal-
@@ -3455,11 +3473,7 @@ app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
     await downloadToFile(videoUrl, videoPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
 
     // Get audio duration
-    const audioDuration = await new Promise((resolve) => {
-      exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${audioPathLocal}"`, (err, stdout) => {
-        resolve(parseFloat(stdout?.trim()) || 60);
-      });
-    });
+    const audioDuration = parseFloat(await ffprobeOut(probeDurationArgs(audioPathLocal))) || 60;
 
     console.log(`Audio: ${audioDuration}s | Aspect: ${aspectRatio} | Video: ${videoUrl}`);
     updateJob(jobId, { progress: 10, message: 'Downloading video clip...' });
@@ -3484,21 +3498,16 @@ app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
     const subsFilter = hasCaptions ? ',' + assFilter(assPath) : '';
     const vf = `${scaleFilter},setsar=1${subsFilter},${watermark}`;
 
-    let ffmpegCmd;
-    if (hasBgMusic) {
-      ffmpegCmd = `ffmpeg -y -stream_loop -1 -i "${videoPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${audioDuration} -filter_complex "[1:a]volume=1.0,asplit=2[voice1][voice2];[2:a]volume=0.3[music_pre];[music_pre][voice1]sidechaincompress=threshold=0.03:ratio=8:attack=120:release=600:makeup=1[music_duck];[voice2][music_duck]amix=inputs=2:duration=first:normalize=0[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
-    } else {
-      ffmpegCmd = `ffmpeg -y -stream_loop -1 -i "${videoPath}" -i "${audioPathLocal}" -t ${audioDuration} -vf "${vf}" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
-    }
+    const enc = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p", "-tune", "fastdecode", "-c:a", "aac", "-b:a", "128k"];
+    const ffArgs = hasBgMusic
+      ? ["-y", "-stream_loop", "-1", "-i", videoPath, "-i", audioPathLocal, "-stream_loop", "-1", "-i", musicPath, "-t", String(audioDuration),
+         "-filter_complex", "[1:a]volume=1.0,asplit=2[voice1][voice2];[2:a]volume=0.3[music_pre];[music_pre][voice1]sidechaincompress=threshold=0.03:ratio=8:attack=120:release=600:makeup=1[music_duck];[voice2][music_duck]amix=inputs=2:duration=first:normalize=0[aout]",
+         "-vf", vf, "-map", "0:v:0", "-map", "[aout]", ...enc, "-shortest", outputVideo]
+      : ["-y", "-stream_loop", "-1", "-i", videoPath, "-i", audioPathLocal, "-t", String(audioDuration),
+         "-vf", vf, ...enc, "-map", "0:v:0", "-map", "1:a:0", "-shortest", outputVideo];
 
     updateJob(jobId, { progress: 40, message: "Merging video & audio..." });
-    console.log("FFmpeg:", ffmpegCmd);
-    await new Promise((resolve, reject) => {
-      exec(ffmpegCmd, { timeout: 180000 }, (err, stdout, stderr) => {
-        if (err) { console.error("FFmpeg error:", stderr?.slice(-500)); return reject(new Error("FFmpeg failed")); }
-        resolve();
-      });
-    });
+    await ffmpegRun(ffArgs, { tag: "idea-to-video" }).catch(() => { throw new Error("FFmpeg failed"); });
 
     fs.unlink(videoPath, () => {});
     if (hasCaptions) fs.unlink(assPath, () => {});
@@ -3729,11 +3738,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
       return;
     }
 
-    const totalAudioDuration = await new Promise((resolve) => {
-      exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${audioPathLocal}"`, (err, stdout) => {
-        resolve(parseFloat(stdout?.trim()) || 60);
-      });
-    });
+    const totalAudioDuration = parseFloat(await ffprobeOut(probeDurationArgs(audioPathLocal))) || 60;
 
     // The precise cap check - the rough word-count estimate before the audio
     // existed was only ever a cheap early filter. This is the real gate:
@@ -3787,10 +3792,9 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
 
       if (!fs.existsSync(trimmedPath)) {
         // Fallback: black clip of correct duration
-        await new Promise((resolve) => {
-          const cmd = `ffmpeg -y -f lavfi -i color=c=black:s=${scaleW}x${scaleH}:d=${dur}:r=30 -vf "setsar=1" -c:v libx264 -preset ultrafast -crf 28 -video_track_timescale 30000 "${trimmedPath}"`;
-          exec(cmd, { timeout: 30000 }, () => resolve());
-        });
+        await ffmpegRun(["-y", "-f", "lavfi", "-i", `color=c=black:s=${scaleW}x${scaleH}:d=${dur}:r=30`, "-vf", "setsar=1",
+          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-video_track_timescale", "30000", trimmedPath],
+          { timeout: 30000, tag: "black fallback" }).catch(() => {});
       }
       clipPaths.push(trimmedPath);
     }
@@ -3836,17 +3840,12 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
 
       if (isNone || clipPaths.length < 2) {
         // Hard cut — simple concat
-        const inputs2 = clipPaths.map(p => `-i "${p}"`).join(' ');
         const filterInputs = clipPaths.map((_, i) => `[${i}:v]`).join('');
         filterComplex = `${filterInputs}concat=n=${clipPaths.length}:v=1:a=0[vout]`;
         mapArg = '[vout]';
-        const cmd2 = `ffmpeg -y ${inputs2} -filter_complex "${filterComplex}" -map "${mapArg}" -c:v libx264 -preset ultrafast -crf 28 "${concatPath}"`;
-        await new Promise((resolve, reject) => {
-          exec(cmd2, { timeout: 180000 }, (err, stdout, stderr) => {
-            if (err) { console.error("concat error:", stderr?.slice(-500)); return reject(new Error("concat failed")); }
-            resolve();
-          });
-        });
+        await ffmpegRun(["-y", ...clipPaths.flatMap(p => ["-i", p]), "-filter_complex", filterComplex, "-map", mapArg,
+          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", concatPath], { tag: "concat" })
+          .catch(() => { throw new Error("concat failed"); });
 
       } else if (isCustom) {
         // Two-pass: render each transition pair separately, then simple-concat all pieces
@@ -3878,28 +3877,21 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
           // Main body of clip A (without last safeXDUR seconds)
           const bodyDur = Math.max(0.1, segDurations[i] - safeXDUR);
           const bodyPath = path.join(videosDir, uniqueName("body", "mp4"));
-          await new Promise((resolve) => {
-            exec(`ffmpeg -y -i "${clipPaths[i]}" -t ${bodyDur} -c:v libx264 -preset ultrafast -crf 28 "${bodyPath}"`, {timeout:60000}, () => resolve());
-          });
+          await ffmpegRun(["-y", "-i", clipPaths[i], "-t", String(bodyDur), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", bodyPath],
+            { timeout: 60000, tag: "trans body" }).catch(() => {});
           transClips.push(bodyPath);
 
           // Transition clip: last safeXDUR of A blended with first safeXDUR of B
           const tailPath = path.join(videosDir, uniqueName("tail", "mp4"));
           const headPath = path.join(videosDir, uniqueName("head", "mp4"));
           const transPath = path.join(videosDir, uniqueName("trans", "mp4"));
-          await new Promise((resolve) => {
-            exec(`ffmpeg -y -sseof -${safeXDUR} -i "${clipPaths[i]}" -c:v libx264 -preset ultrafast -crf 28 "${tailPath}"`, {timeout:30000}, () => resolve());
-          });
-          await new Promise((resolve) => {
-            exec(`ffmpeg -y -i "${clipPaths[i+1]}" -t ${safeXDUR} -c:v libx264 -preset ultrafast -crf 28 "${headPath}"`, {timeout:30000}, () => resolve());
-          });
+          await ffmpegRun(["-y", "-sseof", `-${safeXDUR}`, "-i", clipPaths[i], "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", tailPath],
+            { timeout: 30000, tag: "trans tail" }).catch(() => {});
+          await ffmpegRun(["-y", "-i", clipPaths[i + 1], "-t", String(safeXDUR), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", headPath],
+            { timeout: 30000, tag: "trans head" }).catch(() => {});
           const tFilter = getCustomFilter(dims.w, dims.h);
-          await new Promise((resolve) => {
-            exec(`ffmpeg -y -i "${tailPath}" -i "${headPath}" -filter_complex "${tFilter}" -map "[vout]" -c:v libx264 -preset ultrafast -crf 28 "${transPath}"`, {timeout:60000}, (err,s,se) => {
-              if(err) console.error("trans pair error:", se?.slice(-300));
-              resolve();
-            });
-          });
+          await ffmpegRun(["-y", "-i", tailPath, "-i", headPath, "-filter_complex", tFilter, "-map", "[vout]",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", transPath], { timeout: 60000, tag: "trans pair" }).catch(() => {});
           fs.unlink(tailPath, ()=>{});
           fs.unlink(headPath, ()=>{});
           if (fs.existsSync(transPath)) transClips.push(transPath);
@@ -3907,20 +3899,14 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
         // Add last clip body
         const lastBodyPath = path.join(videosDir, uniqueName("body", "mp4"));
         const lastIdx = clipPaths.length - 1;
-        await new Promise((resolve) => {
-          exec(`ffmpeg -y -i "${clipPaths[lastIdx]}" -c copy "${lastBodyPath}"`, {timeout:60000}, () => resolve());
-        });
+        await ffmpegRun(["-y", "-i", clipPaths[lastIdx], "-c", "copy", lastBodyPath], { timeout: 60000, tag: "last body" }).catch(() => {});
         transClips.push(lastBodyPath);
 
         // Simple concat all pieces
         const concatList = path.join(videosDir, uniqueName("list", "txt"));
         fs.writeFileSync(concatList, transClips.map(p => `file '${p}'`).join('\n'));
-        await new Promise((resolve, reject) => {
-          exec(`ffmpeg -y -f concat -safe 0 -i "${concatList}" -c:v libx264 -preset ultrafast -crf 28 "${concatPath}"`, {timeout:180000}, (err,s,se) => {
-            if(err) { console.error("concat error:", se?.slice(-500)); return reject(new Error("concat failed")); }
-            resolve();
-          });
-        });
+        await ffmpegRun(["-y", "-f", "concat", "-safe", "0", "-i", concatList, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", concatPath],
+          { tag: "concat" }).catch(() => { throw new Error("concat failed"); });
         fs.unlink(concatList, ()=>{});
         transClips.forEach(p => fs.unlink(p, ()=>{}));
 
@@ -3939,7 +3925,6 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
         const specFx = specT ? specT.fx : [];
         const minClipDur = Math.min(...segDurations);
         const safeXDUR = Math.min(XDUR, minClipDur * 0.4);
-        const inputs3 = clipPaths.map(p => `-i "${p}"`).join(' ');
         let parts = [], timeline = 0, prevLabel = '0:v';
         for (let i = 1; i < clipPaths.length; i++) {
           timeline += Math.max(safeXDUR + 0.01, segDurations[i-1] - safeXDUR);
@@ -3969,13 +3954,9 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
         }
         filterComplex = parts.join(';');
         mapArg = '[vout]';
-        const cmd3 = `ffmpeg -y ${inputs3} -filter_complex "${filterComplex}" -map "${mapArg}" -c:v libx264 -preset ultrafast -crf 28 "${concatPath}"`;
-        await new Promise((resolve, reject) => {
-          exec(cmd3, { timeout: 180000 }, (err, stdout, stderr) => {
-            if (err) { console.error("concat error:", stderr?.slice(-500)); return reject(new Error("concat failed")); }
-            resolve();
-          });
-        });
+        await ffmpegRun(["-y", ...clipPaths.flatMap(p => ["-i", p]), "-filter_complex", filterComplex, "-map", mapArg,
+          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", concatPath], { tag: "concat" })
+          .catch(() => { throw new Error("concat failed"); });
       }
 // transition exec handled per-branch above
     }
@@ -4017,20 +3998,18 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
     const adjustedDuration = videoSpeed && videoSpeed !== 1.0 ? (totalAudioDuration / videoSpeed).toFixed(2) : totalAudioDuration;
     const vf = `${speedPts}setsar=1${subsFilter}${watermark ? ',' + watermark : ''}`;
 
-    let ffmpegCmd;
+    const enc = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p", "-tune", "fastdecode", "-c:a", "aac", "-b:a", "128k"];
+    let ffArgs;
     if (hasBgMusic) {
-      const voiceFilter = audioTempo ? `[1:a]${audioTempo}volume=1.0,asplit=2[voice1][voice2]` : `[1:a]volume=1.0,asplit=2[voice1][voice2]`;
-      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${adjustedDuration} -filter_complex "${voiceFilter};[2:a]volume=0.3[music_pre];[music_pre][voice1]sidechaincompress=threshold=0.03:ratio=8:attack=120:release=600:makeup=1[music_duck];[voice2][music_duck]amix=inputs=2:duration=first:normalize=0[amix];[amix]${LOUDNORM_SOCIAL}[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
+      const voiceFilter = `[1:a]${audioTempo}volume=1.0,asplit=2[voice1][voice2]`;
+      ffArgs = ["-y", "-i", concatPath, "-i", audioPathLocal, "-stream_loop", "-1", "-i", musicPath, "-t", String(adjustedDuration),
+        "-filter_complex", `${voiceFilter};[2:a]volume=0.3[music_pre];[music_pre][voice1]sidechaincompress=threshold=0.03:ratio=8:attack=120:release=600:makeup=1[music_duck];[voice2][music_duck]amix=inputs=2:duration=first:normalize=0[amix];[amix]${LOUDNORM_SOCIAL}[aout]`,
+        "-vf", vf, "-map", "0:v:0", "-map", "[aout]", ...enc, "-shortest", outputVideo];
     } else {
-      const audioFilter = `-af "${audioTempo}${LOUDNORM_SOCIAL}"`;
-      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -t ${adjustedDuration} -vf "${vf}" ${audioFilter} -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
+      ffArgs = ["-y", "-i", concatPath, "-i", audioPathLocal, "-t", String(adjustedDuration), "-vf", vf,
+        "-af", `${audioTempo}${LOUDNORM_SOCIAL}`, ...enc, "-map", "0:v:0", "-map", "1:a:0", "-shortest", outputVideo];
     }
-    await new Promise((resolve, reject) => {
-      exec(ffmpegCmd, { timeout: 180000 }, (err, stdout, stderr) => {
-        if (err) { console.error("final ffmpeg error:", stderr?.slice(-500)); return reject(new Error("final merge failed")); }
-        resolve();
-      });
-    });
+    await ffmpegRun(ffArgs, { tag: "final ffmpeg" }).catch(() => { throw new Error("final merge failed"); });
 
     fs.unlink(concatPath, () => {});
     
@@ -6824,19 +6803,12 @@ app.post('/api/edit-video', renderLimiter, async (req, res) => {
     const watermark = allowed.watermark ? "drawtext=text='Tonefy AI':fontsize=18:fontcolor=white@0.5:x=(w-text_w)/2:y=h-th-20" : null;
     const vf = [subsFilter, watermark].filter(Boolean).join(',') || null;
 
-    const ffmpegCmd = vf
-      ? `ffmpeg -y -i "${srcPath}" -vf "${vf}" -c:a copy -pix_fmt yuv420p "${outputVideo}"`
-      : `ffmpeg -y -i "${srcPath}" -c copy "${outputVideo}"`;
+    const ffArgs = vf
+      ? ["-y", "-i", srcPath, "-vf", vf, "-c:a", "copy", "-pix_fmt", "yuv420p", outputVideo]
+      : ["-y", "-i", srcPath, "-c", "copy", outputVideo];
 
     updateJob(jobId, { progress: 60, message: "Burning subtitles..." });
-    console.log("FFmpeg:", ffmpegCmd);
-
-    await new Promise((resolve, reject) => {
-      exec(ffmpegCmd, { timeout: 180000 }, (err, stdout, stderr) => {
-        if (err) { console.error("FFmpeg error:", stderr?.slice(-500)); return reject(new Error("FFmpeg failed")); }
-        resolve();
-      });
-    });
+    await ffmpegRun(ffArgs, { tag: "edit-video" }).catch(() => { throw new Error("FFmpeg failed"); });
 
     const filename = path.basename(outputVideo);
     const localUrl = `/videos/${filename}`;
@@ -7036,12 +7008,8 @@ function frameSize(resolution, aspectRatio) {
 // of sharing three lines isn't worth the churn. This is for the new credit-
 // deduction call sites, which all need the same thing: the REAL duration of
 // a finished export, never an estimate.
-function probeDurationSeconds(filePath) {
-  return new Promise((resolve) => {
-    exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`, (err, stdout) => {
-      resolve(parseFloat(stdout?.trim()) || 0);
-    });
-  });
+async function probeDurationSeconds(filePath) {
+  return parseFloat(await ffprobeOut(probeDurationArgs(filePath))) || 0;
 }
 
 // /api/edit-video burns captions onto the source clip's own resolution -
@@ -7050,13 +7018,10 @@ function probeDurationSeconds(filePath) {
 // from frameSize()/scaleFilter. Falls back to the 720x1280 default (matches
 // buildAssFile's own default) if ffprobe can't read the stream - better to
 // assume the common case than to leave the caption canvas unset.
-function probeVideoDimensions(filePath) {
-  return new Promise((resolve) => {
-    exec(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${filePath}"`, (err, stdout) => {
-      const m = /^(\d+)x(\d+)$/.exec(String(stdout || '').trim());
-      resolve(m ? { width: parseInt(m[1], 10), height: parseInt(m[2], 10) } : { width: 720, height: 1280 });
-    });
-  });
+async function probeVideoDimensions(filePath) {
+  const out = await ffprobeOut(['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', filePath]);
+  const m = /^(\d+)x(\d+)$/.exec(out);
+  return m ? { width: parseInt(m[1], 10), height: parseInt(m[2], 10) } : { width: 720, height: 1280 };
 }
 
 // The app ships the same TTFs and picks from the same list of family names, so the
@@ -7698,7 +7663,7 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // stills and muted clips a real silent track keeps the concat below uniform:
       // one branch that always has [n:a] to work with, rather than a chain that has
       // to know which clips happen to have sound.
-      const SILENCE_IN = '-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100';
+      const SILENCE_IN = ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100'];
       const clipVol = Number.isFinite(Number(item.volume))
         ? Math.max(0, Math.min(4, Number(item.volume)))
         : 1;
@@ -7779,25 +7744,25 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // succeeded, threw, or was never reached.
       let stabTrf = null;
 
-      let cmd;
+      let clipArgs;
       if (item.type === "image") {
         // A still is held for as long as the timeline holds it. Three seconds was
         // the app's default, not its answer.
         const stillDur = Number(item.duration) > 0 ? Number(item.duration) : 3;
-        cmd = `ffmpeg -y -loop 1 -i "${srcPath}" ${SILENCE_IN} -t ${stillDur.toFixed(3)} -vf "${vf}" -pix_fmt yuv420p -r 30 -c:a aac -shortest "${clipOut}"`;
+        clipArgs = ['-y', '-loop', '1', '-i', srcPath, ...SILENCE_IN, '-t', stillDur.toFixed(3), '-vf', vf, '-pix_fmt', 'yuv420p', '-r', '30', '-c:a', 'aac', '-shortest', clipOut];
       } else {
         // trimStart/trimEnd are absolute offsets into the source, so the clip runs for
         // the difference. -ss before -i so the seek does not decode everything ahead
         // of the in point; ffmpeg has seeked accurately from that position for years.
         const ss = Number(item.trimStart) > 0 ? Number(item.trimStart) : 0;
         const te = Number(item.trimEnd) > ss ? Number(item.trimEnd) : null;
-        const seek = ss > 0 ? `-ss ${ss.toFixed(3)} ` : '';
+        const seek = ss > 0 ? ['-ss', ss.toFixed(3)] : [];
         // -t goes before -i, so it bounds how much of the SOURCE is read rather than
         // how long the output runs. As an output option it would fight the speed
         // filter: a clip slowed to 0.5x runs twice the span, and -t would cut it in
         // half again - the trim would silently shorten as soon as speed was applied.
-        const span = te !== null ? `-t ${(te - ss).toFixed(3)} ` : '';
-        const inSpec = `${seek}${span}-i "${srcPath}"`;
+        const span = te !== null ? ['-t', (te - ss).toFixed(3)] : [];
+        const inSpec = [...seek, ...span, '-i', srcPath];
         // A source with no audio track of its own - a screen recording, a GIF turned
         // mp4 - would leave the map unsatisfied, so ask first rather than let the
         // whole clip prep fail on it.
@@ -7813,13 +7778,8 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
         let vfForClip = vf;
         if (wantsStabilize) {
           stabTrf = path.join(videosDir, uniqueName("vidstab", "trf"));
-          const detectCmd = `ffmpeg -y ${inSpec} -vf "${vfHead}vidstabdetect=shakiness=5:accuracy=15:result=${stabTrf}" -f null -`;
-          await new Promise((resolve, reject) => {
-            exec(detectCmd, { timeout: clipTimeoutMs }, (err, stdout, stderr) => {
-              if (err) { console.error("Stabilise detect error:", stderr?.slice(-300)); return reject(new Error("Stabilise failed")); }
-              resolve();
-            });
-          });
+          await ffmpegRun(['-y', ...inSpec, '-vf', `${vfHead}vidstabdetect=shakiness=5:accuracy=15:result=${stabTrf}`, '-f', 'null', '-'],
+            { timeout: clipTimeoutMs, tag: 'Stabilise detect' }).catch(() => { throw new Error("Stabilise failed"); });
           // unsharp after the transform is ffmpeg's own recommendation for this
           // filter: correcting shake resamples every frame, which softens it, and a
           // light sharpen puts back roughly what the interpolation took out.
@@ -7836,18 +7796,13 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
         const af = ['volume=' + clipVol].concat(audioFxChain(item.audioFx)).concat(extraAfPre)
           .concat(spd !== 1 ? atempoChain(spd) : [])
           .concat(freezeEnd > 0 ? [`apad=pad_dur=${freezeEnd}`] : []).join(',');
-          cmd = `ffmpeg -y ${inSpec} -vf "${vfForClip}${extraVf}${speedVf}" -af "${af}" -pix_fmt yuv420p -r 30 -c:a aac "${clipOut}"`;
+          clipArgs = ['-y', ...inSpec, '-vf', `${vfForClip}${extraVf}${speedVf}`, '-af', af, '-pix_fmt', 'yuv420p', '-r', '30', '-c:a', 'aac', clipOut];
         } else {
-          cmd = `ffmpeg -y ${inSpec} ${SILENCE_IN} -vf "${vfForClip}${extraVf}${speedVf}" -pix_fmt yuv420p -r 30 -map 0:v:0 -map 1:a:0 -c:a aac -shortest "${clipOut}"`;
+          clipArgs = ['-y', ...inSpec, ...SILENCE_IN, '-vf', `${vfForClip}${extraVf}${speedVf}`, '-pix_fmt', 'yuv420p', '-r', '30', '-map', '0:v:0', '-map', '1:a:0', '-c:a', 'aac', '-shortest', clipOut];
         }
       }
       try {
-        await new Promise((resolve, reject) => {
-          exec(cmd, { timeout: clipTimeoutMs }, (err, stdout, stderr) => {
-            if (err) { console.error("Clip prep error:", stderr?.slice(-300)); return reject(new Error("Clip prep failed")); }
-            resolve();
-          });
-        });
+        await ffmpegRun(clipArgs, { timeout: clipTimeoutMs, tag: 'Clip prep' }).catch(() => { throw new Error("Clip prep failed"); });
       } finally {
         // One per stabilised clip, and they are pure scratch - nothing reads a .trf
         // after its transform pass. Left behind they would accumulate exactly like
@@ -7860,18 +7815,11 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
 
     // Concat via xfade chain (per-boundary transitions from mediaItems[i].transition)
     async function hasAudioStream(filePath) {
-      return new Promise((resolve) => {
-        exec(`ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${filePath}"`,
-          (err, stdout) => resolve(!!(stdout && stdout.trim())));
-      });
+      return !!(await ffprobeOut(['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', filePath]));
     }
 
     async function getClipDurationSecs(filePath) {
-      return new Promise((resolve) => {
-        exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`, (err, stdout) => {
-          resolve(parseFloat(stdout?.trim()) || 3);
-        });
-      });
+      return parseFloat(await ffprobeOut(probeDurationArgs(filePath))) || 3;
     }
 
     let outputVideo = path.join(videosDir, uniqueName("media", "mp4"));
@@ -7884,7 +7832,7 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       for (const c of tempClips) clipDurations.push(await getClipDurationSecs(c));
 
       const XDUR = 0.5;
-      const inputsX = tempClips.map(p => `-i "${p}"`).join(' ');
+      const inputsX = tempClips.flatMap(p => ['-i', p]);
       let parts = [], timeline = 0, prevLabel = '0:v';
       // The audio is joined with acrossfade at the same durations the video is
       // xfaded at, so the two stay the same length and a transition sounds like it
@@ -7940,14 +7888,9 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
         prevALabel = outALabel;
       }
       const filterComplex = parts.concat(aParts).join(';');
-      const xfadeCmd = `ffmpeg -y ${inputsX} -filter_complex "${filterComplex}" -map "[vout]" -map "[aout]" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -c:a aac "${outputVideo}"`;
-
-      await new Promise((resolve, reject) => {
-        exec(xfadeCmd, { timeout: 180000 }, (err, stdout, stderr) => {
-          if (err) { console.error("Xfade concat error:", stderr?.slice(-500)); return reject(new Error("Concat failed")); }
-          resolve();
-        });
-      });
+      await ffmpegRun(['-y', ...inputsX, '-filter_complex', filterComplex, '-map', '[vout]', '-map', '[aout]',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p', '-c:a', 'aac', outputVideo],
+        { tag: 'Xfade concat' }).catch(() => { throw new Error("Concat failed"); });
     }
 
     tempClips.forEach(c => { try { fs.unlinkSync(c); } catch (e) {} });
@@ -7958,12 +7901,12 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       const withOverlaysOut = path.join(videosDir, uniqueName("withoverlays", "mp4"));
 
       let filterParts = [];
-      let inputs = [`-i "${outputVideo}"`];
+      let inputs = [outputVideo];
       let lastLabel = '0:v';
 
       overlays.forEach((ov, idx) => {
         const ovPath = resolveMediaPath(ov.url);
-        inputs.push(`-i "${ovPath}"`);
+        inputs.push(ovPath);
         const inIdx = idx + 1;
         const newLabel = `ov${idx}`;
 
@@ -8022,7 +7965,7 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       const renderedTextPngs = await textRenderer.render(textOverlays);
 
       renderedTextPngs.forEach(({ t, outPng, placeX, placeY }, idx) => {
-        inputs.push(`-i "${outPng}"`);
+        inputs.push(outPng);
         const inIdx = inputs.length - 1;
         const newLabel = `txt${idx}`;
         const hasTiming = typeof t.startTime === 'number' && typeof t.endTime === 'number';
@@ -8032,7 +7975,8 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       });
 
       const filterComplex = filterParts.join(';');
-      const overlayCmd = `ffmpeg -y ${inputs.join(' ')} -filter_complex "${filterComplex}" -map "[${lastLabel}]" -map 0:a? -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -c:a copy "${withOverlaysOut}"`;
+      const overlayArgs = ['-y', ...inputs.flatMap(p => ['-i', p]), '-filter_complex', filterComplex, '-map', `[${lastLabel}]`, '-map', '0:a?',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p', '-c:a', 'copy', withOverlaysOut];
 
       // Each renderedTextPngs entry's outPng was only ever an input to this one
       // ffmpeg call - once it's composited into withOverlaysOut (or the call
@@ -8040,12 +7984,7 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // Left unhandled before, these accumulated in uploads/ forever: one
       // txtrender-*.png per text overlay per export, never unlinked.
       try {
-        await new Promise((resolve, reject) => {
-          exec(overlayCmd, { timeout: 180000 }, (err, stdout, stderr) => {
-            if (err) { console.error("Overlay/text burn error:", stderr?.slice(-500)); return reject(new Error("Overlay burn failed")); }
-            resolve();
-          });
-        });
+        await ffmpegRun(overlayArgs, { tag: 'Overlay/text burn' }).catch(() => { throw new Error("Overlay burn failed"); });
         try { fs.unlinkSync(outputVideo); } catch (e) {}
         outputVideo = withOverlaysOut;
       } finally {
@@ -8058,15 +7997,21 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       updateJob(jobId, { progress: 80, message: "Mixing audio..." });
       const withAudioOut = path.join(videosDir, uniqueName("withaudio", "mp4"));
 
-      let inputs = [`-i "${outputVideo}"`];
-      audioTracks.forEach(track => {
-        if (track.url.startsWith('http')) {
-          inputs.push(`-i "${track.url}"`);
+      // A remote track is DOWNLOADED (through safeFetch) rather than handed to ffmpeg
+      // as a URL: ffmpeg would fetch any address itself, localhost included (SSRF), and
+      // the URL used to sit inside the shell string as well (Oct 24 2026).
+      let inputs = [outputVideo];
+      const trackDownloads = [];
+      for (const track of audioTracks) {
+        if (String(track.url).startsWith('http')) {
+          const dl = path.join(videosDir, uniqueName("track", "audio"));
+          await downloadToFile(track.url, dl, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+          trackDownloads.push(dl);
+          inputs.push(dl);
         } else {
-          const trackPath = resolveMediaPath(track.url);
-          inputs.push(`-i "${trackPath}"`);
+          inputs.push(resolveMediaPath(track.url));
         }
-      });
+      }
 
       // Each track carries its own placement from the editor timeline:
       //   atrim/asetpts  - the trimmed region of the source file
@@ -8139,14 +8084,12 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // the first audio track (a 6s voiceover cut a 12s video down to 6s).
       const filterComplex = `${audioLabels};${mixInputs}amix=inputs=${audioTracks.length + 1}:duration=longest:dropout_transition=2:normalize=0[amixed];[amixed]apad[aout]`;
 
-      const audioCmd = `ffmpeg -y ${inputs.join(' ')} -filter_complex "${filterComplex}" -map 0:v -map "[aout]" -c:v copy -c:a aac -shortest "${withAudioOut}"`;
-
-      await new Promise((resolve, reject) => {
-        exec(audioCmd, { timeout: 180000 }, (err, stdout, stderr) => {
-          if (err) { console.error("Audio mix error:", stderr?.slice(-500)); return reject(new Error("Audio mix failed")); }
-          resolve();
-        });
-      });
+      try {
+        await ffmpegRun(['-y', ...inputs.flatMap(p => ['-i', p]), '-filter_complex', filterComplex, '-map', '0:v', '-map', '[aout]',
+          '-c:v', 'copy', '-c:a', 'aac', '-shortest', withAudioOut], { tag: 'Audio mix' }).catch(() => { throw new Error("Audio mix failed"); });
+      } finally {
+        trackDownloads.forEach(p => fs.unlink(p, () => {}));
+      }
       try { fs.unlinkSync(outputVideo); } catch (e) {}
       outputVideo = withAudioOut;
     }
@@ -8161,12 +8104,8 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
     if (allowed.watermark) {
       const watermarked = path.join(videosDir, uniqueName("wm", "mp4"));
       const watermark = "drawtext=text='Tonefy AI':fontsize=18:fontcolor=white@0.5:x=(w-text_w)/2:y=h-th-20";
-      await new Promise((resolve, reject) => {
-        exec(`ffmpeg -y -i "${outputVideo}" -vf "${watermark}" -c:a copy "${watermarked}"`, { timeout: 120000 }, (err, stdout, stderr) => {
-          if (err) { console.error("Watermark burn error:", stderr?.slice(-500)); return reject(new Error("Watermark burn failed")); }
-          resolve();
-        });
-      });
+      await ffmpegRun(['-y', '-i', outputVideo, '-vf', watermark, '-c:a', 'copy', watermarked], { timeout: 120000, tag: 'Watermark burn' })
+        .catch(() => { throw new Error("Watermark burn failed"); });
       try { fs.unlinkSync(outputVideo); } catch (e) {}
       outputVideo = watermarked;
     }
