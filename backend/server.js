@@ -22,6 +22,7 @@ import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
 import { getFirestore as getAdminFirestore, FieldValue } from "firebase-admin/firestore";
 import { publicError } from "./publicError.js";
+import { createContentSafety, isRefusal, REFUSAL_MESSAGE } from "./contentSafety.js";
 import { createNextDayEmail, verifyUnsubscribe, escapeHtml } from "./nextDayEmail.js";
 import { createWebPayments } from "./webPayments.js";
 import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, isAdminUid, FREE_RESET_MS } from "./tiers.js";
@@ -329,6 +330,16 @@ const emailLimiter = rateLimit({
 const PEXELS_API_KEY = process.env.PEXELS_API_KEY;
 if (!process.env.GROQ_API_KEY) throw new Error("GROQ_API_KEY not set in .env");
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+// Screens what users ask Tonefy to voice, caption or film, and logs blocks to
+// safetyBlocks/ (see contentSafety.js for the why and the fail-open rule).
+const safety = createContentSafety({ groq, db: adminDb, FieldValue });
+// One refusal shape for every route, so the app and website can show `error` as-is.
+const blockedResponse = (res, v) => res.status(422).json({ error: v.message, code: 'content_blocked' });
+// What extract-segments clears and idea-to-video-v2 screens: the segment text AND the
+// keywords, because both feed the AI scene prompts. Same string on both sides, so the
+// normal flow is a cache hit rather than a second classifier call.
+const segmentsSafetyText = (segments) => (Array.isArray(segments) ? segments : [])
+  .map(s => `${s?.text || ''} ${s?.keywords || ''}`.trim()).join('\n');
 
 // Script cache — avoids duplicate Groq calls for same prompt
 const scriptCache = new Map();
@@ -2781,6 +2792,13 @@ Video script:`
     });
 
     if (!script) return res.status(500).json({ error: "Failed to generate script from URL" });
+    if (isRefusal(script)) {
+      console.warn(`[safety] extract-url refusal for ${url}: ${JSON.stringify(script.slice(0, 120))}`);
+      return res.status(422).json({ error: "We couldn't turn that page into a script. Please try a different link.", code: 'refusal' });
+    }
+    // A web page is anyone's words, so the script is screened rather than trusted.
+    const verdict = await safety.screen(script, { uid: req.user?.uid, route: 'extract-url' });
+    if (!verdict.ok) return blockedResponse(res, verdict);
 
     res.json({ script, title, url });
   } catch (err) {
@@ -2793,6 +2811,10 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
   const { prompt, targetSeconds: requestedSeconds } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
   try {
+    // The idea is screened before anything is written from it (Oct 23 review: sexual
+    // prompts were voiced and captioned, unchecked).
+    const verdict = await safety.screen(prompt, { uid: req.user?.uid, route: 'generate-script' });
+    if (!verdict.ok) return blockedResponse(res, verdict);
     // Ask for a script that will actually fit the plan's export limit. Raising the
     // free cap alone is not enough: a script written to no particular length can
     // always overshoot, and the failure lands at the very end of the flow, after
@@ -2821,6 +2843,7 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
     const cached = getCached(cacheKey);
     if (cached) {
       console.log('[CACHE HIT] generate-script:', prompt.substring(0, 40));
+      safety.markCleared(cached);
       return res.json({ script: cached, cached: true });
     }
     const script = await callLLM({
@@ -2855,6 +2878,14 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
       max_tokens: Math.min(2000, Math.max(400, Math.round(targetSeconds * 2.5 * 1.5))),
       temperature: 0.8,
     });
+    // A refusal is not a script. It once became a whole video ("I'm sorry, but I can't
+    // help with that." voiced and captioned) - and it must not be cached either.
+    if (isRefusal(script)) {
+      console.warn(`[safety] generate-script refusal uid=${req.user?.uid || '-'}: ${JSON.stringify(prompt.slice(0, 120))}`);
+      return res.status(422).json({ error: REFUSAL_MESSAGE, code: 'refusal' });
+    }
+    // Written by us from a prompt that passed: the voiceover step need not re-screen it.
+    safety.markCleared(script);
     setCache(cacheKey, script);
     res.json({ script });
   } catch (err) {
@@ -2967,6 +2998,10 @@ app.post("/api/caption-suggest", scriptLimiter, async (req, res) => {
   if (text.length < 3) {
     return res.status(400).json({ error: "Tell us a few words about the video first." });
   }
+  // The caption is published under the user's name, so the description it is written
+  // from is screened like an idea (normally a cache hit: it is the video's own script).
+  const verdict = await safety.screen(text, { uid: req.user?.uid, route: 'caption-suggest' });
+  if (!verdict.ok) return blockedResponse(res, verdict);
   // Per-platform, because the conventions genuinely differ: TikTok rewards a hook and
   // several hashtags, LinkedIn punishes both.
   const style = {
@@ -3001,6 +3036,7 @@ app.post("/api/caption-suggest", scriptLimiter, async (req, res) => {
       .trim()
       .slice(0, 2200);
     if (!caption) return res.status(502).json({ error: "Could not write a caption. Try again." });
+    if (isRefusal(caption)) return res.status(422).json({ error: "We couldn't write a caption for this video. Please write your own.", code: 'refusal' });
     setCache(cacheKey, caption);
     res.json({ caption });
   } catch (e) {
@@ -3105,6 +3141,11 @@ function shapeFilter(rate, semitones) {
 app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
   const { text, voiceId = "gtts-us", rate = 1, pitch = 0, musicId = null, musicVolume = 0.18 } = req.body;
   if (!text?.trim()) return res.status(400).json({ error: "Text is required" });
+  // This is where words become a voice, whoever wrote them - a typed Script is the path
+  // the Oct 12 sexual prompts took. A script we wrote ourselves is a cache hit here.
+  if (isRefusal(text)) return res.status(422).json({ error: REFUSAL_MESSAGE, code: 'refusal' });
+  const verdict = await safety.screen(text, { uid: req.user?.uid, route: 'generate-audio' });
+  if (!verdict.ok) return blockedResponse(res, verdict);
   try {
     // Voice restriction lives here, not on idea-to-video-v2: that endpoint
     // only ever consumes audio this one already generated, so it never sees
@@ -3202,6 +3243,8 @@ app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
 app.post("/api/tts", scriptLimiter, async (req, res) => {
   const { text } = req.body;
   if (!text?.trim()) return res.status(400).json({ error: "text required" });
+  const verdict = await safety.screen(text, { uid: req.user?.uid, route: 'tts' });
+  if (!verdict.ok) return blockedResponse(res, verdict);
   try {
     const audioFilename = uniqueName("gtts", "mp3");
     const audioPath = path.join(audiosDir, audioFilename);
@@ -3229,6 +3272,11 @@ app.get("/api/job/:jobId", jobPollLimiter, (req, res) => {
 
 app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
   const { voiceover = "", selectedVideo, selectedVideos, audioUrl: providedAudioUrl, aspectRatio = "9:16", captionStyle = "classic", captionMeta = null, musicTrack = "mixkit-deep-meditation-109", videoSpeed = 1.0, transition = "fade" } = req.body || {};
+  // The voiceover is burned in as captions, so it is screened even when the audio was
+  // made (and screened) elsewhere - normally a cache hit.
+  if (isRefusal(voiceover)) return res.status(422).json({ error: REFUSAL_MESSAGE, code: 'refusal' });
+  const verdict = await safety.screen(voiceover, { uid: req.user?.uid, route: 'idea-to-video' });
+  if (!verdict.ok) return blockedResponse(res, verdict);
   const jobId = createJob(req.user.uid);
   res.json({ jobId }); // Return immediately
   try {
@@ -3336,6 +3384,8 @@ app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
 app.post("/api/extract-segments", scriptLimiter, async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: "Text required" });
+  const verdict = await safety.screen(text, { uid: req.user?.uid, route: 'extract-segments' });
+  if (!verdict.ok) return blockedResponse(res, verdict);
   try {
     const raw = await groqChat({
       messages: [
@@ -3367,6 +3417,8 @@ Return ONLY a JSON array, no other text: [{"text":"...","keywords":"..."}]` },
         segments.push({ text: chunk, keywords: chunk.split(' ').slice(0, 3).join(' ') });
       }
     }
+    // Written by us from screened text; idea-to-video-v2 screens exactly this string.
+    safety.markCleared(segmentsSafetyText(segments));
     res.json({ segments });
   } catch (err) {
     console.error("extract-segments error:", err.message);
@@ -3487,6 +3539,14 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
   );
   const allowed = await checkRenderAllowed(adminDb, userId, { requestedDurationSeconds: roughEstimateSeconds });
   if (!allowed.ok) return res.status(allowed.status).json({ error: allowed.error });
+  // The voiceover becomes the captions; segment text and keywords become the AI scene
+  // prompts (paid generation of imagery). Both are screened here because a caller can
+  // send any of them - in the normal flow both are cache hits from earlier steps.
+  if (isRefusal(voiceover)) return res.status(422).json({ error: REFUSAL_MESSAGE, code: 'refusal' });
+  for (const t of [voiceover, segmentsSafetyText(segments)]) {
+    const verdict = await safety.screen(t, { uid: userId, route: 'idea-to-video-v2' });
+    if (!verdict.ok) return blockedResponse(res, verdict);
+  }
   if (!captionStyleAllowed(allowed.plan, captionStyle)) {
     return res.status(403).json({ error: `The "${captionStyle}" caption style is available on the Pro and Creator plans.` });
   }
@@ -4821,6 +4881,11 @@ app.post('/api/account/delete', verifyToken, async (req, res) => {
   // the reported content are not needed once the reporter is gone.
   await step('contentReports', async () => {
     const q = await adminDb.collection('contentReports').where('uid', '==', uid).get();
+    for (const d of q.docs) await d.ref.delete();
+  });
+  // Content-safety block records (contentSafety.js): the excerpt is this user's text.
+  await step('safetyBlocks', async () => {
+    const q = await adminDb.collection('safetyBlocks').where('uid', '==', uid).get();
     for (const d of q.docs) await d.ref.delete();
   });
   await step('emailPrefs', () => adminDb.collection('emailPrefs').doc(uid).delete());
