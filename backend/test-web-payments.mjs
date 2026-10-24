@@ -148,8 +148,31 @@ c = await wp.confirm({ orderTrackingId: tracking, txRef: ref });
 rec = (await db.collection('webPayments').doc(ref).get()).data();
 assert(c.state === 'reversed' && rec.status === 'reversed-after-grant' && (await db.collection('users').doc(uid).get()).data().plan === 'pro', 'reversal recorded for the owner');
 
+// a reversal is final: a later COMPLETED read grants nothing and keeps the reversal
+await db.collection('users').doc(uid).set({ plan: 'free', creditsRemaining: 10 }, { merge: true });
+fakeTx = T(1);
+c = await wp.confirm({ orderTrackingId: tracking, txRef: ref, uid });
+rec = (await db.collection('webPayments').doc(ref).get()).data();
+u = (await db.collection('users').doc(uid).get()).data();
+assert(!c.granted && rec.status === 'reversed-after-grant' && u.plan === 'free', `no second grant after a reversal (${c.state}, ${rec.status}, ${u.plan})`);
+
+// fail closed: a record with no stored tracking id (order start failed) is never granted,
+// even when a "completed" order carries our reference (public sandbox keys)
+await db.collection('webPayments').doc('tfy-orphan-test-000000').set({ uid, plan: 'pro', amount: 30000, currency: 'UGX',
+  status: 'pending', provider: 'pesapal', env: 'sandbox' });
+fakeTx = txFor({ ref: 'tfy-orphan-test-000000', tracking: 'eeeeeeee-ffff-0000-1111-222222222222', currency: 'UGX', amount: 30000 }, 1);
+c = await wp.confirm({ orderTrackingId: 'eeeeeeee-ffff-0000-1111-222222222222', txRef: 'tfy-orphan-test-000000', uid });
+assert(c.status === 400 && !c.granted && (await db.collection('users').doc(uid).get()).data().plan === 'free', 'record without our tracking id is never granted');
+// and a sandbox record cannot be granted once running live
+await db.collection('webPayments').doc('tfy-orphan-test-000000').set({ orderTrackingId: 'eeeeeeee-ffff-0000-1111-222222222222' }, { merge: true });
+process.env.PESAPAL_ENV = 'live';
+c = await wp.confirm({ orderTrackingId: 'eeeeeeee-ffff-0000-1111-222222222222', txRef: 'tfy-orphan-test-000000', uid }).catch(e => ({ status: 'threw', error: e.message }));
+delete process.env.PESAPAL_ENV;
+assert(!c.granted && (await db.collection('users').doc(uid).get()).data().plan === 'free', `sandbox record refused in live mode (${c.status})`);
+await db.collection('webPayments').doc('tfy-orphan-test-000000').delete();
+
 // expiry
-await db.collection('users').doc(uid).set({ webPassUntil: new Date(Date.now() - 1000).toISOString(), creditsRemaining: 42 }, { merge: true });
+await db.collection('users').doc(uid).set({ plan: 'pro', webPassStatus: 'active', webPassUntil: new Date(Date.now() - 1000).toISOString(), creditsRemaining: 42 }, { merge: true });
 await wp.expireSweep();
 u = (await db.collection('users').doc(uid).get()).data();
 assert(u.plan === 'free' && u.webPassStatus === 'ended' && u.creditsRemaining === 10, `expired -> free with ${u.creditsRemaining} credits`);

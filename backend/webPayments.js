@@ -215,7 +215,9 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
       uid, plan, amount, currency, status: 'pending', provider: 'pesapal', env: liveMode() ? 'live' : 'sandbox',
       createdAt: new Date().toISOString(),
     });
-    const order = await pesapal('/Transactions/SubmitOrderRequest', {
+    let order;
+    try {
+    order = await pesapal('/Transactions/SubmitOrderRequest', {
       method: 'POST',
       body: JSON.stringify({
         id: ref,
@@ -233,6 +235,12 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
       }),
     });
     if (!order.redirect_url || !order.order_tracking_id) throw new Error('pesapal: order returned no payment page');
+    } catch (e) {
+      // A record without a tracking id can never be granted (confirm requires a match), and
+      // this marks it dead so nothing tries.
+      await payments.doc(ref).set({ status: 'start-failed', failedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+      throw e;
+    }
     await payments.doc(ref).set({ orderTrackingId: order.order_tracking_id }, { merge: true });
     return { status: 200, link: order.redirect_url, txRef: ref };
   }
@@ -265,15 +273,29 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
       if (!pay.exists) return { status: 404, error: 'We could not find that payment.' };
       const p = pay.data();
       if (uid && p.uid !== uid) return { status: 403, error: 'This payment belongs to another account.' };
-      if (p.orderTrackingId && p.orderTrackingId !== tracking) return { status: 400, error: 'That payment does not match this checkout.' };
+      // FAIL CLOSED (automated review, Oct 24 2026): the order must be the one start() made -
+      // its tracking id stored and equal - and from the mode we are in now. Otherwise, in the
+      // sandbox (Pesapal's demo keys are PUBLIC), anyone could make an order carrying one of our
+      // references and pay it with test money.
+      if (p.provider !== 'pesapal' || !p.orderTrackingId || p.orderTrackingId !== tracking
+        || p.env !== (liveMode() ? 'live' : 'sandbox')) {
+        return { status: 400, error: 'That payment does not match this checkout.' };
+      }
       const seen = { pesapalCode: code, pesapalMethod: tx.payment_method || null, checkedAt: new Date().toISOString() };
       if (code === 3) {
         // Money went back (a card chargeback or a reversed mobile-money payment). Recorded and
         // shouted about, not silently undone: the owner decides what happens to the pass.
-        t.set(payRef, { ...seen, status: p.status === 'granted' ? 'reversed-after-grant' : 'reversed' }, { merge: true });
+        const wasGranted = p.status === 'granted' || p.status === 'reversed-after-grant' || !!p.grantedAt;
+        t.set(payRef, { ...seen, status: wasGranted ? 'reversed-after-grant' : 'reversed' }, { merge: true });
         return { status: 200, granted: false, state: 'reversed', reversedGrant: p.status === 'granted' ? p.uid : null };
       }
       if (p.status === 'granted') return { status: 200, granted: true, plan: p.plan, until: p.passUntil };
+      // Final states. A reversal is never overwritten and nothing is ever granted twice:
+      // grantedAt survives a later status change, so a "completed" read after a reversal
+      // cannot grant the pass again (automated review, Oct 24 2026).
+      if (String(p.status).startsWith('reversed') || p.grantedAt || p.status === 'start-failed') {
+        return { status: 200, granted: false, state: String(p.status).startsWith('reversed') ? 'reversed' : 'closed' };
+      }
 
       if (code !== 1) {
         const next = code === 2 ? 'failed' : 'pending';
