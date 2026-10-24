@@ -8130,4 +8130,10 @@ const nextDayEmail = createNextDayEmail({
 });
 nextDayEmail.start();
 
-app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
+// Loopback only, both families: nginx reaches this as `localhost:5000` (which it may try
+// as ::1 or 127.0.0.1). Listening on every interface let anyone hit :5000 directly,
+// skipping nginx - and then send their own X-Real-IP, which the pre-auth rate limits
+// trust (limitKey). Found Oct 24 2026; no firewall (no ufw) stood in front of it.
+app.listen(PORT, '127.0.0.1', () => console.log(`Server running at http://127.0.0.1:${PORT}`));
+app.listen(PORT, '::1', () => console.log(`Server also on [::1]:${PORT}`))
+  .on('error', (e) => console.warn('[listen] ::1 unavailable:', e.message));
