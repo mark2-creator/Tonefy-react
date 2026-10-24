@@ -23,6 +23,7 @@ import { getStorage } from "firebase-admin/storage";
 import { getFirestore as getAdminFirestore, FieldValue } from "firebase-admin/firestore";
 import { publicError } from "./publicError.js";
 import { createContentSafety, isRefusal, REFUSAL_MESSAGE } from "./contentSafety.js";
+import { safeFetch, readTextCapped, isUnsafeUrlError } from "./safeFetch.js";
 import { createNextDayEmail, verifyUnsubscribe, escapeHtml } from "./nextDayEmail.js";
 import { createWebPayments } from "./webPayments.js";
 import { checkRenderAllowed, deductCredits, voiceAllowed, captionStyleAllowed, getUserPlanData, tierConfig, isAdminUid, FREE_RESET_MS } from "./tiers.js";
@@ -1913,8 +1914,10 @@ function assStyleFromSpec(meta) {
   };
 }
 
+// Every URL that reaches here can come from a user (audioUrl, selectedVideo, beat/waveform
+// url...), so it goes through safeFetch: public addresses on 80/443 only (SSRF, Oct 24 2026).
 async function downloadToFile(url, outPath, headers = {}) {
-  const res = await fetch(url, { headers, timeout: 60000 });
+  const res = await safeFetch(url, { headers });
   if (!res.ok) throw new Error(`Download failed ${url}: ${res.status}`);
   const fileStream = fs.createWriteStream(outPath);
   await new Promise((resolve, reject) => {
@@ -2730,19 +2733,31 @@ app.post("/api/extract-url", scriptLimiter, verifyToken, async (req, res) => {
   }
 
   try {
-    // Fetch the page
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      timeout: 15000,
-    });
+    // Fetch the page - through safeFetch, never plain fetch: this URL is the user's, and a
+    // plain fetch would read http://127.0.0.1:<any port> back to them as a "script" (SSRF,
+    // fixed Oct 24 2026). node-fetch v3 ignores a `timeout` option, so it is a signal.
+    let response;
+    try {
+      response = await safeFetch(parsedUrl.href, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        signal: AbortSignal.timeout(15000),
+      });
+    } catch (e) {
+      if (isUnsafeUrlError(e)) {
+        console.warn(`[extract-url] refused uid=${req.user?.uid || '-'} ${JSON.stringify(url).slice(0, 200)}: ${e.message}`);
+        return res.status(400).json({ error: "That link can't be used. Please paste a link to a public web page." });
+      }
+      throw e;
+    }
 
-    if (!response.ok) return res.status(400).json({ error: `Failed to fetch URL: ${response.status}` });
+    if (!response.ok) return res.status(400).json({ error: "We couldn't open that page. Please check the link and try again." });
 
-    const html = await response.text();
+    // Capped: a link to a huge file must not be buffered whole into memory.
+    const html = await readTextCapped(response, 5 * 1024 * 1024);
     const $ = cheerio.load(html);
 
     // Remove unwanted elements
@@ -4393,7 +4408,7 @@ async function publishToTikTok({
     return { ok: false, error: 'Branded content cannot be posted privately. Choose Public or Friends.' };
   }
   try {
-    const videoRes = await fetch(videoUrl);
+    const videoRes = await safeFetch(videoUrl);
     if (!videoRes.ok) return { ok: false, error: `Could not read the video (${videoRes.status})` };
     const videoBuffer = Buffer.from(await videoRes.arrayBuffer());
     const videoSize = videoBuffer.length;
@@ -5668,7 +5683,7 @@ async function publishToPinterest({ account: accountId, uid, videoUrl, caption, 
 
     const reg = await (await fetch(`${PIN_API}/media`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify({ media_type: 'video' }) })).json();
     if (!reg.media_id || !reg.upload_url) return { ok: false, error: publicError(reg.message || '', 'Pinterest would not accept the upload.', 'pinterest') };
-    const videoRes = await fetch(videoUrl);
+    const videoRes = await safeFetch(videoUrl);
     if (!videoRes.ok) return { ok: false, error: `Could not read the video (${videoRes.status}).` };
     const videoBuf = Buffer.from(await videoRes.arrayBuffer());
     const form = new FormData();
@@ -5833,7 +5848,7 @@ async function publishToLinkedIn({ account: memberId, uid, videoUrl, caption }) 
       'X-Restli-Protocol-Version': '2.0.0',
       'Content-Type': 'application/json',
     };
-    const videoRes = await fetch(videoUrl);
+    const videoRes = await safeFetch(videoUrl);
     if (!videoRes.ok) return { ok: false, error: `Could not read the video (${videoRes.status}).` };
     const videoBuf = Buffer.from(await videoRes.arrayBuffer());
     // 1) initializeUpload
@@ -6514,7 +6529,7 @@ app.post('/tiktok/post-video', tiktokLimiter, verifyToken, async (req, res) => {
 
   try {
     // Download video to buffer
-    const videoRes = await fetch(videoUrl);
+    const videoRes = await safeFetch(videoUrl);
     const videoBuffer = Buffer.from(await videoRes.arrayBuffer());
     const videoSize = videoBuffer.length;
 
