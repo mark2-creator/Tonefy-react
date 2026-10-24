@@ -1937,6 +1937,110 @@ function pickBestMp4(videoObj) {
 
 function isHttpUrl(s) { return typeof s === "string" && /^https?:\/\//i.test(s); }
 
+// The smallest rendition that still covers the frame. pickBestMp4's "hd" can be a
+// 4K file for a 720p video, and a video now downloads ~12 clips, not ~4.
+function pickMp4ForFrame(videoObj, w, h) {
+  const mp4s = (videoObj?.video_files || []).filter(f => f.file_type === "video/mp4" && f.link && f.width && f.height);
+  if (!mp4s.length) return pickBestMp4(videoObj);
+  const need = Math.min(w, h);
+  const covering = mp4s.filter(f => Math.min(f.width, f.height) >= need).sort((a, b) => a.width * a.height - b.width * b.height);
+  if (covering.length) return covering[0].link;
+  return mp4s.sort((a, b) => b.width * b.height - a.width * a.height)[0].link;
+}
+
+// -14 LUFS integrated, -1.5 dBTP: where TikTok/Reels/Shorts play (Oct 23 review measured
+// every Tonefy video at -19.4 LUFS - audibly quieter than the posts around it). One-pass
+// loudnorm, which is dynamic but fine for speech over a bed; it resamples to 192 kHz, so
+// aresample brings it back for AAC.
+const LOUDNORM_SOCIAL = 'loudnorm=I=-14:TP=-1.5:LRA=11,aresample=44100';
+
+// One segment of a generated video, cut into shots of ~SHOT_SECONDS (Oct 24 2026, step 2
+// of the Oct 23 quality review). Shots come, in order, from the segment's AI clip (if it
+// has one - it plays through in sequence, so its motion is not chopped up) and then from
+// different Pexels results for the segment's keywords: ONE search per segment, as before,
+// asking for more results - Pexels allows 200 requests an hour, so more searches per
+// video would cap how many videos an hour the app can make. Too few results: clips are
+// reused from a later point in the clip. Writes `outPath`; leaves it absent on failure
+// (the caller falls back to black).
+const SHOT_SECONDS = 2.5;
+async function buildSegmentShots({ seg, dur, aiFile, aspectRatio, scaleW, scaleH, scaleFilter, outPath }) {
+  const nShots = Math.max(1, Math.ceil(dur / SHOT_SECONDS - 0.15));
+  const shotDur = dur / nShots;
+  const sources = []; // { file, offset }
+  const downloaded = [];
+
+  if (aiFile) {
+    const aiLen = await probeDurationSeconds(aiFile);
+    const fromAi = Math.max(1, Math.min(nShots, Math.floor((aiLen + 0.05) / shotDur)));
+    for (let k = 0; k < fromAi; k++) sources.push({ file: aiFile, offset: k * shotDur });
+  }
+
+  const want = nShots - sources.length;
+  if (want > 0) {
+    let videos = [];
+    try {
+      const orientation = aspectRatio === '9:16' ? 'portrait' : aspectRatio === '1:1' ? 'square' : 'landscape';
+      const r = await fetch(`https://api.pexels.com/videos/search?query=${encodeURIComponent(seg.keywords || 'background')}&per_page=${Math.min(15, want + 3)}&orientation=${orientation}`,
+        { headers: { Authorization: PEXELS_API_KEY } });
+      const d = await r.json();
+      videos = (d.videos || []).filter(v => v.video_files?.length > 0);
+    } catch (e) { console.error("segment search error:", e.message); }
+
+    const picked = videos.slice(0, want);
+    const files = await mapWithConcurrency(picked, 4, async (vid) => {
+      const url = pickMp4ForFrame(vid, scaleW, scaleH);
+      if (!url) return null;
+      const raw = path.join(videosDir, uniqueName("seg-raw", "mp4"));
+      try {
+        await downloadToFile(url, raw, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
+        downloaded.push(raw);
+        return { file: raw, len: Number(vid.duration) || 0 };
+      } catch (e) { console.error("segment download failed:", e.message); return null; }
+    });
+    const ok = files.filter(Boolean);
+    for (let k = 0; ok.length && k < want; k++) {
+      const src = ok[k % ok.length];
+      const round = Math.floor(k / ok.length);
+      // Skip the first half-second (stock clips often open on a fade); a reused clip
+      // starts further in so the repeat is a different moment of it.
+      const offset = src.len > shotDur * (round + 1) + 0.5 ? 0.5 + round * shotDur : 0;
+      sources.push({ file: src.file, offset });
+    }
+  }
+  if (!sources.length) return;
+
+  // Every shot at the same size, rate and timescale, so they join with a stream copy.
+  const shotPaths = [];
+  try {
+    for (const [k, src] of sources.entries()) {
+      const shot = path.join(videosDir, uniqueName(`shot${k}`, "mp4"));
+      try {
+        await run("ffmpeg", ["-y", "-ss", src.offset.toFixed(2), "-stream_loop", "-1", "-i", src.file, "-t", shotDur.toFixed(3),
+          "-vf", `${scaleFilter},setsar=1,fps=30`, "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+          "-pix_fmt", "yuv420p", "-video_track_timescale", "30000", shot], { timeout: 60000 });
+        shotPaths.push(shot);
+      } catch (e) { console.error("shot ffmpeg error:", String(e.stderr || e.message).slice(-300)); }
+    }
+    if (!shotPaths.length) return;
+    // A failed shot must not shorten the segment (captions are timed to the voice), so
+    // the survivors are stretched over the full duration by the last one looping.
+    if (shotPaths.length === 1) {
+      await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", shotPaths[0], "-t", dur.toFixed(3), "-c", "copy", outPath], { timeout: 60000 });
+      return;
+    }
+    const list = path.join(videosDir, uniqueName("shots", "txt"));
+    fs.writeFileSync(list, shotPaths.map(p => `file '${p}'`).join('\n'));
+    try {
+      await run("ffmpeg", ["-y", "-stream_loop", "-1", "-f", "concat", "-safe", "0", "-i", list, "-t", dur.toFixed(3),
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p", "-video_track_timescale", "30000", outPath], { timeout: 120000 });
+    } finally { fs.unlink(list, () => {}); }
+  } finally {
+    shotPaths.forEach(p => fs.unlink(p, () => {}));
+    // Only Pexels downloads are ours to delete; an AI clip lives in the AI cache.
+    downloaded.forEach(p => fs.unlink(p, () => {}));
+  }
+}
+
 // Retention promise: free users keep 72h, paid users (any plan other than
 // "free") keep 30 days. Both live on this VPS's disk - there's no permanent
 // tier yet. Upgrading that promise later (e.g. to real cloud storage) is
@@ -2404,7 +2508,7 @@ function buildCaptionFilter(script, audioDuration) {
   });
   return filters.join(',');
 }
-function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestamps = null, captionMeta = null, videoWidth = 720, videoHeight = 1280) {
+function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestamps = null, captionMeta = null, videoWidth = 720, videoHeight = 1280, opts = {}) {
   // The ASS canvas. Every size in this file - font sizes, outline, shadow, margins - is
   // in pixels DESIGNED for a 720-wide portrait frame. Item 14 (Aug 11 2026) made the
   // canvas the real output size to stop libass stretching it non-uniformly, which was
@@ -2567,9 +2671,25 @@ function buildAssFile(script, audioDuration, assPath, captionStyle, wordTimestam
   // A spec from the app wins over the twelve ids this file happens to know: the
   // catalogue has a hundred and thirty, and an id lookup would quietly render the
   // other hundred and eighteen as "classic".
-  const s = (captionMeta && captionMeta.spec)
+  let s = (captionMeta && captionMeta.spec)
     ? assStyleFromSpec(captionMeta)
     : (STYLES[captionStyle] || STYLES["classic"]);
+  // `social`: the layout for videos Tonefy GENERATES (idea/script/url), where the
+  // caption is the main text a muted scroller reads. The Oct 23 review found them at
+  // ~2% of frame height, sitting in the bottom band that TikTok/Reels cover with the
+  // caption and buttons. 2x (1.7x looked small on a real render) and lifted to ~28% up
+  // the frame on portrait.
+  // NOT for the editor's auto-captions, which must match what the user saw on canvas.
+  if (opts.social) {
+    const k = 2.0;
+    s = {
+      ...s,
+      fontsize: Math.round(s.fontsize * k),
+      outline_w: Number((s.outline_w * 1.4).toFixed(1)),
+      shadow: Number((s.shadow * 1.4).toFixed(1)),
+      marginV: Math.round(playResY * (playResY > playResX ? 0.28 : 0.12)),
+    };
+  }
 
   // Matching the real output frame, not a fixed 9:16 guess - libass maps this
   // virtual canvas onto the actual encoded resolution, stretching it
@@ -2601,6 +2721,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
   // Position variation — alternate center/bottom every 5 words
   const getMarginV = (i) => {
+    if (opts.social) return s.marginV;
     const positions = [80, 80, 80, 80, 80, 80, 80, 80, 80, 80];
     return positions[i % positions.length];
   };
@@ -2794,7 +2915,7 @@ app.post("/api/extract-url", scriptLimiter, verifyToken, async (req, res) => {
     const script = await groqChat({
       messages: [{
         role: "user",
-        content: `Convert this article/webpage content into a short, engaging video script (60-90 seconds when spoken). Write it as natural spoken narration, no headers or bullet points. Keep it informative and engaging.
+        content: `Convert this article/webpage content into a short, engaging video script (30-45 seconds when spoken, about 60-85 words). Open with a hook: a first sentence under 10 words that is a bold claim, surprising fact or question from the content - never a greeting. Write it as natural spoken narration, no headers or bullet points. Keep it informative and engaging.
 
 Title: ${title}
 
@@ -2849,7 +2970,10 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
     // pricing, so a longer audio being a paid feature needs no new policy.
     const targetSeconds = Number(requestedSeconds) > 0
       ? Math.max(15, Math.min(Math.round(Number(requestedSeconds)), capSeconds))
-      : Math.min(90, Math.round(capSeconds * 0.6));
+      // 30 s for video (was up to 90): the Oct 23 review measured our videos at 51-108 s
+      // against a benchmark of 10-27 s, and short-form feeds reward finishing. Still
+      // clamped by the plan cap for a free account's sake.
+      : Math.min(30, Math.round(capSeconds * 0.6));
 
     // The target belongs in the cache key. Without it the first caller's plan
     // decides the length everyone else gets - a Pro-length script served from
@@ -2884,7 +3008,7 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
       // part. Generated scripts are slower because they are written in short
       // sentences and every sentence end is a pause. Timing a passage of prose to
       // pick this number gives the wrong answer by about 25%.
-      system: `You are a professional video script writer. Write an engaging social media video script that takes about ${targetSeconds} seconds to read aloud at a natural pace. It must be between ${Math.round(targetSeconds * 1.8)} and ${Math.round(targetSeconds * 2.0)} words - do not go under the minimum or over the maximum. Write ONLY spoken narration - no stage directions, no Narrator:, no timestamps, no scene descriptions. Just pure spoken words.`,
+      system: `You are a professional video script writer. Write an engaging social media video script that takes about ${targetSeconds} seconds to read aloud at a natural pace. It must be between ${Math.round(targetSeconds * 1.8)} and ${Math.round(targetSeconds * 2.0)} words - do not go under the minimum or over the maximum. The FIRST sentence is the hook: under 10 words, a bold claim, surprising fact or direct question that makes a scroller stop - never a greeting or "In this video". Write ONLY spoken narration - no stage directions, no Narrator:, no timestamps, no scene descriptions. Just pure spoken words.`,
       user: `Create a short video script about: ${prompt}`,
       // Scaled with the target, or a long request comes back quietly truncated: the
       // old flat 400 is about two minutes of speech, so a five-minute script would
@@ -3355,7 +3479,7 @@ app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
     else { scaleFilter = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720"; outW = 1280; outH = 720; }
 
     const assPath = outputVideo.replace('.mp4', '.ass');
-    const hasCaptions = buildAssFile(voiceover || "", audioDuration, assPath, captionStyle, null, captionMeta, outW, outH);
+    const hasCaptions = buildAssFile(voiceover || "", audioDuration, assPath, captionStyle, null, captionMeta, outW, outH, { social: true });
     // subtitles filter burns SRT into video — handles any length efficiently
     const subsFilter = hasCaptions ? ',' + assFilter(assPath) : '';
     const vf = `${scaleFilter},setsar=1${subsFilter},${watermark}`;
@@ -3407,6 +3531,8 @@ app.post("/api/extract-segments", scriptLimiter, async (req, res) => {
         { role: "system", content: `Split this video script into 3-5 short segments (each 1-2 sentences, in original order, covering ALL the text).
 
 For each segment, write a "keywords" field describing a STOCK FOOTAGE SCENE that visually represents the segment's meaning. The keywords must be 2-4 concrete English words describing people, objects, or places (e.g. "person typing laptop", "sunrise mountain hike", "brain puzzle pieces", "students writing exam"). NEVER copy words directly from the script text. NEVER use abstract words like "motivation", "challenge", "test" alone - always describe a visible scene or action.
+
+The FIRST segment is the video's opening second, so its keywords must show a PERSON'S FACE in close-up reacting to or doing what the segment is about (e.g. "woman surprised face closeup", "man smiling at phone closeup"). A face stops the scroll; a landscape does not.
 
 Example input: "Are you ready for a challenge? Take our quiz now."
 Example output: [{"text":"Are you ready for a challenge? Take our quiz now.","keywords":"person solving puzzle excited"}]
@@ -3646,46 +3772,18 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
 
       const aiFile = await ai.clips[i];
       if (aiFile) aiUsed++;
-      let videoUrl = null;
-      if (!aiFile) try {
-        const r = await fetch(`https://api.pexels.com/videos/search?query=${encodeURIComponent(seg.keywords || 'background')}&per_page=1&orientation=${aspectRatio === '9:16' ? 'portrait' : aspectRatio === '1:1' ? 'square' : 'landscape'}`,
-          { headers: { Authorization: PEXELS_API_KEY } });
-        const d = await r.json();
-        const vid = (d.videos || []).find(v => v.video_files?.length > 0);
-        if (vid) videoUrl = pickBestMp4(vid);
-      } catch (e) { console.error("segment search error:", e.message); }
-
-      // An AI clip is read straight from the cache and must survive this
-      // segment (a retry reuses it), so only a downloaded Pexels file is ours
-      // to delete after trimming.
-      const rawPath = aiFile || path.join(videosDir, uniqueName("seg-raw", "mp4"));
       const trimmedPath = path.join(videosDir, uniqueName("seg", "mp4"));
-
-      if (videoUrl) {
-        try {
-          await downloadToFile(videoUrl, rawPath, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
-        } catch (e) {
-          console.error("segment download failed:", e.message);
-        }
-      }
-
       const dur = segDurations[i];
-      if (fs.existsSync(rawPath)) {
-        // Trim/loop clip to exact segment duration, scale+crop, no audio
-        await new Promise((resolve, reject) => {
-          const cmd = `ffmpeg -y -stream_loop -1 -i "${rawPath}" -t ${dur} -vf "${scaleFilter},setsar=1,fps=30" -an -c:v libx264 -preset ultrafast -crf 28 -video_track_timescale 30000 "${trimmedPath}"`;
-          exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
-            if (err) { console.error("segment ffmpeg error:", stderr?.slice(-300)); return reject(new Error("segment ffmpeg failed")); }
-            resolve();
-          });
-        }).catch(() => {});
-        if (!aiFile) fs.unlink(rawPath, () => {});
-      }
+      // A cut every ~2.5 s, not one shot per segment. The Oct 23 review measured our
+      // videos at one shot per 10-40 s against a Flow benchmark cutting every 1-2 s; a
+      // stock clip held that long reads as a slideshow. The segment still decides the
+      // SUBJECT (its keywords); within it each shot is a different clip of that search.
+      await buildSegmentShots({ seg, dur, aiFile, aspectRatio, scaleW, scaleH, scaleFilter, outPath: trimmedPath });
 
       if (!fs.existsSync(trimmedPath)) {
         // Fallback: black clip of correct duration
         await new Promise((resolve) => {
-          const cmd = `ffmpeg -y -f lavfi -i color=c=black:s=${aspectRatio === '9:16' ? '720x1280' : aspectRatio === '1:1' ? '720x720' : '1280x720'}:d=${dur}:r=30 -vf "setsar=1" -c:v libx264 -preset ultrafast -crf 28 -video_track_timescale 30000 "${trimmedPath}"`;
+          const cmd = `ffmpeg -y -f lavfi -i color=c=black:s=${scaleW}x${scaleH}:d=${dur}:r=30 -vf "setsar=1" -c:v libx264 -preset ultrafast -crf 28 -video_track_timescale 30000 "${trimmedPath}"`;
           exec(cmd, { timeout: 30000 }, () => resolve());
         });
       }
@@ -3906,7 +4004,7 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
       if (wordTimestamps) console.log(`Whisper: ${wordTimestamps.length} words aligned`);
     } catch(e) { console.warn('Whisper failed, using estimated timing'); }
     console.log("ASS path:", assPath, "voiceover len:", (voiceover||"").length);
-    const hasCaptions = buildAssFile(voiceover || "", totalAudioDuration, assPath, captionStyle, wordTimestamps, captionMeta, scaleW, scaleH);
+    const hasCaptions = buildAssFile(voiceover || "", totalAudioDuration, assPath, captionStyle, wordTimestamps, captionMeta, scaleW, scaleH, { social: true });
     console.log("hasCaptions:", hasCaptions, "file exists:", fs.existsSync(assPath));
     const subsFilter = hasCaptions ? ',' + assFilter(assPath) : '';
     const speedPts = videoSpeed && videoSpeed !== 1.0 ? `setpts=${(1/videoSpeed).toFixed(4)}*PTS,` : '';
@@ -3917,9 +4015,9 @@ app.post("/api/idea-to-video-v2", videoGenLimiter, async (req, res) => {
     let ffmpegCmd;
     if (hasBgMusic) {
       const voiceFilter = audioTempo ? `[1:a]${audioTempo}volume=1.0,asplit=2[voice1][voice2]` : `[1:a]volume=1.0,asplit=2[voice1][voice2]`;
-      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${adjustedDuration} -filter_complex "${voiceFilter};[2:a]volume=0.3[music_pre];[music_pre][voice1]sidechaincompress=threshold=0.03:ratio=8:attack=120:release=600:makeup=1[music_duck];[voice2][music_duck]amix=inputs=2:duration=first:normalize=0[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
+      ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -stream_loop -1 -i "${musicPath}" -t ${adjustedDuration} -filter_complex "${voiceFilter};[2:a]volume=0.3[music_pre];[music_pre][voice1]sidechaincompress=threshold=0.03:ratio=8:attack=120:release=600:makeup=1[music_duck];[voice2][music_duck]amix=inputs=2:duration=first:normalize=0[amix];[amix]${LOUDNORM_SOCIAL}[aout]" -vf "${vf}" -map 0:v:0 -map "[aout]" -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -shortest "${outputVideo}"`;
     } else {
-      const audioFilter = audioTempo ? `-af "${audioTempo}aresample=44100"` : "";
+      const audioFilter = `-af "${audioTempo}${LOUDNORM_SOCIAL}"`;
       ffmpegCmd = `ffmpeg -y -i "${concatPath}" -i "${audioPathLocal}" -t ${adjustedDuration} -vf "${vf}" ${audioFilter} -c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -tune fastdecode -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}"`;
     }
     await new Promise((resolve, reject) => {
