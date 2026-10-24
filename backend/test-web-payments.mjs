@@ -1,9 +1,10 @@
-// Web payments test (Oct 8 2026): live checks that the routes are OFF without keys, then the
-// grant logic against real Firestore with a FAKE Flutterwave (pending, underpaid, wrong currency,
-// other account, page+webhook race, replay, mid-pass block, webhook hash, expiry). Makes and
-// deletes a disposable account. Run from this folder:
+// Web payments test (Pesapal adapter, Oct 24 2026; Flutterwave version Oct 8): live checks that
+// the routes are OFF without keys, then the grant logic against real Firestore with a FAKE
+// Pesapal (unpaid/INVALID, failed, underpaid, wrong currency, other account, page+IPN race,
+// replay, mid-pass block, IPN shape, reversal, expiry), then ONE real sandbox order with
+// Pesapal's public demo keys. Makes and deletes a disposable account. Run from this folder:
 //   SA_PATH=./serviceAccountKey.json WEB_API_KEY=<website firebase apiKey> node test-web-payments.mjs
-// Once real TEST keys are in .env the first two live checks will (correctly) fail.
+// Once real keys are in .env the first two live checks will (correctly) fail.
 import 'dotenv/config';
 import { readFileSync } from 'fs';
 import { initializeApp, cert } from 'firebase-admin/app';
@@ -30,86 +31,122 @@ assert(r.status === 200 && j.enabled === false && j.passes.pro.display === '$8.2
 r = await fetch(`${API}/api/web-pay/start`, { method: 'POST', headers: H, body: '{"plan":"pro"}' }); j = await r.json();
 assert(r.status === 503, `live start refused while off: ${r.status} ${j.error}`);
 
-// ---- logic with a fake Flutterwave
-process.env.FLW_SECRET_KEY = 'FLWSECK_TEST-fake';
-process.env.FLW_WEBHOOK_HASH = 'hash123';
-let fakeTx = null; let lastStartBody = '{}'; const calls = [];
+// ---- logic with a fake Pesapal
+process.env.PESAPAL_CONSUMER_KEY = 'fake-key';
+process.env.PESAPAL_CONSUMER_SECRET = 'fake-secret';
+delete process.env.PESAPAL_ENV; // sandbox
+process.env.PESAPAL_IPN_ID = '11111111-2222-3333-4444-555555555555';
+let fakeTx = null; let lastOrder = {}; const calls = []; let orderN = 0;
 const realFetch = globalThis.fetch;
+const reply = (o) => new Response(JSON.stringify(o));
 globalThis.fetch = async (url, init) => {
-  if (!String(url).startsWith('https://api.flutterwave.com')) return realFetch(url, init);
-  calls.push(String(url));
-  if (String(url).endsWith('/payments')) lastStartBody = init.body;
-  if (String(url).endsWith('/payments')) {
-    const b = JSON.parse(init.body);
-    return new Response(JSON.stringify({ status: 'success', data: { link: 'https://checkout.flutterwave.com/x/' + b.tx_ref } }));
+  if (!String(url).startsWith('https://cybqa.pesapal.com')) return realFetch(url, init);
+  calls.push(String(url).replace(/^https:\/\/[^/]+\/pesapalv3\/api/, ''));
+  if (String(url).endsWith('/Auth/RequestToken')) return reply({ token: 'tok', expiryDate: new Date(Date.now() + 300000).toISOString(), status: '200' });
+  if (String(url).endsWith('/SubmitOrderRequest')) {
+    lastOrder = JSON.parse(init.body);
+    const id = `aaaaaaaa-bbbb-cccc-dddd-${String(++orderN).padStart(12, '0')}`;
+    return reply({ order_tracking_id: id, merchant_reference: lastOrder.id, redirect_url: 'https://cybqa.pesapal.com/pay/' + id, error: null, status: '200' });
   }
-  return new Response(JSON.stringify({ status: 'success', data: fakeTx }));
+  if (String(url).includes('/GetTransactionStatus')) return reply(fakeTx);
+  return reply({ error: { code: 'x', message: 'unexpected ' + url } });
 };
 const wp = createWebPayments({ adminDb: db, getAuth, isAdminUid, tierConfig });
+const txFor = (rec, code, extra = {}) => ({ status_code: code, payment_status_description: ['INVALID', 'COMPLETED', 'FAILED', 'REVERSED'][code],
+  merchant_reference: rec.ref, order_tracking_id: rec.tracking, currency: rec.currency, amount: rec.amount, payment_method: 'MTN', status: '200', ...extra });
 
-// test key + not on FLW_TEST_UIDS: refused before Flutterwave is called
-delete process.env.FLW_TEST_UIDS;
+// sandbox + not on PESAPAL_TEST_UIDS: refused before Pesapal is called
+delete process.env.PESAPAL_TEST_UIDS;
 let s = await wp.start(uid, 'pro');
-assert(s.status === 503 && (await wp.config(uid)).enabled === false, `test mode refuses unlisted accounts: ${s.status}`);
-process.env.FLW_TEST_UIDS = `someone-else, ${uid}`;
-assert((await wp.config(uid)).enabled === true, 'test mode allows a listed tester');
+assert(s.status === 503 && (await wp.config(uid)).enabled === false && calls.length === 0, `sandbox refuses unlisted accounts: ${s.status}`);
+assert((await wp.config(null)).enabled === false, 'signed-out visitors never see Pay in sandbox');
+process.env.PESAPAL_TEST_UIDS = `someone-else, ${uid}`;
+assert((await wp.config(uid)).enabled === true, 'sandbox allows a listed tester');
 
-// currency: shillings + mobile money for Uganda only, dollars by card for everyone else
+// prices: shillings for Uganda, dollars by card for everyone else
 assert(regionFor({ country: 'Uganda' }, '') === 'UG' && regionFor({ country: 'Uganda' }, 'GH') === 'GH'
   && regionFor({ country: 'United Kingdom' }, '') === 'GB' && regionFor({}, '') === '', 'region: location first, then profile');
-assert(offerFor('UG', 'pro').amount === 30000 && offerFor('GH', 'creator').display === 'GHS 200'
-  && offerFor('US', 'pro').amount === 13.99 && offerFor('KE', 'pro').display === '$8.25' && offerFor('', 'creator').options === 'card', 'offers follow Play prices');
+assert(offerFor('UG', 'pro').amount === 30000 && offerFor('GH', 'creator').display === '$17.69'
+  && offerFor('US', 'pro').amount === 13.99 && offerFor('KE', 'pro').display === '$8.25', 'offers follow Play prices');
 assert((await wp.config(uid, 'GB')).passes.pro.display === '$13.99' && (await wp.config(uid, 'UG')).passes.pro.currency === 'UGX', 'config price follows location');
+
 s = await wp.start(uid, 'pro', 'US');
-let usd = (await db.collection('webPayments').doc(s.txRef).get()).data();
-const usdBody = JSON.parse(lastStartBody);
-assert(usd.currency === 'USD' && usd.amount === 13.99 && usdBody.currency === 'USD' && usdBody.payment_options === 'card', `US visitor: USD 13.99 card only (${usd.currency} ${usd.amount} ${usdBody.payment_options})`);
-fakeTx = { id: 554, tx_ref: s.txRef, status: 'successful', currency: 'UGX', amount: 30000 };
-let cu = await wp.confirm({ transactionId: 554, txRef: s.txRef, uid });
+let rec = (await db.collection('webPayments').doc(s.txRef).get()).data();
+assert(rec.currency === 'USD' && rec.amount === 13.99 && lastOrder.currency === 'USD' && lastOrder.amount === 13.99
+  && lastOrder.notification_id === process.env.PESAPAL_IPN_ID && lastOrder.id === s.txRef && lastOrder.id.length <= 50
+  && lastOrder.description.length <= 100 && lastOrder.billing_address.email_address === `${uid}@example.com`
+  && lastOrder.callback_url.endsWith('/payment-done.html') && /status=cancelled/.test(lastOrder.cancellation_url),
+  `US order: USD 13.99, our ref, IPN id, email, callback (${JSON.stringify(lastOrder).slice(0, 160)})`);
+assert(rec.orderTrackingId && s.link.startsWith('https://cybqa.pesapal.com/'), 'tracking id stored, link is Pesapal');
+fakeTx = txFor({ ref: s.txRef, tracking: rec.orderTrackingId, currency: 'UGX', amount: 30000 }, 1);
+let cu = await wp.confirm({ orderTrackingId: rec.orderTrackingId, txRef: s.txRef, uid });
 assert(cu.status === 400, 'a USD checkout paid in UGX is refused');
 await db.collection('webPayments').doc(s.txRef).delete();
 
 s = await wp.start(uid, 'pro', 'UG');
-assert(JSON.parse(lastStartBody).payment_options === 'mobilemoneyuganda,card', 'Ugandan checkout offers mobile money');
-assert(s.status === 200 && s.link.includes(s.txRef), 'start gives a checkout link');
+assert(s.status === 200 && lastOrder.currency === 'UGX' && lastOrder.amount === 30000 && lastOrder.billing_address.country_code === 'UG', 'Ugandan order in shillings');
 const ref = s.txRef;
-const pay = (await db.collection('webPayments').doc(ref).get()).data();
-assert(pay.status === 'pending' && pay.amount === 30000 && pay.uid === uid, 'pending record written');
+rec = (await db.collection('webPayments').doc(ref).get()).data();
+const tracking = rec.orderTrackingId;
+assert(rec.status === 'pending' && rec.amount === 30000 && rec.uid === uid && rec.provider === 'pesapal' && rec.env === 'sandbox', 'pending record written');
+const T = (code, extra) => txFor({ ref, tracking, currency: 'UGX', amount: 30000 }, code, extra);
 
-fakeTx = { id: 555, tx_ref: ref, status: 'pending', currency: 'UGX', amount: 30000 };
-let c = await wp.confirm({ transactionId: 555, txRef: ref, uid });
-assert(c.granted === false && c.state === 'pending', 'pending payment grants nothing');
+fakeTx = T(0);
+let c = await wp.confirm({ orderTrackingId: tracking, txRef: ref, uid });
+assert(c.granted === false && c.state === 'pending', 'unpaid (INVALID) is pending, not failed');
+c = await wp.confirm({ txRef: ref, uid });
+assert(c.state === 'pending', 'the reference alone is enough (tracking id read from our record)');
 
-fakeTx = { id: 555, tx_ref: ref, status: 'successful', currency: 'UGX', amount: 29000 };
-c = await wp.confirm({ transactionId: 555, txRef: ref, uid });
+fakeTx = T(2);
+c = await wp.confirm({ orderTrackingId: tracking, txRef: ref, uid });
+assert(c.granted === false && c.state === 'failed', 'FAILED is failed');
+await db.collection('webPayments').doc(ref).set({ status: 'pending' }, { merge: true });
+
+fakeTx = T(1, { amount: 29000 });
+c = await wp.confirm({ orderTrackingId: tracking, txRef: ref, uid });
 assert(c.status === 400 && !c.granted, 'underpaid amount refused');
 let u = (await db.collection('users').doc(uid).get()).data() || {};
 assert(u.plan !== 'pro', 'underpaid did not change the plan');
-
-// fresh checkout for the success path
 await db.collection('webPayments').doc(ref).set({ status: 'pending' }, { merge: true });
-fakeTx = { id: 556, tx_ref: ref, status: 'successful', currency: 'USD', amount: 30000 };
-c = await wp.confirm({ transactionId: 556, txRef: ref, uid });
+
+fakeTx = T(1, { currency: 'USD' });
+c = await wp.confirm({ orderTrackingId: tracking, txRef: ref, uid });
 assert(c.status === 400, 'wrong currency refused');
 await db.collection('webPayments').doc(ref).set({ status: 'pending' }, { merge: true });
 
-fakeTx = { id: 557, tx_ref: ref, status: 'successful', currency: 'UGX', amount: 30000, payment_type: 'mobilemoneyug' };
-c = await wp.confirm({ transactionId: 557, txRef: ref, uid: 'someone-else' });
+fakeTx = T(1, { merchant_reference: 'tfy-somebody-else-00000000' });
+c = await wp.confirm({ orderTrackingId: tracking, txRef: ref, uid });
+assert(c.status === 400, "another order's tracking id cannot confirm this checkout");
+
+fakeTx = T(1, { confirmation_code: 'MTN123' });
+c = await wp.confirm({ orderTrackingId: tracking, txRef: ref, uid: 'someone-else' });
 assert(c.status === 403, 'another account cannot confirm it');
-const both = await Promise.all([wp.confirm({ transactionId: 557, txRef: ref, uid }), wp.confirm({ transactionId: 557, txRef: ref })]);
-assert(both.every(x => x.granted), 'page + webhook together both report granted');
+const mkRes = () => { const o = { body: null, json(b) { o.body = b; return o; } }; return o; };
+const ipnRes = mkRes();
+const both = await Promise.all([wp.confirm({ orderTrackingId: tracking, txRef: ref, uid }),
+  wp.ipn({ query: { OrderTrackingId: tracking, OrderMerchantReference: ref, OrderNotificationType: 'IPNCHANGE' } }, ipnRes)]);
+assert(both[0].granted && ipnRes.body?.status === 200 && ipnRes.body.orderTrackingId === tracking
+  && ipnRes.body.orderMerchantReference === ref && ipnRes.body.orderNotificationType === 'IPNCHANGE', `page + IPN together: granted, IPN answered ${JSON.stringify(ipnRes.body)}`);
 u = (await db.collection('users').doc(uid).get()).data();
 assert(u.plan === 'pro' && u.creditsRemaining === 60 && u.webPassStatus === 'active', `granted once: plan ${u.plan}, credits ${u.creditsRemaining}`);
-c = await wp.confirm({ transactionId: 557, txRef: ref, uid });
+c = await wp.confirm({ orderTrackingId: tracking, txRef: ref, uid });
 assert(c.granted && (await db.collection('users').doc(uid).get()).data().creditsRemaining === 60, 'replay does not add credits');
+rec = (await db.collection('webPayments').doc(ref).get()).data();
+assert(rec.status === 'granted' && rec.confirmationCode === 'MTN123', 'record granted with the provider confirmation code');
 
 s = await wp.start(uid, 'creator');
 assert(s.status === 409, `second purchase blocked mid-pass: ${s.error}`);
 
-// webhook auth
-const mkRes = () => { const o = { code: 0, status(c) { o.code = c; return o; }, end() { return o; } }; return o; };
-let res = mkRes(); await wp.webhook({ get: () => 'wrong', body: {} }, res); assert(res.code === 401, 'webhook with wrong hash refused');
-res = mkRes(); await wp.webhook({ get: () => 'hash123', body: { data: { id: 557, tx_ref: ref } } }, res); assert(res.code === 200, 'webhook with right hash accepted');
+// IPN with junk is answered 500 without calling Pesapal
+const before = calls.length; const junk = mkRes();
+await wp.ipn({ query: { OrderTrackingId: 'nope', OrderMerchantReference: '../x' } }, junk);
+assert(junk.body.status === 500 && calls.length === before, 'junk IPN refused without a Pesapal call');
+
+// reversal after the grant is recorded, not silently undone
+fakeTx = T(3);
+c = await wp.confirm({ orderTrackingId: tracking, txRef: ref });
+rec = (await db.collection('webPayments').doc(ref).get()).data();
+assert(c.state === 'reversed' && rec.status === 'reversed-after-grant' && (await db.collection('users').doc(uid).get()).data().plan === 'pro', 'reversal recorded for the owner');
 
 // expiry
 await db.collection('users').doc(uid).set({ webPassUntil: new Date(Date.now() - 1000).toISOString(), creditsRemaining: 42 }, { merge: true });
@@ -117,9 +154,19 @@ await wp.expireSweep();
 u = (await db.collection('users').doc(uid).get()).data();
 assert(u.plan === 'free' && u.webPassStatus === 'ended' && u.creditsRemaining === 10, `expired -> free with ${u.creditsRemaining} credits`);
 
+// ---- one REAL sandbox order with Pesapal's public demo keys (Ugandan merchant)
+globalThis.fetch = realFetch;
+process.env.PESAPAL_CONSUMER_KEY = 'TDpigBOOhs+zAl8cwH2Fl82jJGyD8xev';
+process.env.PESAPAL_CONSUMER_SECRET = '1KpqkfsMaihIcOlhnBo/gBZ5smw=';
+delete process.env.PESAPAL_IPN_ID; // let it register one
+const wp2 = createWebPayments({ adminDb: db, getAuth, isAdminUid, tierConfig });
+s = await wp2.start(uid, 'pro', 'UG');
+assert(s.status === 200 && /^https:\/\/cybqa\.pesapal\.com\//.test(s.link), `real sandbox checkout page: ${s.link}`);
+c = await wp2.confirm({ txRef: s.txRef, uid });
+assert(c.status === 200 && c.state === 'pending', `real sandbox unpaid order reads pending: ${JSON.stringify(c)}`);
+
 // cleanup
-await db.collection('webPayments').doc(ref).delete();
 const more = await db.collection('webPayments').where('uid', '==', uid).get(); for (const d of more.docs) await d.ref.delete();
 await db.collection('users').doc(uid).delete();
 await getAuth().deleteUser(uid);
-console.log('cleaned up; flutterwave calls:', calls.length);
+console.log('cleaned up; fake pesapal calls:', calls.length);

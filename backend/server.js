@@ -2256,7 +2256,7 @@ app.post("/api/web-pay/start", mediaProcLimiter, async (req, res) => {
 app.post("/api/web-pay/confirm", mediaProcLimiter, async (req, res) => {
   try {
     const out = await webPay.confirm({
-      transactionId: req.body?.transactionId, txRef: req.body?.txRef, uid: req.user.uid,
+      orderTrackingId: req.body?.orderTrackingId, txRef: req.body?.txRef, uid: req.user.uid,
     });
     if (out.error) return res.status(out.status).json({ error: out.error });
     res.json(out);
@@ -2463,10 +2463,10 @@ async function subscriptionSweep() {
 // through exactly the code the six-hourly sweep uses. That makes this endpoint a
 // TRIGGER for a check that already exists, not a second implementation of it - and it
 // makes replays harmless, because re-asking Play twice gives the same answer twice.
-// Flutterwave's payment webhook. Outside /api for the same reason as the Play one below:
-// Flutterwave has no Firebase token. It proves itself with the secret hash we set in its
-// dashboard (FLW_WEBHOOK_HASH), and even then only triggers a verify-with-Flutterwave.
-app.post('/flw-webhook', (req, res) => webPay.webhook(req, res));
+// Pesapal's IPN, registered as GET (POST accepted too). Outside /api: Pesapal has no Firebase
+// token. Unsigned by design - it only makes us ask Pesapal (webPayments.js ipn()).
+app.get('/pesapal-ipn', mediaProcLimiter, (req, res) => webPay.ipn(req, res));
+app.post('/pesapal-ipn', mediaProcLimiter, (req, res) => webPay.ipn(req, res));
 
 // Plans and prices for a signed-out visitor of upgrade.html (a payment provider's reviewer
 // checks prices before signing up). Outside /api because there is no token; config(null)

@@ -1,6 +1,7 @@
-// Web payments through Flutterwave (Oct 8 2026): 30-day Pro / Creator passes bought on
-// the WEBSITE, at Play's price for the buyer's country, by mobile money where Flutterwave offers
-// it (see LOCAL) and by card everywhere.
+// Web payments through Pesapal (adapter Oct 24 2026; Flutterwave's, Oct 8, declined Uganda sole
+// proprietors on Oct 11). 30-day Pro / Creator passes bought on the WEBSITE, at Play's price for
+// the buyer's country: Uganda in shillings (mobile money or card on Pesapal's page), everyone
+// else in US dollars by card.
 //
 // WHY A PASS, NOT A SUBSCRIPTION: mobile money cannot be charged automatically, and most
 // real users are Ugandan and pay by mobile money. A pass is paid once, lasts 30 days and
@@ -10,23 +11,26 @@
 // consumption of content bought elsewhere), but the app must never link to, mention or
 // steer anyone to this payment. Nothing in the app may point at upgrade.html.
 //
-// TRUST: nothing the browser or Flutterwave's redirect says is believed. A payment
-// grants a plan only after the server asks Flutterwave itself (GET
-// /v3/transactions/{id}/verify) and the answer matches what WE recorded when the
-// checkout started: our tx_ref, status successful, the recorded currency, amount at least
-// the recorded price. The webhook is only a trigger for that same check (its verif-hash header is
-// still compared, so strangers cannot make us call Flutterwave in a loop).
+// TRUST: nothing the browser, the callback URL or an IPN call says is believed. Pesapal's
+// callback and IPN carry no status and no signature (by design - its docs say to ask), so a
+// payment grants a plan only after the server calls GetTransactionStatus itself and the answer
+// matches what WE recorded when the checkout started: our merchant reference, COMPLETED, the
+// recorded currency, amount at least the recorded price. The IPN is only a trigger for that
+// same check, so a stranger calling it can at most make us ask Pesapal about our own order.
 //
-// ONCE ONLY: webPayments/{tx_ref} is created at checkout and flipped to 'granted' inside
-// a Firestore transaction, so the redirect page and the webhook arriving together (the
-// normal case) grant the pass exactly once.
+// ONCE ONLY: webPayments/{ref} is created at checkout and flipped to 'granted' inside a
+// Firestore transaction, so the redirect page and the IPN arriving together (the normal case)
+// grant the pass exactly once.
 //
-// OFF until FLW_SECRET_KEY is in .env: /config says enabled:false and /start refuses.
+// OFF until PESAPAL_CONSUMER_KEY + PESAPAL_CONSUMER_SECRET are in .env. PESAPAL_ENV=live uses
+// the live API; anything else is the SANDBOX, where only PESAPAL_TEST_UIDS may pay (sandbox
+// payments are fake money). Pesapal's public demo keys (developer.pesapal.com/api3-demo-keys.txt)
+// work in the sandbox for testing before the real account is approved.
 
 import crypto from 'crypto';
 
-const FLW_API = 'https://api.flutterwave.com/v3';
 const SITE = 'https://tonefy-ai.fitlifesolutions.site';
+const IPN_URL = 'https://api.fitlifesolutions.site/pesapal-ipn';
 export const PASS_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Buying again is allowed once the current pass is this close to its end; the new 30
@@ -34,23 +38,17 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const RENEW_WINDOW_MS = 5 * DAY_MS;
 
 // Prices follow Google Play's price for the buyer's country (owner, Oct 8), so the web is never
-// the cheaper or dearer route. Where Flutterwave can take MOBILE MONEY (or local bank transfer)
-// the pass is charged in that country's currency; everywhere else in US dollars by card, at
-// Play's doubled price in the 44 high-income markets (Oct 3 2026) and the base price elsewhere.
-// Probed Oct 8 on the TEST account: mobile money shows for UGX/RWF/GHS/ZMW; NGN shows bank
-// transfer + USSD; TZS and XOF/XAF show card only; KES fails to initialise at all. Add a country
-// to LOCAL only after a test checkout shows its method (docs/web-payments.md).
+// the cheaper or dearer route. Uganda pays in shillings (Pesapal's page then offers MTN/Airtel
+// mobile money and cards); everywhere else pays US dollars by card, at Play's doubled price in
+// the 44 high-income markets (Oct 3 2026) and the base price elsewhere. Both currencies were
+// accepted by Pesapal's sandbox for a Ugandan merchant (Oct 24). Add a country to LOCAL only
+// after a real checkout shows its local method (docs/web-payments.md).
 export const PASSES = {
   pro: { label: 'Pro', credits: 60 },
   creator: { label: 'Creator', credits: 300 },
 };
 const LOCAL = {
-  //       currency  Pro      Creator  Flutterwave options                 how they pay
-  UG: { currency: 'UGX', pro: 30000, creator: 65000, options: 'mobilemoneyuganda,card', how: 'mobile money (MTN or Airtel) or a card' },
-  RW: { currency: 'RWF', pro: 10500, creator: 22500, options: 'mobilemoneyrwanda,card', how: 'mobile money (MTN or Airtel) or a card' },
-  GH: { currency: 'GHS', pro: 90, creator: 200, options: 'mobilemoneyghana,card', how: 'mobile money (MTN, Telecel or AirtelTigo) or a card' },
-  ZM: { currency: 'ZMW', pro: 170, creator: 360, options: 'mobilemoneyzambia,card', how: 'mobile money (MTN or Airtel) or a card' },
-  NG: { currency: 'NGN', pro: 10000, creator: 22000, options: 'banktransfer,ussd,card', how: 'bank transfer, USSD or a card' },
+  UG: { currency: 'UGX', pro: 30000, creator: 65000, how: 'mobile money (MTN or Airtel) or a card' },
 };
 // Play's doubled-price markets (Oct 3 2026, ~/ytshots/play-subs-after-2026-10-03.json).
 const HIGH = new Set('AE AT AU BE BH CA CH CY CZ DE DK EE ES FI FR GB HK HR IE IL IS IT JP KR KW LI LT LU LV MO MT NL NO NZ OM PT QA SA SE SG SI SK TW US'.split(' '));
@@ -78,49 +76,81 @@ export function regionFor(user, loc) {
   if (/^[A-Z]{2}$/.test(l) && l !== 'XX' && l !== 'T1') return l;
   return NAME_TO_CODE[String(user?.country || '').trim().toLowerCase()] || '';
 }
-// What this buyer pays for a plan: { currency, amount, options, how, display }.
+// What this buyer pays for a plan: { currency, amount, how, display }.
 export function offerFor(region, plan) {
   const local = LOCAL[region];
   if (local) {
     const amount = local[plan];
-    return { currency: local.currency, amount, options: local.options, how: local.how,
+    return { currency: local.currency, amount, how: local.how,
       display: `${local.currency} ${amount.toLocaleString('en-US')}` };
   }
   const amount = (HIGH.has(region) ? USD_HIGH : USD_BASE)[plan];
-  return { currency: 'USD', amount, options: 'card', how: 'a card', display: `$${amount.toFixed(2)}` };
+  return { currency: 'USD', amount, how: 'a card', display: `$${amount.toFixed(2)}` };
 }
 
-function secret() { return process.env.FLW_SECRET_KEY || ''; }
-export function webPaymentsEnabled() { return !!secret(); }
-// A TEST key accepts Flutterwave's fake cards and numbers, so in test mode only the accounts
-// listed in FLW_TEST_UIDS may start a payment - otherwise anyone could get a real plan for
-// fake money. Grants need the pending record that start() writes, so gating start is enough.
-function testMode() { return /_TEST/.test(secret()); }
+const env = (k) => process.env[k] || '';
+export function webPaymentsEnabled() { return !!(env('PESAPAL_CONSUMER_KEY') && env('PESAPAL_CONSUMER_SECRET')); }
+function liveMode() { return env('PESAPAL_ENV') === 'live'; }
+function apiBase() { return liveMode() ? 'https://pay.pesapal.com/v3/api' : 'https://cybqa.pesapal.com/pesapalv3/api'; }
+// The sandbox takes fake money, so there only the accounts in PESAPAL_TEST_UIDS may start a
+// payment - otherwise anyone could get a real plan for nothing. Grants need the pending record
+// that start() writes, so gating start is enough.
 function canPay(uid) {
   if (!webPaymentsEnabled()) return false;
-  if (!testMode()) return true;
-  return (process.env.FLW_TEST_UIDS || '').split(',').map((x) => x.trim()).filter(Boolean).includes(uid);
+  if (liveMode()) return true;
+  return env('PESAPAL_TEST_UIDS').split(',').map((x) => x.trim()).filter(Boolean).includes(uid);
 }
 
-async function flw(path, init = {}) {
-  const res = await fetch(`${FLW_API}${path}`, {
+// Bearer tokens last 5 minutes; reused until 30 s before expiry. Cached per base URL AND
+// consumer key, so new keys or a switch from sandbox to live never reuse an old token (the
+// test caught exactly that: "Invalid Access Token" after the keys changed).
+let tokenCache = { id: '', token: '', until: 0 };
+async function pesapal(path, init = {}) {
+  const base = apiBase();
+  const id = `${base}|${env('PESAPAL_CONSUMER_KEY')}`;
+  if (!(tokenCache.id === id && tokenCache.until > Date.now() + 30000)) {
+    const t = await rawCall(base, '/Auth/RequestToken', { method: 'POST',
+      body: JSON.stringify({ consumer_key: env('PESAPAL_CONSUMER_KEY'), consumer_secret: env('PESAPAL_CONSUMER_SECRET') }) });
+    if (!t.token) throw new Error(`pesapal auth: ${String(t.error?.message || t.message || 'no token').slice(0, 120)}`);
+    tokenCache = { id, token: t.token, until: Date.parse(t.expiryDate) || Date.now() + 4 * 60 * 1000 };
+  }
+  return rawCall(base, path, { ...init, headers: { Authorization: `Bearer ${tokenCache.token}`, ...(init.headers || {}) } });
+}
+async function rawCall(base, path, { allowErrorCodes = [], ...init }) {
+  const res = await fetch(`${base}${path}`, {
     ...init,
-    headers: { Authorization: `Bearer ${secret()}`, 'Content-Type': 'application/json', ...(init.headers || {}) },
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json', ...(init.headers || {}) },
     signal: AbortSignal.timeout(20000),
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok || body.status !== 'success') {
-    const err = new Error(`flutterwave ${path.split('?')[0]} ${res.status}: ${String(body.message || '').slice(0, 120)}`);
-    err.flwStatus = res.status;
+  // Pesapal reports most failures as HTTP 200 with an `error` object - and some answers too:
+  // an order nobody has paid yet comes back with its full details AND error
+  // payment_details_not_found "Pending Payment" (sandbox, Oct 24). Callers name those codes.
+  const softError = body.error && allowErrorCodes.includes(body.error.code);
+  if (!res.ok || (body.error && (body.error.code || body.error.message) && !softError)) {
+    const err = new Error(`pesapal ${path.split('?')[0]} ${res.status}: ${String(body.error?.message || body.message || '').slice(0, 120)}`);
+    err.pesapalStatus = res.status;
     throw err;
   }
-  return body.data;
+  return body;
 }
 
-function sameText(a, b) {
-  const x = Buffer.from(String(a)); const y = Buffer.from(String(b));
-  return x.length === y.length && crypto.timingSafeEqual(x, y);
+// The IPN id every order names. PESAPAL_IPN_ID if set (register once in the dashboard or let
+// this do it); otherwise registered on first use and kept for the life of the process -
+// registering the same URL again returns a fresh id, which is harmless.
+let ipnCache = { base: '', key: '', id: '' };
+async function ipnId() {
+  if (env('PESAPAL_IPN_ID')) return env('PESAPAL_IPN_ID');
+  if (ipnCache.base === apiBase() && ipnCache.key === env('PESAPAL_CONSUMER_KEY') && ipnCache.id) return ipnCache.id;
+  const r = await pesapal('/URLSetup/RegisterIPN', { method: 'POST', body: JSON.stringify({ url: IPN_URL, ipn_notification_type: 'GET' }) });
+  if (!r.ipn_id) throw new Error('pesapal: IPN registration returned no id');
+  ipnCache = { base: apiBase(), key: env('PESAPAL_CONSUMER_KEY'), id: r.ipn_id };
+  console.log(`[web-pay] Pesapal IPN registered (${liveMode() ? 'live' : 'sandbox'}): ${r.ipn_id} - set PESAPAL_IPN_ID to reuse it`);
+  return r.ipn_id;
 }
+
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const REF = /^tfy-[\w-]{8,45}$/;
 
 /**
  * deps: { adminDb, getAuth, isAdminUid, tierConfig }
@@ -150,7 +180,7 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
   async function config(uid, loc) {
     const user = uid ? (await adminDb.collection('users').doc(uid).get()).data() || {} : {};
     const region = regionFor(user, loc);
-    const out = { enabled: uid ? canPay(uid) : webPaymentsEnabled() && !testMode(), days: PASS_DAYS, region,
+    const out = { enabled: uid ? canPay(uid) : webPaymentsEnabled() && liveMode(), days: PASS_DAYS, region,
       how: offerFor(region, 'pro').how,
       passes: Object.fromEntries(Object.entries(PASSES).map(([k, v]) => {
         const o = offerFor(region, k);
@@ -164,7 +194,7 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
     return out;
   }
 
-  // Creates the pending record and Flutterwave's hosted checkout link.
+  // Creates the pending record and Pesapal's hosted payment page.
   async function start(uid, plan, loc) {
     if (!canPay(uid)) return { status: 503, error: 'Paying on the website is not available yet.' };
     const pass = PASSES[plan];
@@ -177,50 +207,57 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
     const authUser = await getAuth().getUser(uid);
     if (!authUser.email) return { status: 400, error: 'Your account needs an email address to pay. Please sign in with email or Google.' };
 
-    const txRef = `tfy-${uid.slice(0, 8)}-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
-    const { currency, amount, options } = offerFor(regionFor(user, loc), plan);
-    await payments.doc(txRef).create({
-      uid, plan, amount, currency, status: 'pending',
+    // Pesapal's merchant reference: max 50 chars of [A-Za-z0-9-_.:].
+    const ref = `tfy-${uid.slice(0, 8)}-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
+    const region = regionFor(user, loc);
+    const { currency, amount } = offerFor(region, plan);
+    await payments.doc(ref).create({
+      uid, plan, amount, currency, status: 'pending', provider: 'pesapal', env: liveMode() ? 'live' : 'sandbox',
       createdAt: new Date().toISOString(),
     });
-    const data = await flw('/payments', {
+    const order = await pesapal('/Transactions/SubmitOrderRequest', {
       method: 'POST',
       body: JSON.stringify({
-        tx_ref: txRef,
-        amount,
+        id: ref,
         currency,
-        redirect_url: `${SITE}/payment-done.html`,
-        payment_options: options,
-        customer: { email: authUser.email, name: authUser.displayName || undefined },
-        customizations: {
-          title: 'Tonefy AI',
-          description: `${pass.label} pass - ${PASS_DAYS} days, does not renew by itself`,
-          logo: `${SITE}/app-icon-meta.png`,
+        amount,
+        description: `Tonefy AI ${pass.label} pass - ${PASS_DAYS} days, does not renew by itself`.slice(0, 100),
+        callback_url: `${SITE}/payment-done.html`,
+        cancellation_url: `${SITE}/payment-done.html?status=cancelled`,
+        notification_id: await ipnId(),
+        billing_address: {
+          email_address: authUser.email,
+          first_name: (authUser.displayName || '').split(' ')[0] || undefined,
+          country_code: /^[A-Z]{2}$/.test(region) ? region : undefined,
         },
-        meta: { uid, plan },
       }),
     });
-    return { status: 200, link: data.link, txRef };
+    if (!order.redirect_url || !order.order_tracking_id) throw new Error('pesapal: order returned no payment page');
+    await payments.doc(ref).set({ orderTrackingId: order.order_tracking_id }, { merge: true });
+    return { status: 200, link: order.redirect_url, txRef: ref };
   }
 
-  // Asks Flutterwave about one transaction and, if it is a real, complete payment for
-  // a checkout we started, grants the pass. Safe to call any number of times.
-  async function confirm({ transactionId, txRef, uid = null }) {
+  // Asks Pesapal about one order and, if it is a real, complete payment for a checkout we
+  // started, grants the pass. Safe to call any number of times. Either id works: the page has
+  // both; the IPN has both; a record alone (txRef) is enough because start() stored the other.
+  async function confirm({ orderTrackingId, txRef, uid = null }) {
     if (!webPaymentsEnabled()) return { status: 503, error: 'Paying on the website is not available yet.' };
-    let tx;
-    if (transactionId && /^\d{1,20}$/.test(String(transactionId))) {
-      tx = await flw(`/transactions/${transactionId}/verify`);
-    } else if (txRef && /^tfy-[\w-]{8,60}$/.test(String(txRef))) {
-      tx = await flw(`/transactions/verify_by_reference?tx_ref=${encodeURIComponent(txRef)}`);
-    } else {
-      return { status: 400, error: 'Missing payment reference.' };
-    }
-    const ref = String(tx.tx_ref || '');
+    if (txRef && !REF.test(String(txRef))) return { status: 400, error: 'Missing payment reference.' };
+    let tracking = GUID.test(String(orderTrackingId || '')) ? String(orderTrackingId) : '';
+    if (!tracking && txRef) tracking = (await payments.doc(String(txRef)).get()).data()?.orderTrackingId || '';
+    if (!tracking) return { status: 400, error: 'Missing payment reference.' };
+
+    const tx = await pesapal(`/Transactions/GetTransactionStatus?orderTrackingId=${encodeURIComponent(tracking)}`,
+      { allowErrorCodes: ['payment_details_not_found'] });
+    const ref = String(tx.merchant_reference || '');
     if (txRef && ref !== txRef) return { status: 400, error: 'That payment does not match this checkout.' };
-    if (!/^tfy-/.test(ref)) return { status: 404, error: 'We could not find that payment.' };
+    if (!REF.test(ref)) return { status: 404, error: 'We could not find that payment.' };
 
     const payRef = payments.doc(ref);
     const userRefFor = (u) => adminDb.collection('users').doc(u);
+    // 1 COMPLETED, 2 FAILED, 3 REVERSED, 0 INVALID - which is also what an order nobody has
+    // paid yet reads as (sandbox, Oct 24), so 0 means "still waiting", never "failed".
+    const code = Number(tx.status_code);
 
     // Logged after the commit: a transaction body can run more than once under contention.
     const out = await adminDb.runTransaction(async (t) => {
@@ -228,18 +265,24 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
       if (!pay.exists) return { status: 404, error: 'We could not find that payment.' };
       const p = pay.data();
       if (uid && p.uid !== uid) return { status: 403, error: 'This payment belongs to another account.' };
+      if (p.orderTrackingId && p.orderTrackingId !== tracking) return { status: 400, error: 'That payment does not match this checkout.' };
+      const seen = { pesapalCode: code, pesapalMethod: tx.payment_method || null, checkedAt: new Date().toISOString() };
+      if (code === 3) {
+        // Money went back (a card chargeback or a reversed mobile-money payment). Recorded and
+        // shouted about, not silently undone: the owner decides what happens to the pass.
+        t.set(payRef, { ...seen, status: p.status === 'granted' ? 'reversed-after-grant' : 'reversed' }, { merge: true });
+        return { status: 200, granted: false, state: 'reversed', reversedGrant: p.status === 'granted' ? p.uid : null };
+      }
       if (p.status === 'granted') return { status: 200, granted: true, plan: p.plan, until: p.passUntil };
 
-      if (tx.status !== 'successful') {
-        const next = tx.status === 'failed' ? 'failed' : 'pending';
-        t.set(payRef, { status: next, flwId: tx.id, checkedAt: new Date().toISOString() }, { merge: true });
+      if (code !== 1) {
+        const next = code === 2 ? 'failed' : 'pending';
+        t.set(payRef, { ...seen, status: next }, { merge: true });
         return { status: 200, granted: false, state: next };
       }
-      const want = p.currency || 'UGX'; // records before Oct 8 evening carry no currency: all UGX
-      if (tx.currency !== want || !(Number(tx.amount) >= p.amount)) {
-        t.set(payRef, { status: 'mismatch', flwId: tx.id, flwAmount: tx.amount, flwCurrency: tx.currency,
-          checkedAt: new Date().toISOString() }, { merge: true });
-        console.error(`[web-pay] ${ref}: amount/currency mismatch ${tx.amount} ${tx.currency} vs ${p.amount} ${want}`);
+      if (tx.currency !== p.currency || !(Number(tx.amount) >= p.amount)) {
+        t.set(payRef, { ...seen, status: 'mismatch', paidAmount: tx.amount, paidCurrency: tx.currency }, { merge: true });
+        console.error(`[web-pay] ${ref}: amount/currency mismatch ${tx.amount} ${tx.currency} vs ${p.amount} ${p.currency}`);
         return { status: 400, error: 'The amount paid does not match the price. Please contact us and we will sort it out.' };
       }
 
@@ -261,7 +304,7 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
         webPassTxRef: ref,
         webPassStatus: 'active',
       }, { merge: true });
-      t.set(payRef, { status: 'granted', flwId: tx.id, paidAmount: tx.amount, paymentType: tx.payment_type || null,
+      t.set(payRef, { ...seen, status: 'granted', paidAmount: tx.amount, confirmationCode: tx.confirmation_code || null,
         grantedAt: new Date().toISOString(), passUntil: until }, { merge: true });
       return { status: 200, granted: true, plan: p.plan, until, justGranted: p.uid };
     });
@@ -269,21 +312,30 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
       console.log(`[web-pay] ${out.justGranted}: ${out.plan} pass until ${out.until} (${ref})`);
       delete out.justGranted;
     }
+    if (out.reversedGrant) {
+      console.error(`[web-pay] REVERSED after the pass was granted: ${ref} (user ${out.reversedGrant}) - check it in the Pesapal dashboard`);
+      delete out.reversedGrant;
+    }
     return out;
   }
 
-  // Flutterwave's webhook. Answered 200 at once; the work is the same confirm().
-  async function webhook(req, res) {
-    const hash = process.env.FLW_WEBHOOK_HASH || '';
-    if (!hash || !sameText(req.get('verif-hash') || '', hash)) return res.status(401).end();
-    res.status(200).end();
+  // Pesapal's IPN (registered as GET): OrderTrackingId, OrderMerchantReference,
+  // OrderNotificationType in the query. Unsigned by design, so it only triggers confirm(),
+  // which asks Pesapal. Pesapal wants this JSON back, status 200 = handled, 500 = retry later.
+  async function ipn(req, res) {
+    const q = { ...(req.query || {}), ...(req.body || {}) };
+    const orderTrackingId = String(q.OrderTrackingId || '');
+    const txRef = String(q.OrderMerchantReference || '');
+    const reply = (status) => res.json({ orderNotificationType: String(q.OrderNotificationType || 'IPNCHANGE'),
+      orderTrackingId, orderMerchantReference: txRef, status });
+    if (!GUID.test(orderTrackingId) || !REF.test(txRef)) return reply(500);
     try {
-      const d = req.body?.data || {};
-      if (!d.id && !d.tx_ref) return;
-      const out = await confirm({ transactionId: d.id, txRef: d.tx_ref });
-      console.log(`[web-pay] webhook ${d.tx_ref}: ${out.granted ? 'granted' : (out.state || out.error)}`);
+      const out = await confirm({ orderTrackingId, txRef });
+      console.log(`[web-pay] ipn ${txRef}: ${out.granted ? 'granted' : (out.state || out.error)}`);
+      reply(out.error && out.status >= 500 ? 500 : 200);
     } catch (e) {
-      console.error('[web-pay] webhook failed:', e.message);
+      console.error('[web-pay] ipn failed:', e.message);
+      reply(500);
     }
   }
 
@@ -312,5 +364,5 @@ export function createWebPayments({ adminDb, getAuth, isAdminUid, tierConfig }) 
     }
   }
 
-  return { config, start, confirm, webhook, expireSweep };
+  return { config, start, confirm, ipn, expireSweep };
 }
