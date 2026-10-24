@@ -336,6 +336,11 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const safety = createContentSafety({ groq, db: adminDb, FieldValue });
 // One refusal shape for every route, so the app and website can show `error` as-is.
 const blockedResponse = (res, v) => res.status(422).json({ error: v.message, code: 'content_blocked' });
+// A failure whose message is written for the user (shown as-is by the app, website and
+// API). Thrown by the pipeline functions; routes turn it into {error, code} with status.
+function publicFail(status, code, message) {
+  return Object.assign(new Error(message), { status, code, publicMessage: message });
+}
 // What extract-segments clears and idea-to-video-v2 screens: the segment text AND the
 // keywords, because both feed the AI scene prompts. Same string on both sides, so the
 // normal flow is a cache hit rather than a second classifier call.
@@ -661,8 +666,21 @@ function resolveMediaPath(url) {
   if (!allowedRoots.some(root => resolved.startsWith(root))) {
     throw new Error("Media path outside the allowed directories");
   }
+  // Only media. A stored playlist (.m3u8 and friends) makes ffmpeg - or the Python
+  // helpers' own ffmpeg - open every entry in it: local files, or http://127.0.0.1.
+  if (!MEDIA_EXT_RE.test(resolved)) {
+    throw new Error("Not a media file");
+  }
   return resolved;
 }
+
+// Extensions a stored media file may have. Uploads outside this list are stored as .bin
+// (see /api/upload-media) - which also stops an uploaded .html or .svg being served as a
+// page from the API's own origin.
+const MEDIA_EXTENSIONS = ['.mp4', '.mov', '.m4v', '.3gp', '.webm', '.mkv', '.avi', '.ts',
+  '.mp3', '.m4a', '.aac', '.wav', '.ogg', '.opus', '.flac', '.amr',
+  '.jpg', '.jpeg', '.png', '.webp', '.gif', '.heic', '.bmp', '.bin'];
+const MEDIA_EXT_RE = new RegExp(`(${MEDIA_EXTENSIONS.map(e => e.replace('.', '\\.')).join('|')})$`, 'i');
 
 const EDIT_XFADE_MAP = {
   fade:'fade', wipeleft:'wipeleft', wiperight:'wiperight', wipeup:'wipeup', wipedown:'wipedown',
@@ -807,13 +825,8 @@ app.post("/api/audio-waveform", verifyToken, mediaProcLimiter, async (req, res) 
     pcmPath = path.join(uploadsDir, uniqueName("wavepcm", "raw"));
     // execFile, not exec: srcPath comes from the request body and this endpoint
     // is unauthenticated, so it must never reach a shell.
-    await new Promise((resolve, reject) => {
-      execFile("ffmpeg", ["-y", "-i", srcPath, "-ac", "1", "-ar", "8000", "-f", "s16le", "-acodec", "pcm_s16le", pcmPath],
-        { timeout: 30000 }, (err, stdout, stderr) => {
-          if (err) { console.error("Waveform ffmpeg error:", stderr?.slice(-300)); return reject(new Error("Waveform extraction failed")); }
-          resolve();
-        });
-    });
+    await ffmpegRun(["-y", "-i", srcPath, "-ac", "1", "-ar", "8000", "-f", "s16le", "-acodec", "pcm_s16le", pcmPath],
+      { timeout: 30000, tag: "Waveform ffmpeg" }).catch(() => { throw new Error("Waveform extraction failed"); });
 
     const buffer = fs.readFileSync(pcmPath);
     const totalSamples = buffer.length / 2;
@@ -1826,8 +1839,13 @@ function uniqueName(prefix, ext) { return `${prefix}-${Date.now()}-${uuidv4()}.$
 // directly with an argument vector, so a quote, a semicolon or a $(...) in a
 // caption or a filename is just a character in an argument.
 function run(bin, args, opts = {}) {
+  // Every ffmpeg/ffprobe call goes through here, so the demuxer allowlist (below) is
+  // applied here rather than trusted to each caller.
+  let argv = args.map(String);
+  if (bin === 'ffmpeg') argv = withInputAllowlist(argv);
+  else if (bin === 'ffprobe') argv = ['-format_whitelist', MEDIA_DEMUXERS, ...argv];
   return new Promise((resolve, reject) => {
-    execFile(bin, args.map(String), { timeout: 30000, ...opts }, (err, stdout, stderr) => {
+    execFile(bin, argv, { timeout: 30000, ...opts }, (err, stdout, stderr) => {
       if (err) { err.stderr = stderr; return reject(err); }
       resolve(stdout);
     });
@@ -1841,6 +1859,29 @@ function run(bin, args, opts = {}) {
 // quoting ('...'); only the shell layer is gone. maxBuffer is raised because ffmpeg
 // writes progress to stderr and a long render can pass execFile's 1 MB default.
 // `tag` labels the stderr tail in the log when it fails.
+//
+// Every input without an explicit `-f` (ours: lavfi, concat) is also limited to real
+// media demuxers. A file that is actually a playlist - an upload keeps its own extension,
+// so `x.m3u8` is possible - would otherwise have ffmpeg open each entry itself:
+// http://127.0.0.1:<port>/... or a local file (automated review, Oct 24 2026).
+const MEDIA_DEMUXERS = [
+  'mov', 'mp4', 'm4a', '3gp', '3g2', 'mj2', 'matroska', 'webm', 'avi', 'mpegts', 'mpeg', 'flv', 'asf',
+  'mp3', 'wav', 'aac', 'ogg', 'flac', 'amr', 'aiff', 'caf',
+  'image2', 'png_pipe', 'jpeg_pipe', 'webp_pipe', 'bmp_pipe', 'tiff_pipe', 'gif', 'gif_pipe',
+].join(',');
+function withInputAllowlist(args) {
+  const out = [];
+  let explicitFormat = false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-f' && args[i + 1] !== undefined && args.indexOf('-i', i) > -1) explicitFormat = true;
+    if (args[i] === '-i') {
+      if (!explicitFormat) out.push('-format_whitelist', MEDIA_DEMUXERS);
+      explicitFormat = false;
+    }
+    out.push(args[i]);
+  }
+  return out;
+}
 function ffmpegRun(args, { timeout = 180000, tag = 'ffmpeg', bin = 'ffmpeg' } = {}) {
   return run(bin, args, { timeout, maxBuffer: 64 * 1024 * 1024 }).catch((err) => {
     console.error(`${tag} error:`, String(err.stderr || err.message).slice(-500));
@@ -1934,15 +1975,27 @@ function assStyleFromSpec(meta) {
 
 // Every URL that reaches here can come from a user (audioUrl, selectedVideo, beat/waveform
 // url...), so it goes through safeFetch: public addresses on 80/443 only (SSRF, Oct 24 2026).
-async function downloadToFile(url, outPath, headers = {}) {
-  const res = await safeFetch(url, { headers });
+// Capped in size and time (automated review, Oct 24 2026): a URL that streams forever, or
+// a 50 GB file, must not fill the disk or hold a render slot. A partial file is deleted.
+async function downloadToFile(url, outPath, headers = {}, { maxBytes = 500 * 1024 * 1024, timeoutMs = 180000 } = {}) {
+  const res = await safeFetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`Download failed ${url}: ${res.status}`);
+  if (Number(res.headers.get('content-length')) > maxBytes) throw new Error(`Download too large ${url}`);
   const fileStream = fs.createWriteStream(outPath);
-  await new Promise((resolve, reject) => {
-    res.body.pipe(fileStream);
-    res.body.on("error", reject);
-    fileStream.on("finish", resolve);
-  });
+  try {
+    let bytes = 0;
+    for await (const chunk of res.body) {
+      bytes += chunk.length;
+      if (bytes > maxBytes) throw new Error(`Download too large ${url}`);
+      if (!fileStream.write(chunk)) await new Promise(r => fileStream.once('drain', r));
+    }
+    await new Promise((resolve, reject) => fileStream.end(err => err ? reject(err) : resolve()));
+  } catch (e) {
+    fileStream.destroy();
+    fs.unlink(outPath, () => {});
+    res.body.destroy?.();
+    throw e;
+  }
   return outPath;
 }
 
@@ -2961,14 +3014,15 @@ Video script:`
   }
 });
 
-app.post("/api/generate-script", scriptLimiter, async (req, res) => {
-  const { prompt, targetSeconds: requestedSeconds } = req.body;
-  if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
-  try {
+// The script step as a function, so the app route and the public API (/v1/videos) run
+// the same screening, length rules, cache and refusal check. Client-visible failures are
+// thrown as publicFail(status, code, message); anything else is a 500.
+async function generateScriptText({ prompt, uid = null, targetSeconds: requestedSeconds }) {
+  {
     // The idea is screened before anything is written from it (Oct 23 review: sexual
     // prompts were voiced and captioned, unchecked).
-    const verdict = await safety.screen(prompt, { uid: req.user?.uid, route: 'generate-script' });
-    if (!verdict.ok) return blockedResponse(res, verdict);
+    const verdict = await safety.screen(prompt, { uid, route: 'generate-script' });
+    if (!verdict.ok) throw publicFail(422, 'content_blocked', verdict.message);
     // Ask for a script that will actually fit the plan's export limit. Raising the
     // free cap alone is not enough: a script written to no particular length can
     // always overshoot, and the failure lands at the very end of the flow, after
@@ -2977,7 +3031,7 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
     // 60% of the cap, capped at 90 seconds. The margin is because spoken length is
     // an estimate at ~150 wpm and delivery varies; 90 seconds because past that a
     // social-media script stops being a short-form script whatever the plan allows.
-    const { plan: scriptPlan } = await getUserPlanData(adminDb, req.user?.uid);
+    const { plan: scriptPlan } = await getUserPlanData(adminDb, uid);
     const capSeconds = tierConfig(scriptPlan).maxExportSeconds;
     // Idea-to-Audio asks for a length, because for an audio product the length IS the
     // product - a 30-second clip and a 5-minute one are different things a user chose
@@ -3001,7 +3055,7 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
     if (cached) {
       console.log('[CACHE HIT] generate-script:', prompt.substring(0, 40));
       safety.markCleared(cached);
-      return res.json({ script: cached, cached: true });
+      return { script: cached, cached: true };
     }
     const script = await callLLM({
       // A range with a floor, not a ceiling. "Do not exceed N words" alone made the
@@ -3038,14 +3092,24 @@ app.post("/api/generate-script", scriptLimiter, async (req, res) => {
     // A refusal is not a script. It once became a whole video ("I'm sorry, but I can't
     // help with that." voiced and captioned) - and it must not be cached either.
     if (isRefusal(script)) {
-      console.warn(`[safety] generate-script refusal uid=${req.user?.uid || '-'}: ${JSON.stringify(prompt.slice(0, 120))}`);
-      return res.status(422).json({ error: REFUSAL_MESSAGE, code: 'refusal' });
+      console.warn(`[safety] generate-script refusal uid=${uid || '-'}: ${JSON.stringify(prompt.slice(0, 120))}`);
+      throw publicFail(422, 'refusal', REFUSAL_MESSAGE);
     }
     // Written by us from a prompt that passed: the voiceover step need not re-screen it.
     safety.markCleared(script);
     setCache(cacheKey, script);
-    res.json({ script });
+    return { script };
+  }
+}
+
+app.post("/api/generate-script", scriptLimiter, async (req, res) => {
+  const { prompt, targetSeconds } = req.body;
+  if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
+  try {
+    const out = await generateScriptText({ prompt, uid: req.user?.uid, targetSeconds });
+    res.json(out.cached ? { script: out.script, cached: true } : { script: out.script });
   } catch (err) {
+    if (err.publicMessage) return res.status(err.status).json({ error: err.publicMessage, code: err.code });
     console.error("Script error:", err.message);
     res.status(500).json({ error: "Failed to generate script" });
   }
@@ -3295,22 +3359,21 @@ function shapeFilter(rate, semitones) {
   return `rubberband=tempo=${r.toFixed(3)}:pitch=${pitchFactor.toFixed(4)}`;
 }
 
-app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
-  const { text, voiceId = "gtts-us", rate = 1, pitch = 0, musicId = null, musicVolume = 0.18 } = req.body;
-  if (!text?.trim()) return res.status(400).json({ error: "Text is required" });
+// The voiceover step as a function (app route and /v1/videos). Returns { audioUrl }.
+async function synthesizeVoiceover({ text, uid = null, voiceId = "gtts-us", rate = 1, pitch = 0, musicId = null, musicVolume = 0.18 }) {
   // This is where words become a voice, whoever wrote them - a typed Script is the path
   // the Oct 12 sexual prompts took. A script we wrote ourselves is a cache hit here.
-  if (isRefusal(text)) return res.status(422).json({ error: REFUSAL_MESSAGE, code: 'refusal' });
-  const verdict = await safety.screen(text, { uid: req.user?.uid, route: 'generate-audio' });
-  if (!verdict.ok) return blockedResponse(res, verdict);
-  try {
+  if (isRefusal(text)) throw publicFail(422, 'refusal', REFUSAL_MESSAGE);
+  const verdict = await safety.screen(text, { uid, route: 'generate-audio' });
+  if (!verdict.ok) throw publicFail(422, 'content_blocked', verdict.message);
+  {
     // Voice restriction lives here, not on idea-to-video-v2: that endpoint
     // only ever consumes audio this one already generated, so it never sees
     // a voiceId to gate on. This is generation, not export, so it isn't a
     // credit/duration check - just which voices this plan can pick from.
-    const { plan } = await getUserPlanData(adminDb, req.user?.uid);
+    const { plan } = await getUserPlanData(adminDb, uid);
     if (!voiceAllowed(plan, voiceId)) {
-      return res.status(403).json({ error: `The "${voiceId}" voice is available on the Pro and Creator plans.` });
+      throw publicFail(403, 'plan_required', `The "${voiceId}" voice is available on the Pro and Creator plans.`);
     }
     const voice = VOICES[resolveVoiceId(voiceId)] || VOICES["gtts-us"];
     const audioFilename = uniqueName("gtts", "mp3");
@@ -3334,13 +3397,8 @@ app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
       // half-written file there.
       const shapedPath = audioPath.replace(/\.mp3$/, "-shaped.mp3");
       try {
-        await new Promise((resolve, reject) => {
-          execFile("ffmpeg", ["-y", "-i", audioPath, "-filter:a", filter, "-c:a", "libmp3lame", "-q:a", "4", shapedPath],
-            { timeout: 120000 }, (err, stdout, stderr) => {
-              if (err) { console.error("Audio shaping failed:", stderr?.slice(-300)); return reject(err); }
-              resolve();
-            });
-        });
+        await ffmpegRun(["-y", "-i", audioPath, "-filter:a", filter, "-c:a", "libmp3lame", "-q:a", "4", shapedPath],
+          { timeout: 120000, tag: "Audio shaping" });
         fs.renameSync(shapedPath, audioPath);
       } catch (e) {
         // The unshaped audio is still correct audio. Losing the whole request over a
@@ -3382,7 +3440,7 @@ app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
             "-t", String(voiceDur), "-c:a", "libmp3lame", "-b:a", "192k", mixedPath],
             { timeout: 180000 });
           try { fs.unlinkSync(audioPath); } catch (e) {}
-          return res.json({ audioUrl: `/audios/${mixedName}` });
+          return { audioUrl: `/audios/${mixedName}` };
         } catch (e) {
           // A failed mix must not cost the voiceover that already generated fine.
           console.error("[generate-audio] music mix failed:", e.message);
@@ -3390,8 +3448,17 @@ app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
       }
     }
 
-    res.json({ audioUrl: `/audios/${audioFilename}` });
+    return { audioUrl: `/audios/${audioFilename}` };
+  }
+}
+
+app.post("/api/generate-audio", scriptLimiter, async (req, res) => {
+  const { text, voiceId, rate, pitch, musicId, musicVolume } = req.body;
+  if (!text?.trim()) return res.status(400).json({ error: "Text is required" });
+  try {
+    res.json(await synthesizeVoiceover({ text, uid: req.user?.uid, voiceId, rate, pitch, musicId, musicVolume }));
   } catch (err) {
+    if (err.publicMessage) return res.status(err.status).json({ error: err.publicMessage, code: err.code });
     console.error("Audio error:", err.message);
     res.status(500).json({ error: "Failed to synthesize audio" });
   }
@@ -3529,12 +3596,11 @@ app.post("/api/idea-to-video", videoGenLimiter, async (req, res) => {
 
 // ===== Segment-based Idea-to-Video (improved visual matching) =====
 
-app.post("/api/extract-segments", scriptLimiter, async (req, res) => {
-  const { text } = req.body;
-  if (!text) return res.status(400).json({ error: "Text required" });
-  const verdict = await safety.screen(text, { uid: req.user?.uid, route: 'extract-segments' });
-  if (!verdict.ok) return blockedResponse(res, verdict);
-  try {
+// Script -> scenes with stock-search keywords, as a function (app route and /v1/videos).
+async function splitIntoSegments({ text, uid = null }) {
+  const verdict = await safety.screen(text, { uid, route: 'extract-segments' });
+  if (!verdict.ok) throw publicFail(422, 'content_blocked', verdict.message);
+  {
     const raw = await groqChat({
       messages: [
         { role: "system", content: `Split this video script into 3-5 short segments (each 1-2 sentences, in original order, covering ALL the text).
@@ -3569,8 +3635,17 @@ Return ONLY a JSON array, no other text: [{"text":"...","keywords":"..."}]` },
     }
     // Written by us from screened text; idea-to-video-v2 screens exactly this string.
     safety.markCleared(segmentsSafetyText(segments));
-    res.json({ segments });
+    return segments;
+  }
+}
+
+app.post("/api/extract-segments", scriptLimiter, async (req, res) => {
+  const { text } = req.body;
+  if (!text) return res.status(400).json({ error: "Text required" });
+  try {
+    res.json({ segments: await splitIntoSegments({ text, uid: req.user?.uid }) });
   } catch (err) {
+    if (err.publicMessage) return res.status(err.status).json({ error: err.publicMessage, code: err.code });
     console.error("extract-segments error:", err.message);
     res.status(500).json({ error: "Failed to extract segments" });
   }
@@ -6958,7 +7033,11 @@ app.post('/api/profile-photo/remove', verifyToken, (req, res) => {
 app.post('/api/upload-media', uploadLimiter, uploadFiles, async (req, res) => {
   try {
     const urls = (req.files || []).map(f => {
-      const ext = (path.extname(f.originalname) || '').toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12);
+      // Allowlisted, not just sanitised: the name decides how /uploads serves the file and
+      // whether ffmpeg treats it as a playlist. Anything else is kept as opaque .bin -
+      // ffmpeg reads real media by its content, so a valid clip still works.
+      const rawExt = (path.extname(f.originalname) || '').toLowerCase();
+      const ext = MEDIA_EXTENSIONS.includes(rawExt) && rawExt !== '.bin' ? rawExt : '.bin';
       const finalName = `${f.filename}${ext}`;
       fs.renameSync(f.path, path.join(uploadsDir, finalName));
       const type = f.mimetype.startsWith('image') ? 'image' : 'video';
@@ -8002,11 +8081,12 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // the URL used to sit inside the shell string as well (Oct 24 2026).
       let inputs = [outputVideo];
       const trackDownloads = [];
+      try {
       for (const track of audioTracks) {
         if (String(track.url).startsWith('http')) {
           const dl = path.join(videosDir, uniqueName("track", "audio"));
-          await downloadToFile(track.url, dl, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" });
-          trackDownloads.push(dl);
+          trackDownloads.push(dl); // before the download, so a partial file is removed too
+          await downloadToFile(track.url, dl, { "User-Agent": "Mozilla/5.0 (compatible; Tonefy/1.0)" }, { maxBytes: 200 * 1024 * 1024 });
           inputs.push(dl);
         } else {
           inputs.push(resolveMediaPath(track.url));
@@ -8084,7 +8164,6 @@ app.post('/api/media-to-video', renderLimiter, async (req, res) => {
       // the first audio track (a 6s voiceover cut a 12s video down to 6s).
       const filterComplex = `${audioLabels};${mixInputs}amix=inputs=${audioTracks.length + 1}:duration=longest:dropout_transition=2:normalize=0[amixed];[amixed]apad[aout]`;
 
-      try {
         await ffmpegRun(['-y', ...inputs.flatMap(p => ['-i', p]), '-filter_complex', filterComplex, '-map', '0:v', '-map', '[aout]',
           '-c:v', 'copy', '-c:a', 'aac', '-shortest', withAudioOut], { tag: 'Audio mix' }).catch(() => { throw new Error("Audio mix failed"); });
       } finally {
